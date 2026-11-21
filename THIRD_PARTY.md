@@ -23,13 +23,16 @@ against the projects' own pages otherwise, in November 2026.
 | — or [Boolector](https://github.com/Boolector/boolector) 3.x | proofs | MIT | optional |
 | [yosys-slang](https://github.com/povik/yosys-slang) | `--frontend slang` | ISC; parts derived from slang are MIT | optional |
 | [slang](https://github.com/MikePopoloski/slang) | used by yosys-slang | MIT | optional |
-| [ABC](https://github.com/berkeley-abc/abc) (`yosys-abc`) | `--engine pdr` | permissive license, © The Regents of the University of California | optional |
+| [ABC](https://github.com/berkeley-abc/abc) (`yosys-abc`) | PDR engine (default when present) | permissive license, © The Regents of the University of California | optional |
+| [pyosys](https://pypi.org/project/pyosys/) wheel | pip source of a `yosys-abc` binary | MIT (bindings); the bundled Yosys is ISC and ABC as above | optional (`pip install fvlint[yowasp]`) |
 | [YoWASP](https://yowasp.org) `yowasp-yosys`, `yowasp-runtime` | pip-installable Yosys + SymbiYosys | ISC | optional (`pip install fvlint[yowasp]`) |
 | [wasmtime-py](https://github.com/bytecodealliance/wasmtime-py) | dependency of YoWASP | Apache-2.0 WITH LLVM-exception | with YoWASP |
 
 ## Notes for redistribution
 
 * Publishing or using fvlint itself only involves fvlint's ISC license.
+* fvlint finds `yosys-abc` on `PATH` or inside an installed `pyosys` package
+  and runs it as a separate program; it does not import pyosys.
 * If you ship fvlint **bundled with** these tools (a container image, an
   internal tool distribution), you must also meet each bundled tool's license.
   Most are permissive. The one copyleft case is Yices **before 2.8.0**

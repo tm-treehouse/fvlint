@@ -8,7 +8,7 @@ import json
 from collections import Counter
 from xml.sax.saxutils import escape, quoteattr
 
-from .checks import ERROR, FAIL, PROVEN, SEVERITY, UNKNOWN, WAIVED
+from .checks import ERROR, FAIL, PROVEN, SEVERITY, UNKNOWN, VACUOUS, WAIVED
 
 
 def _order(r):
@@ -39,7 +39,7 @@ def write_json(results, path: str, meta: dict):
 
 
 def write_junit(results, path: str, suite="fvlint"):
-    fails = sum(r.status in (FAIL, ERROR) for r in results)
+    fails = sum(r.status in (FAIL, ERROR, VACUOUS) for r in results)
     skipped = sum(r.status == UNKNOWN for r in results)
     out = ['<?xml version="1.0" encoding="UTF-8"?>',
            f'<testsuite name={quoteattr(suite)} tests="{len(results)}" failures="{fails}" skipped="{skipped}">']
@@ -48,7 +48,7 @@ def write_junit(results, path: str, suite="fvlint"):
         cls = quoteattr(r.check.kind)
         out.append(f"  <testcase classname={cls} name={name}>")
         msg = f"{r.check.src}: {r.check.desc}: {r.detail}"
-        if r.status in (FAIL, ERROR):
+        if r.status in (FAIL, ERROR, VACUOUS):
             out.append(f"    <failure message={quoteattr(r.status)}>{escape(msg)}"
                        f"{escape(' trace: ' + r.trace) if r.trace else ''}</failure>")
         elif r.status == UNKNOWN:

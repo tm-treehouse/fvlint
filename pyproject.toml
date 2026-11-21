@@ -6,12 +6,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fvlint"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lightweight formal lint: auto-generated, locally scoped proofs for counters, case statements, part-selects, memories and FSMs in RTL"
 readme = "README.md"
 license = "ISC"
 license-files = ["LICENSE", "LICENSES/*.txt", "AUTHORS"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = []          # stdlib only; Yosys/SymbiYosys/solvers are external programs
 keywords = ["formal verification", "lint", "yosys", "symbiyosys", "fpga", "rtl", "systemverilog"]
 classifiers = [
@@ -22,12 +22,15 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# Pip-installable toolchain (Yosys + SymbiYosys as WebAssembly, Z3).  Optional:
-# a native OSS CAD Suite install on PATH is preferred and faster.
-yowasp = ["yowasp-yosys", "z3-solver"]
+# Pip-installable toolchain: Yosys + SymbiYosys as WebAssembly (YoWASP), Z3,
+# and the yosys-abc binary shipped in the pyosys wheel (for the PDR engine).
+# Optional: a native OSS CAD Suite install on PATH is preferred and faster.
+yowasp = ["yowasp-yosys", "z3-solver", "pyosys"]
 
 [project.scripts]
 fvlint = "fvlint.cli:main"
+fvlint-regress = "fvlint.regress:main"
+fvlint-fuzz = "fvlint.fuzz:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

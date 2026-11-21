@@ -10,7 +10,7 @@ import shlex
 import shutil
 from dataclasses import dataclass, field
 
-from .tools import Toolchain, ToolError
+from .tools import IDENT, Toolchain, ToolError, yosys_arg
 
 
 @dataclass
@@ -28,8 +28,8 @@ class Sources:
         with open(path) as f:
             toks = []
             for line in f:
-                line = line.split("//", 1)[0].split("#", 1)[0].strip()
-                if line:
+                line = line.split("//", 1)[0].strip()
+                if line and not line.startswith("#"):
                     toks += shlex.split(line)
         it = iter(toks)
         for t in it:
@@ -53,38 +53,48 @@ class Sources:
                 self.files.append(rel(t))
 
 
-def _q(p: str) -> str:
-    # Only quote when needed: some frontends (read_slang) take arguments verbatim.
-    return '"' + p + '"' if any(ch.isspace() for ch in p) else p
-
-
 def _rel(p: str, cwd: str) -> str:
     return os.path.relpath(os.path.abspath(p), cwd)
+
+
+def _slang_arg(s: str) -> str:
+    # read_slang takes its arguments verbatim (no quote processing).
+    if any(ch.isspace() for ch in s) or any(ch in s for ch in ';#"'):
+        raise ToolError(f"--frontend slang cannot take {s!r}: avoid spaces, ';', '#' and quotes")
+    return s
 
 
 def read_commands(src: Sources, top: str, frontend: str, tools: Toolchain, path) -> str:
     """Yosys commands that read and elaborate the design; `path` maps a file
     or directory to the form handed to Yosys."""
+    if not IDENT.match(top):
+        raise ToolError(f"--top {top!r} is not a plain module name")
     lines = []
     for lib in src.libs:
-        lines.append(f"read_verilog -sv -lib {_q(path(lib))}")
-    files = " ".join(_q(path(f)) for f in src.files)
+        lines.append(f"read_verilog -sv -lib {yosys_arg(path(lib))}")
     if frontend == "slang":
-        opts = [f"--top {top}"]
-        opts += [f"-I {_q(path(i))}" for i in src.incdirs]
-        opts += [f"-D {d}" for d in src.defines]
-        opts += [f"-G {p}" for p in src.params]
+        opts = ["--top", top]
+        for i in src.incdirs:
+            opts += ["-I", _slang_arg(path(i))]
+        for d in src.defines:
+            opts += ["-D", _slang_arg(d)]
+        for p in src.params:
+            opts += ["-G", _slang_arg(p)]
         if tools.is_yowasp:
-            opts.append("--threads 1")   # WebAssembly build cannot spawn threads
-        lines.append(tools.slang_prefix(".") + f"read_slang {' '.join(opts)} {files}")
+            opts += ["--threads", "1"]   # WebAssembly build cannot spawn threads
+        files = [_slang_arg(path(f)) for f in src.files]
+        lines.append(tools.slang_prefix(".") + "read_slang " + " ".join(opts + files))
     else:
         opts = ["-sv"]
-        opts += [f"-I{_q(path(i))}" for i in src.incdirs]
-        opts += [f"-D{d}" for d in src.defines]
-        lines.append(f"read_verilog {' '.join(opts)} {files}")
+        opts += [yosys_arg("-I" + path(i)) for i in src.incdirs]
+        opts += [yosys_arg("-D" + d) for d in src.defines]
+        files = [yosys_arg(path(f)) for f in src.files]
+        lines.append("read_verilog " + " ".join(opts + files))
         for p in src.params:
             name, _, value = p.partition("=")
-            lines.append(f"chparam -set {name} {value} {top}")
+            if not IDENT.match(name):
+                raise ToolError(f"-P {p!r}: bad parameter name")
+            lines.append(f"chparam -set {name} {yosys_arg(value)} {top}")
     lines.append(f"hierarchy -check -top {top}")
     return "\n".join(lines) + "\n"
 
@@ -127,51 +137,52 @@ def _stage(src: Sources, assume_file, edir: str):
 
 def elaborate(src: Sources, top: str, frontend: str, tools: Toolchain, outdir: str,
               assume_file: str | None = None) -> dict:
-    """Produce main.json (structure preserved for detection and slicing),
-    fsm.json (with Yosys' extracted $fsm cells) and, optionally, the port list
-    of the user's assumption module."""
+    """One Yosys run producing main.json (structure preserved for detection
+    and slicing) and fsm.json (Yosys' extracted $fsm cells).  FSM extraction
+    runs on a saved copy of the elaborated design; if it fails, the main
+    netlist is still used and FSM checks are skipped."""
     edir = os.path.join(outdir, "elab")
     os.makedirs(edir, exist_ok=True)
+    for f in ("main.json", "fsm.json", "assume.json"):
+        if os.path.exists(os.path.join(edir, f)):
+            os.remove(os.path.join(edir, f))
     src_map = None
     if tools.is_yowasp:
         src, assume_file, src_map = _stage(src, assume_file, edir)
-        path = lambda p: _rel(p, edir)
+        path = lambda p: _rel(p, edir)  # noqa: E731
     else:
         path = os.path.abspath
-    rd = read_commands(src, top, frontend, tools, path)
-
-    try:
-        tools.run_yosys(rd + "proc -noopt\nflatten\nmemory_collect\nopt_clean\n"
-                        "write_json main.json\n", edir, "main")
-    except ToolError as e:
-        if frontend == "yosys" and "syntax error" in str(e):
-            raise ToolError(f"{e}\nhint: Yosys' built-in parser covers only part of "
-                            "SystemVerilog; try --frontend slang") from None
-        raise
-
+    script = (read_commands(src, top, frontend, tools, path) +
+              "design -save fvl_elab\n"
+              "proc -noopt\nflatten\nmemory_collect\nopt_clean\nwrite_json main.json\n"
+              "design -load fvl_elab\n"
+              "proc\nflatten\nopt -nodffe -nosdff\n"
+              # Ask fsm_detect to consider every register (except ones driving
+              # ports), not only those it would re-encode for synthesis.
+              "setattr -set fsm_encoding \"auto\" t:$dff t:$adff %u %co1:+[Q] w:* %i x:* %d\n"
+              "fsm_detect\nfsm_extract\nwrite_json fsm.json\n")
+    rc = tools.run_yosys(script, edir, "elab", allow_fail=True)
+    main = os.path.join(edir, "main.json")
     fsm_json = os.path.join(edir, "fsm.json")
-    if os.path.exists(fsm_json):
-        os.remove(fsm_json)
-    try:
-        tools.run_yosys(rd + "proc\nflatten\nopt -nodffe -nosdff\n"
-                        # Ask fsm_detect to consider every register (except ones
-                        # driving ports), not only those it would re-encode.
-                        "setattr -set fsm_encoding \"auto\" "
-                        "t:$dff t:$adff %u %co1:+[Q] w:* %i x:* %d\n"
-                        "fsm_detect\nfsm_extract\nwrite_json fsm.json\n", edir, "fsm")
-        fsm_warning = None
-    except ToolError as e:
-        fsm_warning = f"FSM extraction failed, FSM checks skipped ({e.args[0].splitlines()[0]})"
+    log = os.path.join(edir, "elab.log")
+    if not os.path.exists(main):
+        tail = tools.log_tail(log)
+        hint = ""
+        if frontend == "yosys" and "syntax error" in tail:
+            hint = "\nhint: Yosys' built-in parser covers only part of SystemVerilog; try --frontend slang"
+        raise ToolError(f"elaboration failed (see {log}.full):\n{tail}{hint}")
+    fsm_warning = None
+    if rc != 0 or not os.path.exists(fsm_json):
+        fsm_warning = "FSM extraction failed in Yosys; FSM checks skipped (see elab.log.full)"
 
     assume_ports = None
     if assume_file:
-        tools.run_yosys(f"read_verilog -formal -sv {_q(path(assume_file))}\n"
+        tools.run_yosys(f"read_verilog -formal -sv {yosys_arg(path(assume_file))}\n"
                         "hierarchy -top fvlint_assumptions\nproc\nwrite_json assume.json\n",
                         edir, "assume")
         with open(os.path.join(edir, "assume.json")) as f:
             m = json.load(f)["modules"]["fvlint_assumptions"]
         assume_ports = {n: p["direction"] for n, p in m["ports"].items()}
-    return {"main": os.path.join(edir, "main.json"),
-            "fsm": fsm_json if os.path.exists(fsm_json) else None, "fsm_warning": fsm_warning,
-            "src_base": edir, "src_map": src_map, "assume_ports": assume_ports,
-            "assume_file": assume_file}
+    return {"main": main, "fsm": fsm_json if os.path.exists(fsm_json) else None,
+            "fsm_warning": fsm_warning, "src_base": edir, "src_map": src_map,
+            "assume_ports": assume_ports, "assume_file": assume_file}

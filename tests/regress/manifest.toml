@@ -1,0 +1,345 @@
+# SPDX-FileCopyrightText: 2026 The fvlint Authors
+# SPDX-License-Identifier: ISC
+#
+# fvlint regression manifest.  Run with:
+#   python -m fvlint.regress tests/regress/manifest.toml -j 4
+# Every case states the expected status of each check; anything unexpected
+# that is FAIL / ERROR / VACUOUS also fails the case.  Cases listing
+# engines = ["pdr", "smtbmc"] run once per proof engine.
+
+[defaults]
+budget_s = 90
+engines = ["auto"]
+
+# ------------------------------------------------------------- counters
+[[case]]
+name = "counters/cnt_mod100"
+files = ["../fixtures/counters.sv"]
+top = "cnt_mod100"
+engines = ["pdr", "smtbmc"]
+expect = { "counter_overflow:q" = "PROVEN" }
+tags = ["counter"]
+
+[[case]]
+name = "counters/cnt_badlimit"
+files = ["../fixtures/counters.sv"]
+top = "cnt_badlimit"
+engines = ["pdr", "smtbmc"]
+expect = { "counter_overflow:q" = "FAIL" }
+tags = ["counter", "bug"]
+
+[[case]]
+name = "counters/credit_ok"
+files = ["../fixtures/counters.sv"]
+top = "credit_ok"
+engines = ["pdr", "smtbmc"]
+expect = { "counter_overflow:used" = "PROVEN", "counter_underflow:used" = "PROVEN" }
+tags = ["counter", "cone"]
+
+[[case]]
+name = "counters/credit_bug"
+files = ["../fixtures/counters.sv"]
+top = "credit_bug"
+engines = ["pdr", "smtbmc"]
+expect = { "counter_overflow:used" = "FAIL", "counter_underflow:used" = "PROVEN" }
+tags = ["counter", "bug", "cone"]
+
+[[case]]
+name = "counters/timebase"
+files = ["../fixtures/counters.sv"]
+top = "timebase"
+expect = { "counter_overflow:div" = "INFO" }
+strict = true
+tags = ["counter"]
+
+[[case]]
+name = "counters/cnt_wide"
+files = ["../fixtures/counters.sv"]
+top = "cnt_wide"
+engines = ["pdr", "smtbmc"]
+expect = { "counter_overflow:cnt" = "PROVEN" }
+budget_s = 150
+tags = ["counter", "lemma"]
+
+# ------------------------------------------------------------ arithmetic
+[[case]]
+name = "arith/cnt_signed_ok"
+files = ["../fixtures/arith.sv"]
+top = "cnt_signed_ok"
+engines = ["pdr", "smtbmc"]
+expect = { "counter_overflow:pos" = "PROVEN" }
+tags = ["counter", "signed", "review"]
+
+[[case]]
+name = "arith/acc_signed_bug"
+files = ["../fixtures/arith.sv"]
+top = "acc_signed_bug"
+engines = ["pdr", "smtbmc"]
+expect = { "counter_overflow:acc" = "PROVEN", "counter_overflow:acc#1" = "FAIL" }
+tags = ["counter", "signed", "bug", "review"]
+
+[[case]]
+name = "arith/prog_timer"
+files = ["../fixtures/arith.sv"]
+top = "prog_timer"
+engines = ["pdr", "smtbmc"]
+expect = { "counter_overflow:cnt" = "PROVEN" }
+tags = ["counter", "lemma", "review"]
+
+[[case]]
+name = "arith/prog_timer_bug"
+files = ["../fixtures/arith.sv"]
+top = "prog_timer_bug"
+engines = ["pdr", "smtbmc"]
+expect = { "counter_overflow:cnt" = "FAIL" }
+budget_s = 150
+tags = ["counter", "bug", "review"]
+
+# ---------------------------------------------------------------- memory
+[[case]]
+name = "memory/ring_ok"
+files = ["../fixtures/memory.sv"]
+top = "ring_ok"
+expect = { "mem_addr:mem.rd0" = "PROVEN", "mem_addr:mem.wr0" = "PROVEN", "counter_overflow:wp" = "PROVEN", "counter_overflow:rp" = "PROVEN" }
+strict = true
+tags = ["memory"]
+
+[[case]]
+name = "memory/ring_bug"
+files = ["../fixtures/memory.sv"]
+top = "ring_bug"
+engines = ["pdr", "smtbmc"]
+expect = { "mem_addr:mem.wr0" = "FAIL", "mem_addr:mem.rd0" = "FAIL", "counter_overflow:wp" = "PROVEN" }
+budget_s = 150
+tags = ["memory", "bug"]
+
+[[case]]
+name = "memory/ring_bug_assume"
+files = ["../fixtures/memory.sv"]
+top = "ring_bug"
+args = ["--assume", "{dir}/../fixtures/ring_bug_assume.sv"]
+expect = { "mem_addr:mem.rd0" = "PROVEN", "mem_addr:mem.wr0" = "FAIL", "counter_overflow:wp" = "PROVEN" }
+tags = ["memory", "assume"]
+
+# ------------------------------------------------------ vacuity / environment
+[[case]]
+name = "vacuity/assume_vacuous"
+files = ["../fixtures/memory.sv"]
+top = "ring_bug"
+args = ["--assume", "{dir}/../fixtures/assume_vacuous.sv"]
+expect = { "mem_addr:mem.wr0" = "VACUOUS", "counter_overflow:wp" = "VACUOUS", "mem_addr:mem.rd0" = "FAIL" }
+expect_detail = { "mem_addr:mem.wr0" = "can never hold" }
+tags = ["vacuity", "review"]
+
+[[case]]
+name = "vacuity/assume_unsat"
+files = ["../fixtures/memory.sv"]
+top = "ring_bug"
+args = ["--assume", "{dir}/../fixtures/assume_unsat.sv"]
+expect = { "mem_addr:mem.wr0" = "ERROR", "mem_addr:mem.rd0" = "ERROR", "counter_overflow:wp" = "ERROR" }
+expect_detail = { "mem_addr:mem.rd0" = "unsatisfiable" }
+tags = ["vacuity", "review"]
+
+[[case]]
+name = "vacuity/assume_typo"
+files = ["../fixtures/memory.sv"]
+top = "ring_bug"
+args = ["--assume", "{dir}/../fixtures/assume_typo.sv"]
+expect_error = "raddr are not inputs of ring_bug"
+tags = ["vacuity", "review"]
+
+# ------------------------------------------------------------- case / index
+[[case]]
+name = "case/arb_unique"
+files = ["../fixtures/cases.sv"]
+top = "arb_unique"
+expect = { "parallel_case:gnt" = "FAIL" }
+strict = true
+tags = ["case", "bug"]
+
+[[case]]
+name = "case/dec_onehot"
+files = ["../fixtures/cases.sv"]
+top = "dec_onehot"
+engines = ["pdr", "smtbmc"]
+expect = { "parallel_case:y" = "PROVEN", "full_case:y" = "PROVEN" }
+strict = true
+tags = ["case", "cone"]
+
+[[case]]
+name = "case/arb_guarded"
+files = ["../fixtures/cases.sv"]
+top = "arb_guarded"
+expect = { "parallel_case:gnt" = "PROVEN" }
+strict = true
+tags = ["case"]
+
+[[case]]
+name = "index/lane_sel_ok"
+files = ["../fixtures/index.sv"]
+top = "lane_sel_ok"
+expect = { "index_range:lane" = "PROVEN" }
+strict = true
+tags = ["index"]
+
+[[case]]
+name = "index/lane_sel_bug"
+files = ["../fixtures/index.sv"]
+top = "lane_sel_bug"
+expect = { "index_range:lane" = "FAIL", "counter_overflow:sel" = "INFO" }
+strict = true
+tags = ["index", "bug"]
+
+[[case]]
+name = "index/lane_sel_fixed"
+files = ["../fixtures/index.sv"]
+top = "lane_sel_fixed"
+expect = { "index_range:lane" = "PROVEN", "counter_overflow:sel" = "PROVEN" }
+strict = true
+tags = ["index"]
+
+[[case]]
+name = "params/lanes_disabled"
+files = ["../fixtures/params.sv"]
+top = "lanes_param"
+expect = {}
+strict = true
+tags = ["params", "review"]
+
+[[case]]
+name = "params/lanes_enabled"
+files = ["../fixtures/params.sv"]
+top = "lanes_param"
+args = ["-P", "USE_LANES=1"]
+expect = { "index_range:y" = "FAIL" }
+strict = true
+tags = ["params", "review"]
+
+# ------------------------------------------------------------------- FSMs
+[[case]]
+name = "fsm/fsm_issues"
+files = ["../fixtures/fsm.sv"]
+top = "fsm_issues"
+expect = { "fsm_unreachable:st=2'b11" = "FAIL", "fsm_trap:st={2'b10}" = "WARN", "fsm_summary:st" = "INFO" }
+strict = true
+tags = ["fsm", "bug"]
+
+[[case]]
+name = "fsm/fsm_clean"
+files = ["../fixtures/fsm.sv"]
+top = "fsm_clean"
+expect = { "fsm_summary:st" = "INFO" }
+strict = true
+tags = ["fsm"]
+
+[[case]]
+name = "fsm/fsm_sync_reset"
+files = ["../fixtures/resets.sv"]
+top = "fsm_sync"
+expect = { "fsm_unreachable:st=2'b11" = "FAIL", "fsm_trap:st={2'b10}" = "WARN", "fsm_summary:st" = "INFO" }
+strict = true
+tags = ["fsm", "reset", "review"]
+
+# ------------------------------------------------------------- clocks / reset
+[[case]]
+name = "clocks/credit_mc"
+files = ["../fixtures/clocks.sv"]
+top = "credit_mc"
+engines = ["pdr", "smtbmc"]
+expect = { "counter_overflow:used" = "FAIL", "counter_underflow:used" = "PROVEN" }
+tags = ["clock", "soundness", "review"]
+
+[[case]]
+name = "clocks/credit_mixed_edge"
+files = ["../fixtures/clocks.sv"]
+top = "credit_mixed_edge"
+engines = ["pdr"]
+expect = { "counter_overflow:used" = "PROVEN" }
+expect_detail = { "counter_overflow:used" = "multi-clock model" }
+tags = ["clock", "review"]
+
+# Known limitation, recorded so a change is noticed: under the multi-clock
+# model clocks may stall, so plain k-induction cannot close invariants that
+# span clock edges.  PDR (above) proves it; k-induction alone stays UNKNOWN.
+[[case]]
+name = "clocks/credit_mixed_edge_kind"
+files = ["../fixtures/clocks.sv"]
+top = "credit_mixed_edge"
+engines = ["smtbmc"]
+expect = { "counter_overflow:used" = "UNKNOWN" }
+exit = 0
+tags = ["clock", "limitation"]
+
+[[case]]
+name = "clocks/two_domains"
+files = ["../fixtures/clocks.sv"]
+top = "two_domains"
+expect = { "counter_overflow:ca" = "PROVEN", "counter_overflow:cb" = "PROVEN" }
+strict = true
+budget_s = 60
+tags = ["clock"]
+
+[[case]]
+name = "reset/rst_sync_onehot"
+files = ["../fixtures/resets.sv"]
+top = "rst_sync_onehot"
+expect = { "parallel_case:y" = "PROVEN", "full_case:y" = "PROVEN" }
+strict = true
+tags = ["reset", "review"]
+
+[[case]]
+name = "reset/rst_bridge_counter"
+files = ["../fixtures/resets.sv"]
+top = "rst_bridge_counter"
+expect = { "counter_overflow:q" = "PROVEN" }
+strict = true
+tags = ["reset", "review"]
+
+# ------------------------------------------------------- workflow features
+[[case]]
+name = "workflow/waiver_file"
+files = ["../fixtures/counters.sv"]
+top = "credit_bug"
+args = ["--waivers", "{dir}/credit_bug_waivers.txt"]
+expect = { "counter_overflow:used" = "WAIVED", "counter_underflow:used" = "PROVEN" }
+exit = 0
+tags = ["workflow"]
+
+[[case]]
+name = "workflow/check_selection"
+files = ["../fixtures/memory.sv"]
+top = "ring_bug"
+args = ["--checks", "counter_overflow"]
+expect = { "counter_overflow:wp" = "PROVEN" }
+strict = true
+tags = ["workflow"]
+
+[[case]]
+name = "demo/bare"
+files = ["../../examples/demo/demo_top.sv"]
+top = "demo_top"
+args = ["--frontend", "slang"]
+expect = { "fsm_unreachable:u_framer.st=3'b100" = "FAIL", "index_range:u_framer.hdr_byte" = "FAIL", "counter_overflow:u_framer.seq" = "WAIVED", "mem_addr:u_fifo.mem.wr0" = "PROVEN", "mem_addr:u_fifo.mem.rd0" = "PROVEN", "counter_overflow:u_fifo.count" = "PROVEN" }
+budget_s = 150
+tags = ["demo", "slang"]
+
+[[case]]
+name = "demo/triaged"
+files = ["../../examples/demo/demo_top.sv"]
+top = "demo_top"
+args = ["--frontend", "slang", "--assume", "{dir}/../../examples/demo/assumptions.sv",
+        "--waivers", "{dir}/../../examples/demo/waivers.txt"]
+expect = { "fsm_unreachable:u_framer.st=3'b100" = "WAIVED", "index_range:u_framer.hdr_byte" = "PROVEN" }
+exit = 0
+budget_s = 150
+tags = ["demo", "slang"]
+
+# -------------------------------------------------------------------- scale
+[[case]]
+name = "perf/scale_200"
+files = ["../fixtures/scale_200.v"]
+top = "scale_200"
+args = ["--checks", "counter_overflow"]
+expect = { "counter_overflow:c0" = "PROVEN", "counter_overflow:c199" = "PROVEN" }
+budget_s = 240
+tags = ["perf"]

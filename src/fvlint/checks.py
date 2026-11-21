@@ -7,20 +7,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # Result statuses, most severe first.
-FAIL = "FAIL"
-ERROR = "ERROR"
-UNKNOWN = "UNKNOWN"
+FAIL = "FAIL"          # counterexample on the full design (or replayed onto it)
+ERROR = "ERROR"        # tool error, unsatisfiable assumptions, ...
+VACUOUS = "VACUOUS"    # proven, but the check's enabling condition can never occur
+UNKNOWN = "UNKNOWN"    # neither proven nor refuted
 WARN = "WARN"
 INFO = "INFO"
 PROVEN = "PROVEN"
 WAIVED = "WAIVED"
-SEVERITY = [FAIL, ERROR, UNKNOWN, WARN, INFO, PROVEN, WAIVED]
+SEVERITY = [FAIL, ERROR, VACUOUS, UNKNOWN, WARN, INFO, PROVEN, WAIVED]
 
 
 @dataclass
 class Check:
     kind: str                 # e.g. counter_overflow, parallel_case, mem_addr, fsm_unreachable
-    target: str               # human-readable object name (register, memory, src location)
+    target: str               # structural name: register, memory port, destination signal
     src: str                  # file:line
     desc: str                 # one-line description of the property
     checker: str | None = None          # checker module in checkers.v (None = no proof needed)
@@ -30,12 +31,18 @@ class Check:
     anchors: list = field(default_factory=list)  # state cells always kept in the cone
     waive_attr: str | None = None       # value of an fvlint_waive attribute on the object
     preset: str | None = None           # status decided without a proof (graph checks, info)
-    depth_hint: int = 0                 # BMC depth that would expose a violation, if known
     detail: str = ""
+    depth_hint: int = 0                 # BMC depth that would expose a violation, if known
 
     @property
     def id(self) -> str:
         return f"{self.kind}:{self.target}"
+
+    def roots(self) -> list:
+        out = []
+        for bits in self.ports.values():
+            out += bits
+        return out + [b for b, _ in self.conds]
 
 
 @dataclass
@@ -59,20 +66,24 @@ class Result:
     check: Check
     status: str
     detail: str = ""
-    level: int | None = None          # cone level that decided the result
-    full: bool = False                # True if that cone was the whole design
+    level: str | None = None          # cone that decided the result ("0", "1", "full", "cegar")
+    full: bool = False                # True if the deciding cone had no cuts
     trace: str | None = None
     step: int | None = None
+    engine: str | None = None
     lemmas_used: int = 0
-    runs: int = 0
-    history: list = field(default_factory=list)   # [(level, outcome)]
+    refinements: int = 0
+    vacuity: str | None = None        # "ok", "vacuous", "unknown" or None (not checked)
+    history: list = field(default_factory=list)   # [(cone, outcome)]
     waiver: str | None = None
+    seconds: float = 0.0
 
     def to_dict(self) -> dict:
         return {
             "id": self.check.id, "kind": self.check.kind, "target": self.check.target,
             "src": self.check.src, "property": self.check.desc, "status": self.status,
-            "detail": self.detail, "cone_level": self.level, "full_design": self.full,
-            "trace": self.trace, "cex_step": self.step, "lemmas_used": self.lemmas_used,
-            "solver_runs": self.runs, "history": self.history, "waiver": self.waiver,
+            "detail": self.detail, "cone": self.level, "full_design": self.full,
+            "trace": self.trace, "cex_step": self.step, "engine": self.engine,
+            "lemmas_used": self.lemmas_used, "refinements": self.refinements,
+            "vacuity": self.vacuity, "history": self.history, "waiver": self.waiver,
         }

@@ -21,29 +21,48 @@ def _bits_lsb(v) -> str:
     return v[::-1] if isinstance(v, str) else format(v, "032b")[::-1]
 
 
-def read_fsm_cells(fsm_json: str, top: str) -> list:
+def read_fsm_cells(fsm_json: str, top: str, reset_names: dict | None = None) -> list:
     """Decode the $fsm cells written by fsm_extract.
 
     Returns dicts with 'name', 'states' (MSB-first code strings, index =
     state number), 'reset' (state number or None) and 'trans' [(from, to)].
+    Transitions that require a reset input to be asserted are dropped
+    (`reset_names` maps signal names to their active level): with a
+    synchronous reset every state has an edge back to the reset state, which
+    would otherwise hide trap states.
     """
     with open(fsm_json) as f:
         mod = json.load(f)["modules"][top]
+    bit_names = {}
+    for name, n in mod["netnames"].items():
+        for i, b in enumerate(n["bits"]):
+            bit_names.setdefault(b, set()).add(name if len(n["bits"]) == 1 else f"{name}[{i}]")
+    reset_names = reset_names or {}
     out = []
     for c in mod["cells"].values():
         if c["type"] != "$fsm":
             continue
         p = c["parameters"]
-        num = lambda k: param_int(p[k])
+        num = lambda k: param_int(p[k])  # noqa: E731
         sb, sn, lg = num("STATE_BITS"), num("STATE_NUM"), num("STATE_NUM_LOG2")
         ci, co, tn = num("CTRL_IN_WIDTH"), num("CTRL_OUT_WIDTH"), num("TRANS_NUM")
         st = _bits_lsb(p["STATE_TABLE"])
         states = [st[i * sb:(i + 1) * sb][::-1] for i in range(sn)]
+        ctrl_in = c["connections"].get("CTRL_IN", [])
+        reset_inputs = {}
+        for j, b in enumerate(ctrl_in):
+            for nm in bit_names.get(b, ()):
+                if nm in reset_names:
+                    reset_inputs[j] = str(reset_names[nm])
         tt = _bits_lsb(p["TRANS_TABLE"])
         w = 2 * lg + ci + co
-        trans = []
+        trans, dropped = [], 0
         for i in range(tn):
             e = tt[i * w:(i + 1) * w]
+            cin = e[co + lg:co + lg + ci]
+            if any(cin[j] == lvl for j, lvl in reset_inputs.items() if j < len(cin)):
+                dropped += 1
+                continue
             s_out = int(e[co:co + lg][::-1] or "0", 2)
             s_in = int(e[co + lg + ci:][::-1] or "0", 2)
             trans.append((s_in, s_out))
@@ -56,7 +75,8 @@ def read_fsm_cells(fsm_json: str, top: str) -> list:
             except ValueError:
                 reset = None
         name = str(p.get("NAME", "")).lstrip("\\")
-        out.append({"name": name, "states": states, "reset": reset, "trans": trans})
+        out.append({"name": name, "states": states, "reset": reset, "trans": trans,
+                    "reset_edges": dropped})
     return out
 
 
@@ -109,14 +129,14 @@ def _fmt(code: str) -> str:
     return f"{len(code)}'b{code}"
 
 
-def analyse_fsms(nl: Netlist, fsm_json: str):
+def analyse_fsms(nl: Netlist, fsm_json: str, reset_names: dict | None = None):
     checks, lemmas = [], {}
     q_to_ff = {}
     for cell, c in nl.cells.items():
         if "Q" in c["connections"] and nl.is_stateful(cell):
             q_to_ff[tuple(c["connections"]["Q"])] = cell
 
-    for fsm in read_fsm_cells(fsm_json, nl.top):
+    for fsm in read_fsm_cells(fsm_json, nl.top, reset_names):
         sig = fsm["name"]
         codes = fsm["states"]
         net = nl.netnames.get(sig)

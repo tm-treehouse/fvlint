@@ -1,0 +1,3 @@
+# SPDX-FileCopyrightText: 2026 The fvlint Authors
+# SPDX-License-Identifier: ISC
+counter_overflow:used   # accepted for the waiver regression case

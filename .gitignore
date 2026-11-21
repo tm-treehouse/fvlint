@@ -6,3 +6,6 @@ build/
 dist/
 fvlint_out/
 tests/_out/
+fvlint_regress/
+fvlint_fuzz/
+regress_out/
