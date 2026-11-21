@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 The fvlint Authors
+# SPDX-License-Identifier: ISC
+__pycache__/
+*.egg-info/
+build/
+dist/
+fvlint_out/
+tests/_out/

@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 The fvlint Authors
+# SPDX-License-Identifier: ISC
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fvlint"
+version = "0.1.0"
+description = "Lightweight formal lint: auto-generated, locally scoped proofs for counters, case statements, part-selects, memories and FSMs in RTL"
+readme = "README.md"
+license = "ISC"
+license-files = ["LICENSE", "LICENSES/*.txt", "AUTHORS"]
+requires-python = ">=3.10"
+dependencies = []          # stdlib only; Yosys/SymbiYosys/solvers are external programs
+keywords = ["formal verification", "lint", "yosys", "symbiyosys", "fpga", "rtl", "systemverilog"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+
+[project.optional-dependencies]
+# Pip-installable toolchain (Yosys + SymbiYosys as WebAssembly, Z3).  Optional:
+# a native OSS CAD Suite install on PATH is preferred and faster.
+yowasp = ["yowasp-yosys", "z3-solver"]
+
+[project.scripts]
+fvlint = "fvlint.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fvlint = ["checkers.v"]

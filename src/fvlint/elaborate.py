@@ -1,0 +1,177 @@
+# SPDX-FileCopyrightText: 2026 The fvlint Authors
+# SPDX-License-Identifier: ISC
+"""Elaborate the user's RTL with Yosys into the netlists fvlint analyses."""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import shutil
+from dataclasses import dataclass, field
+
+from .tools import Toolchain, ToolError
+
+
+@dataclass
+class Sources:
+    files: list = field(default_factory=list)
+    incdirs: list = field(default_factory=list)
+    defines: list = field(default_factory=list)   # "NAME" or "NAME=VALUE"
+    libs: list = field(default_factory=list)      # blackbox stubs (vendor primitives)
+    params: list = field(default_factory=list)    # "NAME=VALUE" top-level overrides
+
+    def add_filelist(self, path: str):
+        """Parse a simple .f file: files, +incdir+, +define+, -I, -D, -f."""
+        base = os.path.dirname(os.path.abspath(path))
+        rel = lambda p: p if os.path.isabs(p) else os.path.normpath(os.path.join(base, p))
+        with open(path) as f:
+            toks = []
+            for line in f:
+                line = line.split("//", 1)[0].split("#", 1)[0].strip()
+                if line:
+                    toks += shlex.split(line)
+        it = iter(toks)
+        for t in it:
+            if t.startswith("+incdir+"):
+                self.incdirs += [rel(p) for p in t[8:].split("+") if p]
+            elif t.startswith("+define+"):
+                self.defines += [d for d in t[8:].split("+") if d]
+            elif t == "-I":
+                self.incdirs.append(rel(next(it)))
+            elif t.startswith("-I"):
+                self.incdirs.append(rel(t[2:]))
+            elif t == "-D":
+                self.defines.append(next(it))
+            elif t.startswith("-D"):
+                self.defines.append(t[2:])
+            elif t == "-f":
+                self.add_filelist(rel(next(it)))
+            elif t.startswith("-") or t.startswith("+"):
+                continue  # ignore simulator-specific options
+            else:
+                self.files.append(rel(t))
+
+
+def _q(p: str) -> str:
+    # Only quote when needed: some frontends (read_slang) take arguments verbatim.
+    return '"' + p + '"' if any(ch.isspace() for ch in p) else p
+
+
+def _rel(p: str, cwd: str) -> str:
+    return os.path.relpath(os.path.abspath(p), cwd)
+
+
+def read_commands(src: Sources, top: str, frontend: str, tools: Toolchain, path) -> str:
+    """Yosys commands that read and elaborate the design; `path` maps a file
+    or directory to the form handed to Yosys."""
+    lines = []
+    for lib in src.libs:
+        lines.append(f"read_verilog -sv -lib {_q(path(lib))}")
+    files = " ".join(_q(path(f)) for f in src.files)
+    if frontend == "slang":
+        opts = [f"--top {top}"]
+        opts += [f"-I {_q(path(i))}" for i in src.incdirs]
+        opts += [f"-D {d}" for d in src.defines]
+        opts += [f"-G {p}" for p in src.params]
+        if tools.is_yowasp:
+            opts.append("--threads 1")   # WebAssembly build cannot spawn threads
+        lines.append(tools.slang_prefix(".") + f"read_slang {' '.join(opts)} {files}")
+    else:
+        opts = ["-sv"]
+        opts += [f"-I{_q(path(i))}" for i in src.incdirs]
+        opts += [f"-D{d}" for d in src.defines]
+        lines.append(f"read_verilog {' '.join(opts)} {files}")
+        for p in src.params:
+            name, _, value = p.partition("=")
+            lines.append(f"chparam -set {name} {value} {top}")
+    lines.append(f"hierarchy -check -top {top}")
+    return "\n".join(lines) + "\n"
+
+
+HDL_EXT = {".v", ".sv", ".vh", ".svh", ".vinc", ".inc", ".h", ".pkg", ".sva", ".svi"}
+
+
+def _stage(src: Sources, assume_file, edir: str):
+    """Copy the inputs under edir/src, mirroring their layout relative to the
+    deepest common directory.  Used with the WebAssembly Yosys build, which
+    only resolves plain relative paths below its working directory."""
+    paths = src.files + src.libs + ([assume_file] if assume_file else [])
+    dirs = [os.path.dirname(os.path.abspath(p)) for p in paths] + [os.path.abspath(d) for d in src.incdirs]
+    orig_root = os.path.commonpath(dirs)
+    stage_root = os.path.join(edir, "src")
+    if os.path.isdir(stage_root):
+        shutil.rmtree(stage_root)
+
+    def put(p):
+        rel = os.path.relpath(os.path.abspath(p), orig_root)
+        dst = os.path.join(stage_root, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(p, dst)
+        return dst
+
+    for d in src.incdirs:
+        for dp, dns, fns in os.walk(d):
+            dns[:] = [x for x in dns if not x.startswith(".")]
+            for fn in fns:
+                if os.path.splitext(fn)[1].lower() in HDL_EXT:
+                    put(os.path.join(dp, fn))
+    staged = Sources(files=[put(f) for f in src.files], libs=[put(f) for f in src.libs],
+                     incdirs=[os.path.join(stage_root, os.path.relpath(os.path.abspath(d), orig_root))
+                              for d in src.incdirs],
+                     defines=list(src.defines), params=list(src.params))
+    for d in staged.incdirs:
+        os.makedirs(d, exist_ok=True)
+    return staged, (put(assume_file) if assume_file else None), (stage_root, orig_root)
+
+
+def elaborate(src: Sources, top: str, frontend: str, tools: Toolchain, outdir: str,
+              assume_file: str | None = None) -> dict:
+    """Produce main.json (structure preserved for detection and slicing),
+    fsm.json (with Yosys' extracted $fsm cells) and, optionally, the port list
+    of the user's assumption module."""
+    edir = os.path.join(outdir, "elab")
+    os.makedirs(edir, exist_ok=True)
+    src_map = None
+    if tools.is_yowasp:
+        src, assume_file, src_map = _stage(src, assume_file, edir)
+        path = lambda p: _rel(p, edir)
+    else:
+        path = os.path.abspath
+    rd = read_commands(src, top, frontend, tools, path)
+
+    try:
+        tools.run_yosys(rd + "proc -noopt\nflatten\nmemory_collect\nopt_clean\n"
+                        "write_json main.json\n", edir, "main")
+    except ToolError as e:
+        if frontend == "yosys" and "syntax error" in str(e):
+            raise ToolError(f"{e}\nhint: Yosys' built-in parser covers only part of "
+                            "SystemVerilog; try --frontend slang") from None
+        raise
+
+    fsm_json = os.path.join(edir, "fsm.json")
+    if os.path.exists(fsm_json):
+        os.remove(fsm_json)
+    try:
+        tools.run_yosys(rd + "proc\nflatten\nopt -nodffe -nosdff\n"
+                        # Ask fsm_detect to consider every register (except ones
+                        # driving ports), not only those it would re-encode.
+                        "setattr -set fsm_encoding \"auto\" "
+                        "t:$dff t:$adff %u %co1:+[Q] w:* %i x:* %d\n"
+                        "fsm_detect\nfsm_extract\nwrite_json fsm.json\n", edir, "fsm")
+        fsm_warning = None
+    except ToolError as e:
+        fsm_warning = f"FSM extraction failed, FSM checks skipped ({e.args[0].splitlines()[0]})"
+
+    assume_ports = None
+    if assume_file:
+        tools.run_yosys(f"read_verilog -formal -sv {_q(path(assume_file))}\n"
+                        "hierarchy -top fvlint_assumptions\nproc\nwrite_json assume.json\n",
+                        edir, "assume")
+        with open(os.path.join(edir, "assume.json")) as f:
+            m = json.load(f)["modules"]["fvlint_assumptions"]
+        assume_ports = {n: p["direction"] for n, p in m["ports"].items()}
+    return {"main": os.path.join(edir, "main.json"),
+            "fsm": fsm_json if os.path.exists(fsm_json) else None, "fsm_warning": fsm_warning,
+            "src_base": edir, "src_map": src_map, "assume_ports": assume_ports,
+            "assume_file": assume_file}
