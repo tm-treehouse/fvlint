@@ -5,6 +5,29 @@ SPDX-License-Identifier: ISC
 
 # Changelog
 
+## 0.3.1
+
+Test infrastructure only; fvlint's own behaviour is unchanged.
+
+* The soundness fuzzer's oracle is now independent of fvlint for every check
+  kind. The generator writes down, as plain Verilog, when each construct it
+  builds is active and when it goes wrong; the oracle adds those monitors to
+  its own copy of the design and runs a plain bounded model check with
+  SymbiYosys. It no longer reads fvlint's netlist, check parameters, path
+  conditions or discovered resets. With an off-by-one planted in fvlint's
+  counter limits, or a path condition dropped, the new oracle reports the
+  wrong verdicts; the old one agreed with them.
+* The scheduler is also tested against a fake solver that answers from a
+  per-property truth table, over many random mixes, so its answers cannot
+  contradict each other.
+* The mutation-testing baseline names each accepted survivor by its
+  enclosing function, so edits elsewhere no longer shift an entry onto a
+  different line. Entries whose code changed fail the ordinary unit tests,
+  and `--strict` also fails on entries that are now killed.
+* CI: current major versions of the GitHub actions, the OSS CAD Suite build
+  pinned to one from just after Yosys 0.71, `pyosys` pinned with
+  `yowasp-yosys`, and job time limits.
+
 ## 0.3.0
 
 Unit tests for the internals (`tests/unit/`), checked by branch coverage and

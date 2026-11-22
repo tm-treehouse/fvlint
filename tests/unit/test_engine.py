@@ -4,7 +4,10 @@
 
 Engine.run (the one method that starts SymbiYosys) is replaced by a scripted
 fake, so slicing, batching, refinement, replay, deep BMC and vacuity logic run
-for real against controlled solver answers."""
+for real against controlled solver answers.  Most tests script the answers
+job by job; AgainstATruthTable derives them from what is true of each
+property, so they cannot contradict each other, and checks the scheduler's
+verdicts against that truth over many random mixes."""
 
 from __future__ import annotations
 
@@ -103,6 +106,128 @@ class Scripted:
     @property
     def tags(self):
         return [c.tag for c in self.calls]
+
+
+@dataclass
+class Truth:
+    """What is true of one property (a check or a lemma) in the design."""
+    fails_at: int | None = None              # step of a real counterexample; None: the property holds
+    needs: frozenset | None = frozenset()    # lemmas k-induction needs beside it; None: not k-inductive
+    spurious: frozenset = frozenset()        # registers whose cutting admits a spurious counterexample...
+    spurious_at: int = 1                     # ...at this step
+    pdr_timeout: bool = False                # PDR gives up instead of deciding
+    reach_at: int | None = 1                 # first step the check's condition can hold; None: never (vacuous)
+
+    def __post_init__(self):
+        assert self.fails_at is None or self.needs is None, "a false property cannot be inductive"
+
+
+class Truthful:
+    """A solver policy (for Scripted) that answers every job from a truth table
+    per property, so answers cannot contradict each other: a property that
+    fails, fails in every job deep enough to see it; k-induction succeeds
+    exactly when every asserted property's needed lemmas are asserted with it,
+    so dropping a lemma never helps; a cut cone adds only the spurious
+    counterexamples its truth allows; replay confirms only real ones and
+    shows divergence exactly on the cut registers that caused them."""
+
+    def __init__(self, case, checks: dict, lemmas: dict, truth: dict):
+        self.case, self.nl, self.truth = case, case.nl, truth
+        self.keys = {(c.checker, json.dumps(c.params, sort_keys=True), json.dumps(c.ports, sort_keys=True)): name
+                     for name, c in checks.items()}
+        for lems in lemmas.values():
+            for lem in lems:
+                self.keys[(lem.checker, json.dumps(lem.params, sort_keys=True),
+                           json.dumps(lem.ports, sort_keys=True))] = lem.desc
+        self.n = 0
+        self._lock = threading.Lock()
+
+    def key(self, p):
+        return self.keys[(p.checker, json.dumps(p.params, sort_keys=True), json.dumps(p.ports, sort_keys=True))]
+
+    def fail_step(self, p, spec):
+        """Earliest counterexample step for p in this job's cone (real or spurious), or None."""
+        t = self.truth[self.key(p)]
+        steps = [t.fails_at] if t.fails_at is not None else []
+        if t.spurious & spec.cut:
+            steps.append(t.spurious_at)
+        return min(steps, default=None)
+
+    def cex(self, spec, p, step):
+        """Write the slice trace and witness for a counterexample, as SymbiYosys would."""
+        t = self.truth[self.key(p)]
+        with self._lock:
+            self.n += 1
+            n = self.n
+        values = {}
+        for cell in sorted(spec.cut):
+            if self.nl.is_stateful(cell):
+                for _, bits in self.nl.outputs(cell):
+                    name = self.nl.visible_name(bits)
+                    if name:
+                        values[name] = [("1" if cell in t.spurious else "0") * len(bits)] * (step + 1)
+        values = values or {"t_dummy": ["0"] * (step + 1)}
+        inputs = {name: ["0" * len(port["bits"])] * (step + 1) for name, port in self.nl.ports.items()
+                  if port["direction"] == "input"}
+        return self.case.trace(f"tr/{n}/trace.vcd", values, inputs)
+
+    def __call__(self, c) -> JobResult:
+        if c.tag == "env":
+            return jr("FAIL", fvl_s0=PropResult("fail", step=0, phase="cover"))
+        if c.tag == "replay":
+            return self.replay(c)
+        props = {}
+        failed = False
+        if all(p.mode == 2 for p in c.props):               # vacuity: assert that the condition never holds
+            for p in c.props:
+                reach = self.truth[self.key(p)].reach_at
+                if reach is not None and (c.mode == "prove" and c.engine.startswith("abc") or reach < c.depth):
+                    props[p.name], failed = PropResult("fail", step=reach, phase="basecase"), True
+                elif reach is None and c.mode == "prove":
+                    props[p.name] = PropResult("pass")       # "never holds" is trivially inductive
+            return JobResult("FAIL" if failed else "PASS", props, dir="/job")
+        pdr = c.engine.startswith("abc")
+        for p in c.props:
+            step = self.fail_step(p, c.spec)
+            if step is not None and (pdr or step < c.depth):
+                props[p.name] = PropResult("fail", self.cex(c.spec, p, step), step, "basecase")
+                failed = True
+        if pdr:                                              # PDR decides each property on its own
+            slow = [p.name for p in c.props if p.name not in props and self.truth[self.key(p)].pdr_timeout]
+            for p in c.props:
+                props.setdefault(p.name, PropResult("unknown" if p.name in slow else "pass"))
+            return JobResult("FAIL" if failed else "TIMEOUT" if slow else "PASS", props, dir="/job")
+        if failed:
+            return JobResult("FAIL", props, dir="/job")
+        if c.mode == "bmc":
+            return JobResult("PASS", props, dir="/job")
+        # k-induction: the hypothesis assumes every asserted property.
+        asserted = {self.key(p) for p in c.props}
+        stuck = [p.name for p in c.props
+                 if self.truth[self.key(p)].needs is None or not self.truth[self.key(p)].needs <= asserted]
+        if not stuck:
+            return JobResult("PASS", props, dir="/job")
+        return JobResult("UNKNOWN", {n: PropResult("unknown", phase="induction") for n in stuck}, dir="/job")
+
+    def replay(self, c):
+        (p,) = c.props
+        t = self.truth[self.key(p)]
+        step = c.depth - 2
+        if t.fails_at is not None and t.fails_at <= step:
+            full = c.spec
+            return jr("FAIL", fvl_t0=PropResult("fail", self.cex(full, p, t.fails_at), t.fails_at, "cover"),
+                      fvl_s0=PropResult("fail", step=step, phase="cover"))
+        values = {}
+        for cell in sorted(self.nl.cells):
+            if self.nl.is_stateful(cell):
+                for _, bits in self.nl.outputs(cell):
+                    name = self.nl.visible_name(bits)
+                    if name:
+                        values[name] = ["0" * len(bits)] * (step + 1)
+        with self._lock:
+            self.n += 1
+            rel = self.case.trace(f"tr/{self.n}/real.vcd", values)
+        return jr("FAIL", fvl_s0=PropResult("fail", rel, step, "cover"))
 
 
 def design():
@@ -1045,6 +1170,89 @@ class DeepBmc(EngineCase):
         s = self.unknown_state(eng)
         eng._deep_bmc([s])
         self.assertEqual(s.res.detail, "induction failed")
+
+
+class AgainstATruthTable(EngineCase):
+    """The scheduler against a solver that answers from a consistent truth
+    table: its verdicts must follow from the truth whatever the mix."""
+
+    LEMMAS = ("l0", "l1", "l2")
+
+    def setUp(self):
+        super().setUp()
+        cnt = self.nl.netnames["cnt"]["bits"]
+        self.my_lemmas = {"ff_cnt": [Lemma("ff_cnt", f"l{i}", "fvl_range", {"W": 4, "LO": 0, "HI": 9 + i, "SIGNED": 0},
+                                           {"v": cnt}) for i in range(3)]}
+
+    def run_truth(self, truth, engine="smtbmc", **opts):
+        truth = dict({n: Truth() for n in ("cnt", "other") + self.LEMMAS}, **truth)
+        eng = self.engine(None, abc=engine == "pdr", lemmas=self.my_lemmas, engine=engine, **opts)
+        eng.run = Scripted(eng, Truthful(self, self.checks, self.my_lemmas, truth))
+        res = eng.prove_all([self.checks["cnt"], self.checks["other"]])
+        return eng, dict(zip(("cnt", "other"), res))
+
+    def test_houdini_keeps_only_the_lemma_that_is_needed_and_true(self):
+        eng, r = self.run_truth({"cnt": Truth(needs=frozenset({"l2"})), "l0": Truth(fails_at=0, needs=None),
+                                 "l1": Truth(needs=None)})
+        self.assertEqual((r["cnt"].status, r["cnt"].lemmas_used), (PROVEN, 1))
+        kind = [c for c in eng.run.calls if "_kind" in c.tag]
+        self.assertEqual([sorted(Truthful(self, self.checks, self.my_lemmas, {}).key(p) for p in c.props
+                                 if p.name.startswith("fvl_l")) for c in kind],
+                         [["l0", "l1", "l2"], ["l1", "l2"], ["l2"]])           # l0 fails, l1 is not inductive
+
+    def test_a_target_needing_a_false_lemma_stays_unproven(self):
+        eng, r = self.run_truth({"cnt": Truth(needs=frozenset({"l0"})), "l0": Truth(fails_at=0, needs=None)})
+        self.assertEqual(r["cnt"].status, UNKNOWN)
+        self.assertNotIn(FAIL, {x.status for x in r.values()})
+
+    def test_spurious_counterexample_from_a_cut_register(self):
+        eng, r = self.run_truth({"cnt": Truth(spurious=frozenset({"ff_lim"}), spurious_at=2)})
+        self.assertEqual((r["cnt"].status, r["cnt"].refinements), (PROVEN, 1))
+        self.assertEqual(r["cnt"].history[:2], [("0", "fail"), ("replay", "spurious, restored 1")])
+
+    def test_real_counterexample_behind_a_spurious_one(self):
+        eng, r = self.run_truth({"cnt": Truth(fails_at=6, needs=None, spurious=frozenset({"ff_lim"}),
+                                              spurious_at=2)})
+        self.assertEqual((r["cnt"].status, r["cnt"].step), (FAIL, 6))
+
+    def test_vacuous_and_reachable_conditions(self):
+        eng, r = self.run_truth({"cnt": Truth(reach_at=None), "other": Truth(reach_at=3)})
+        self.assertEqual((r["cnt"].status, r["other"].status), (VACUOUS, PROVEN))
+
+    def test_random_truth_tables(self):
+        import random
+        for seed in range(60):
+            rng = random.Random(seed)
+            truth = {}
+            for name in ("cnt", "other") + self.LEMMAS:
+                fails = rng.choice([None, None, None, rng.randrange(0, 8), rng.randrange(8, 40)])
+                if name in self.LEMMAS:
+                    fails = rng.choice([None, None, rng.randrange(0, 4)])
+                needs = None if fails is not None else rng.choice(
+                    [frozenset(), frozenset(), None, frozenset(rng.sample(self.LEMMAS, rng.randrange(1, 3)))])
+                cut = frozenset({"ff_lim"}) if name == "cnt" and rng.random() < .4 else frozenset()
+                truth[name] = Truth(fails_at=fails, needs=needs, spurious=cut,
+                                    spurious_at=rng.randrange(0, 6), pdr_timeout=rng.random() < .2,
+                                    reach_at=rng.choice([None, 0, 2, 5]))
+            for engine in ("smtbmc", "pdr"):
+                with self.subTest(seed=seed, engine=engine):
+                    _, r = self.run_truth(truth, engine)
+                    for name, res in r.items():
+                        t = truth[name]
+                        # Soundness: never a verdict the truth contradicts.
+                        if res.status == FAIL:
+                            self.assertEqual(res.step, t.fails_at)
+                        if res.status in (PROVEN, VACUOUS):
+                            self.assertIsNone(t.fails_at)
+                            self.assertEqual(res.status == VACUOUS, t.reach_at is None)
+                        # Completeness where the solver can decide: PDR unless it times out;
+                        # k-induction within its depth, or with no lemma needed.  (With PDR
+                        # available, k-induction only gets a brief try first.)
+                        if t.fails_at is not None and (engine == "pdr" or t.fails_at < 20):
+                            self.assertEqual(res.status, FAIL)
+                        if t.fails_at is None and (engine == "pdr" and not t.pdr_timeout or
+                                                   engine == "smtbmc" and t.needs == frozenset()):
+                            self.assertIn(res.status, (PROVEN, VACUOUS))
 
 
 if __name__ == "__main__":

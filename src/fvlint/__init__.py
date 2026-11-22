@@ -2,4 +2,4 @@
 # SPDX-License-Identifier: ISC
 """fvlint: lightweight formal lint for RTL."""
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"

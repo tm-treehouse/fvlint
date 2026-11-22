@@ -7,12 +7,13 @@ jobs:
   # Unit tests of the internals: no Yosys, SymbiYosys or solver needed.
   unit:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       matrix:
         python: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: {python-version: "${{ matrix.python }}"}
       - run: pip install ruff reuse coverage
       - run: ruff check src tests --select E,F,W --ignore E731 --line-length 120
@@ -24,16 +25,17 @@ jobs:
   regress-pip:
     runs-on: ubuntu-latest
     needs: unit
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: {python-version: "3.12"}
       # Pinned to the Yosys release fvlint is tested with (netlist.TESTED_YOSYS)
       # and that made the unit tests' committed netlist snapshots.
-      - run: pip install .[yowasp] "yowasp-yosys==0.71.*"
+      - run: pip install .[yowasp] "yowasp-yosys==0.71.*" "pyosys==0.71.*"
       - run: python tests/unit/data/make_snapshots.py --check
       - run: python -m fvlint.regress tests/regress/manifest.toml -j 2 --budget-scale 2 --fuzz 20 --junit regress.xml -o regress_out
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with: {name: regress-pip, path: "regress.xml\nregress_out/summary.json"}
 
@@ -41,15 +43,21 @@ jobs:
   regress-oss-cad-suite:
     runs-on: ubuntu-latest
     needs: unit
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: {python-version: "3.12"}
-      - uses: YosysHQ/setup-oss-cad-suite@v3
+      # Pinned to a build from just after the Yosys 0.71 release (2026-11-12),
+      # the version fvlint is tested with; move it together with TESTED_YOSYS.
+      - uses: YosysHQ/setup-oss-cad-suite@v4
+        with:
+          version: "2026-11-14"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - run: pip install .
       # A newer Yosys may elaborate the snapshot sources differently: report it.
       - run: python tests/unit/data/make_snapshots.py --check || echo "::warning::unit-test netlist snapshots differ under this Yosys"
       - run: python -m fvlint.regress tests/regress/manifest.toml -j 2 --fuzz 20 --junit regress.xml -o regress_out
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with: {name: regress-oss-cad-suite, path: "regress.xml\nregress_out/summary.json"}

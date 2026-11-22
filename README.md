@@ -217,9 +217,9 @@ fvlint's own suite:
 
 | Suite | What it covers |
 |---|---|
-| `tests/unit/` | unit tests of every module's internals, no toolchain needed (about 1 s). Netlists are built by hand for exact edge cases and also loaded from committed Yosys snapshots of `tests/unit/data/rtl` for the shapes Yosys really produces; SymbiYosys log parsing is tested on lines in the formats of real runs, verbatim for the irregular ones (a step-0 failure has no step number). The scheduler is tested with a scripted solver (refinement, replay, batching, deep BMC, vacuity) that also checks every job it is handed is closed (no bit a checker reads is left undriven), external tools with stub executables. Kept honest by branch coverage and mutation testing (below). |
+| `tests/unit/` | unit tests of every module's internals, no toolchain needed (about 2 s). Netlists are built by hand for exact edge cases and also loaded from committed Yosys snapshots of `tests/unit/data/rtl` for the shapes Yosys really produces; SymbiYosys log parsing is tested on lines in the formats of real runs, verbatim for the irregular ones (a step-0 failure has no step number). The scheduler is tested with a scripted solver (refinement, replay, batching, deep BMC, vacuity) that also checks every job it is handed is closed (no bit a checker reads is left undriven), and against a solver that answers from a per-property truth table over many random mixes, so its verdicts must follow from the truth; external tools are tested with stub executables. Kept honest by branch coverage and mutation testing (below). |
 | `tests/regress/manifest.toml` | 57 case runs over the fixtures in `tests/fixtures`. Each fixture has clean structures and planted bugs, including a reproduction for every defect found in the design review: multi-clock false proofs, vacuous assumptions, parameter-disabled logic, synchronous-reset FSM traps, reset synchronizers, signed counters, register-bounded timers. Many cases run under both engines, plus a 200-counter throughput case. |
-| `fvlint.fuzz` | soundness fuzzer: random designs (counters, registered guards, case statements, part-selects including narrow signed indices, memories, second clocks, falling edges, synchronized resets, and flops that look like reset stages but that data can set). Every `PROVEN`, `VACUOUS`, `FAIL` and unreachable-state verdict is re-checked by a plain bounded model check of the whole design, with no slicing, refinement, lemmas or PDR. Proofs are checked twice: under fvlint's own reset gating and under the oracle's (primary reset released plus a settle time, ignoring fvlint's derived resets); part-select bounds are computed by the oracle itself. |
+| `fvlint.fuzz` | soundness fuzzer: random designs (counters, registered guards, case statements, part-selects including narrow signed indices, memories, second clocks, falling edges, synchronized resets, and flops that look like reset stages but that data can set). The generator writes down, for each construct it builds, when it is active and when it goes wrong, as plain Verilog. An independent oracle appends those monitors to its own copy of the design and re-checks every `PROVEN`, `VACUOUS`, `FAIL` and unreachable-state verdict with a plain bounded model check: it uses none of fvlint's netlist, slicing, refinement, lemmas, PDR, check parameters, path conditions or reset discovery. |
 
 ```
 python -m unittest discover -s tests/unit -t .   # unit tests (no toolchain)
@@ -242,8 +242,13 @@ python tests/unit/mutation.py detect cone          # selected modules
 A surviving mutant is either a missing test, an equivalent change (one that
 cannot alter behaviour), or an accepted one (a tuning constant, wording of a
 message). Equivalent and accepted survivors are listed with their reason in
-`tests/unit/mutation_baseline.json`; the report separates new survivors from
-those, and `--strict` (used by the weekly CI run) fails on new ones.
+`tests/unit/mutation_baseline.json`. An entry names the module, the
+enclosing function, the line of code and the change (and which occurrence of
+that in the function), so edits elsewhere don't move it onto another site.
+The report separates new survivors from listed ones and flags entries that
+are now killed or whose code is gone; `--strict` (used by the weekly CI run)
+fails on any of those. Entries whose code changed also fail the ordinary unit
+tests, so they are caught at once rather than in the weekly run.
 
 The committed Yosys snapshots are regenerated with
 `python tests/unit/data/make_snapshots.py` (`--check` reports drift).
@@ -273,9 +278,12 @@ or on demand.
   branch identical to `default` is merged away by the frontend.
 * **The fuzzer's oracle is bounded** (24+ cycles), so it can't see a
   disagreement deeper than that. Designs are kept small so the bound covers
-  them. Apart from part-select bounds and reset gating, it still uses
-  fvlint's own check parameters and path conditions, so a mistake there would
-  be shared.
+  them. The oracle shares the tools (Yosys, SymbiYosys) and the contract
+  (registers start at zero, the reset is held at start, checks apply while
+  the resets are inactive) with fvlint, so a mistake in those would be
+  shared. Where a register has two increments by the same constant, the
+  oracle watches them together, so with mixed verdicts it checks only the
+  `FAIL`, or only that neither goes wrong.
 * **Derived resets are recognised conservatively.** A register counts as a
   synchronized reset only if every way it can change other than through its D
   input (asynchronous reset, load, set or clear, synchronous reset, enable) is

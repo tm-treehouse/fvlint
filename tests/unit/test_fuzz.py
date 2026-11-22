@@ -1,38 +1,36 @@
 # SPDX-FileCopyrightText: 2026 The fvlint Authors
 # SPDX-License-Identifier: ISC
-"""fvlint.fuzz: the design generator and the oracle's judging logic.  The
-oracle's bounded model check is faked; its verdict rules run for real."""
+"""fvlint.fuzz: the design generator, its monitors, and the oracle's judging
+logic.  The oracle's SymbiYosys run is faked; everything around it is real."""
 
 from __future__ import annotations
 
 import json
 import os
 import re
-import shutil
 import unittest
 from unittest import mock
 
 from fvlint import cli, fuzz
-from fvlint.detect import detect_all
-from fvlint.engine import Engine
-from fvlint.netlist import Netlist
-from fvlint.sby import JobResult, PropResult
+from fvlint.fuzz import Design
 from fvlint.tools import Toolchain
 
-from .support import TempDirCase, captured, snapshot
+from .support import TempDirCase, captured
+
+IDENT = re.compile(r"(?<!')\b[A-Za-z_]\w*\b")
 
 
 class Generator(unittest.TestCase):
     def test_deterministic_per_seed(self):
         self.assertEqual(fuzz.generate(7), fuzz.generate(7))
-        self.assertNotEqual(fuzz.generate(7)[0], fuzz.generate(8)[0])
-        text, top = fuzz.generate(42)
-        self.assertEqual(top, "fz42")
-        self.assertTrue(text.startswith("module fz42 (") and text.endswith("endmodule\n"))
+        self.assertNotEqual(fuzz.generate(7).text, fuzz.generate(8).text)
+        d = fuzz.generate(42)
+        self.assertEqual(d.top, "fz42")
+        self.assertTrue(d.text.startswith("module fz42 (") and d.text.endswith("endmodule\n"))
 
     def test_shape(self):
         for seed in range(1, 60):
-            text, _ = fuzz.generate(seed)
+            text = fuzz.generate(seed).text
             with self.subTest(seed=seed):
                 regs = re.findall(r"reg \[(\d+):0\] r(\d+);", text)
                 self.assertTrue(2 <= len(regs) <= 4)
@@ -46,7 +44,7 @@ class Generator(unittest.TestCase):
                 self.assertEqual(text.splitlines()[-1], "endmodule")
 
     def test_every_feature_is_generated(self):
-        texts = "\n".join(fuzz.generate(s)[0] for s in range(1, 120))
+        texts = "\n".join(fuzz.generate(s).text for s in range(1, 120))
         for feature in ("posedge clk2", "negedge clk", "unique casez", "unique case (1'b1)", "*4 +: 4]",
                         "reg [3:0] mem [0:", "else if (r", "<= 1'b1; else ok", "r0 - ",
                         "s1 <= rst; s2 <= s1;", "if (s2) r", "msk <= 1'b1; else msk <= s1", "if (msk) r",
@@ -54,216 +52,357 @@ class Generator(unittest.TestCase):
             with self.subTest(feature=feature):
                 self.assertIn(feature, texts)
 
+    def test_a_monitor_for_every_counter_step(self):
+        for seed in range(1, 80):
+            d = fuzz.generate(seed)
+            with self.subTest(seed=seed):
+                sites = set()
+                for i, op, k in re.findall(r"r(\d+) <= r\1 ([+-]) \d+'d(\d+);", d.text):
+                    sites.add(("counter_overflow" if op == "+" else "counter_underflow", f"r{i}", int(k)))
+                self.assertEqual({k for k in d.monitors if k[0].startswith("counter")}, sites)
 
-class OracleCase(TempDirCase):
-    """An fvlint output directory for the snap_counters / snap_fsm snapshots."""
+    def test_monitors_only_name_signals_of_the_design(self):
+        for seed in range(1, 80):
+            d = fuzz.generate(seed)
+            declared = set(IDENT.findall(d.text))
+            for key, m in d.monitors.items():
+                with self.subTest(seed=seed, key=key):
+                    self.assertEqual(len(m["en"]), len(m["bad"]))
+                    self.assertLessEqual(set(IDENT.findall(" ".join(m["en"] + m["bad"]))), declared)
 
-    def outdir(self, top, results: dict, cex_steps=None):
-        d = os.path.join(self.tmp, top)
-        os.makedirs(os.path.join(d, "elab"))
-        shutil.copy(snapshot(top), os.path.join(d, "elab", "main.json"))
-        shutil.copy(snapshot(top, "fsm"), os.path.join(d, "elab", "fsm.json"))
-        rows = []
-        for cid, st in results.items():
-            kind, _, target = cid.partition(":")
-            rows.append({"id": cid, "kind": kind, "target": target, "status": st,
-                         "cex_step": (cex_steps or {}).get(cid)})
+    def test_monitors_of_a_known_design(self):
+        # Seed 10 (two credit counters, a bounded and a plain one, a signed
+        # bit-select, a memory): the generator's own account of each construct.
+        m = fuzz.generate(10).monitors
+        self.assertEqual(m[("counter_overflow", "r0", 1)],
+                         {"en": ["(!(rst) && (in3 && ok0))"], "bad": ["(!(rst) && (in3 && ok0) && (r0 > 2'd2))"]})
+        self.assertEqual(m[("counter_underflow", "r0", 1)]["bad"],
+                         ["(!(rst) && !(in3 && ok0) && (in2 && r0 != 2'd0) && (r0 < 2'd1))"])
+        self.assertEqual(m[("counter_overflow", "r1", 3)]["bad"], ["(!(rst) && ((r3 == 2'd1)) && (r1 > 5'd28))"])
+        self.assertEqual(m[("counter_overflow", "r3", 1)]["bad"],
+                         ["(!(rst) && !(r3 == 2'd3) && ((r0 == 2'd0)) && (r3 > 2'd2))"])
+        self.assertEqual(m[("index_range", "sbit")]["bad"], ["((sidx < 0) || (sidx > 11))"])
+        self.assertEqual(m[("mem_addr", "mem.wr0")], {"en": ["in3"], "bad": ["(in3 && (r2[3:0]) > 9)"]})
+        self.assertEqual(m[("mem_addr", "mem.rd0")], {"en": ["1'b1"], "bad": ["((r2[3:0]) > 9)"]})
+        self.assertEqual(m[("index_range", "sbit")]["en"], ["1'b1"])               # always evaluated
+        self.assertEqual(len(m), 9)
+
+    def test_case_and_part_select_monitors(self):
+        seen = set()
+        for seed in range(1, 80):
+            d = fuzz.generate(seed)
+            m = d.monitors
+            if "unique casez" in d.text:
+                self.assertEqual((m[("parallel_case", "y")]["bad"], m[("full_case", "y")]["bad"]),
+                                 (["(in0 && in1)"], ["1'b0"]))                   # the default always matches
+                self.assertEqual((m[("parallel_case", "y")]["en"], m[("full_case", "y")]["en"]), (["1'b1"], ["1'b1"]))
+                self.assertNotIn("y", d.clock)                                    # combinational
+                self.assertLessEqual({"in0", "in1"}, d.reads["y"])
+                seen.add("casez")
+            elif "unique case" in d.text:
+                k = re.search(r"unique case \(1'b1\) r(\d+)\[0\]", d.text).group(1)
+                self.assertEqual(m[("parallel_case", "y")]["bad"], [f"(r{k}[0] && r{k}[1])"])
+                self.assertEqual(m[("full_case", "y")]["bad"], [f"(!r{k}[0] && !r{k}[1])"])
+                self.assertEqual((m[("parallel_case", "y")]["en"], m[("full_case", "y")]["en"]), (["1'b1"], ["1'b1"]))
+                seen.add("onehot")
+            lanes = re.search(r"wire \[(\d+):0\] lanes = .*\n.*lanes\[r(\d+)\*4", d.text)
+            if lanes:
+                top, k = lanes.groups()
+                self.assertEqual(m[("index_range", "sel")], {"en": ["1'b1"],
+                                                             "bad": [f"(r{k} > {(int(top) + 1) // 4 - 1})"]})
+                seen.add("lanes")
+        self.assertEqual(seen, {"casez", "onehot", "lanes"})
+
+    def test_reset_stages(self):
+        # Only the synchronizer stages something uses survive elaboration.
+        self.assertEqual(fuzz.generate(4).stages, ["s1", "s2"])         # a register resets on s2
+        self.assertEqual(fuzz.generate(9).stages, ["s1"])               # s2 unused; s1 feeds msk, which is used
+        self.assertEqual(fuzz.generate(31).stages, [])                  # synchronizer present but unused
+        self.assertEqual(fuzz.generate(10).stages, [])                  # no synchronizer
+        self.assertEqual(fuzz.generate(9).regs, [("r0", 4), ("r1", 4), ("r2", 3), ("s1", 1), ("s2", 1), ("msk", 1)])
+        self.assertEqual(fuzz.generate(10).regs, [("r0", 2), ("r1", 5), ("r2", 5), ("r3", 2), ("ok0", 1), ("ok2", 1)])
+
+    def test_clocks_and_dependencies(self):
+        # Seed 7: r2 runs on clk2 and the memory address is r2; r1's checks
+        # depend on clk registers only.
+        d = fuzz.generate(7)
+        self.assertEqual(d.clock, {"r0": "posedge clk", "ok1": "posedge clk", "r1": "posedge clk",
+                                   "r2": "posedge clk2", "mem": "posedge clk"})
+        self.assertEqual(d.reads["sel"], {"wire", "lanes", "r1"})
+        self.assertEqual(d.clocks_of(" ".join(d.monitors[("counter_overflow", "r1", 1)]["bad"])), {"posedge clk"})
+        self.assertEqual(d.clocks_of(" ".join(d.monitors[("mem_addr", "mem.rd0")]["bad"])),
+                         {"posedge clk", "posedge clk2"})
+        self.assertEqual(d.clocks_of("in0 && din"), set())
+        neg = next(fuzz.generate(s) for s in range(1, 80) if "negedge clk" in fuzz.generate(s).text)
+        self.assertIn("negedge clk", set(neg.clock.values()))
+        sync = fuzz.generate(9)                                         # through wires and the synchronizer
+        self.assertEqual(sync.clocks_of("msk"), {"posedge clk"})
+        self.assertTrue({"rst", "s1"} <= sync.reads["s2"] and "rst" in sync.reads["s1"])
+
+
+def design(**kw):
+    text = "module t (input clk, input rst, input e, output [3:0] o);\n  reg [3:0] q;\nendmodule\n"
+    return Design(**dict(dict(text=text, top="t", regs=[("q", 4)]), **kw))
+
+
+def row(cid, status, prop="", step=None):
+    kind, _, target = cid.partition(":")
+    return {"id": cid, "kind": kind, "target": target, "property": prop, "status": status, "cex_step": step}
+
+
+class OracleText(unittest.TestCase):
+    def test_monitors_are_appended(self):
+        d = design(stages=["s1", "s2"], regs=[("q", 4), ("s1", 1)])
+        text, first = fuzz.oracle_text(d, ["(a)", "(b && c)"], 3)
+        lines = text.splitlines()
+        self.assertEqual(lines[:2], d.text.splitlines()[:2])           # the design itself, unchanged
+        self.assertIn("  initial begin q = 4'd0; s1 = 1'd0; end", lines)
+        self.assertIn("  always @* if (fvo_n < 8'd3) assume (rst); else assume (!rst);", lines)
+        self.assertIn("  wire fvo_gate = !rst && !s2;", lines)
+        self.assertEqual(lines[first - 1:], ["  always @* if (fvo_gate) assert (!((a)));",
+                                             "  always @* if (fvo_gate) assert (!((b && c)));", "endmodule"])
+        self.assertEqual(text.count("endmodule"), 1)
+        self.assertIn("  wire fvo_gate = !rst;", fuzz.oracle_text(design(), ["x"], 1)[0])
+        self.assertIn("  wire fvo_gate = !rst && !s1;", fuzz.oracle_text(design(stages=["s1"]), ["x"], 1)[0])
+
+    def test_one_clock_jobs_leave_other_clocks_out(self):
+        text = ("module t (input clk, input clk2, input rst, input e);\n  reg a, b, c;\n"
+                "  always @(posedge clk or posedge e) if (e) a <= 1'b1; else a <= rst;\n"
+                "  always @(negedge clk) b <= a;\n  always @(posedge clk2) c <= b;\n"
+                "  always @* begin end\nendmodule\n")
+        d = Design(text, "t", regs=[("a", 1), ("b", 1), ("c", 1)])
+        lines = fuzz.oracle_text(d, ["(a)"], 1, "posedge clk")[0].splitlines()
+        self.assertEqual(lines[2:6], ["  always @(posedge clk or posedge e) if (e) a <= 1'b1; else a <= rst;",
+                                      "  // (oracle: on another clock, not modelled here)",
+                                      "  // (oracle: on another clock, not modelled here)",
+                                      "  always @* begin end"])
+        lines = fuzz.oracle_text(d, ["(b)"], 1, "negedge clk")[0].splitlines()
+        self.assertEqual(lines[2:4], ["  // (oracle: on another clock, not modelled here)",
+                                      "  always @(negedge clk) b <= a;"])
+        self.assertEqual(fuzz.oracle_text(d, ["(c)"], 1)[0].splitlines()[2:5], text.splitlines()[2:5])   # two clocks
+
+    def test_log(self):
+        log = ("SBY 1:00:00 [run] summary: counterexample trace: run/engine_0/trace0.vcd\n"
+               "SBY 1:00:00 [run] summary:   failed assertion t._witness_.check_oracle_sv_12_assert_3 at "
+               "oracle.sv:12.27-12.40\n"
+               "SBY 1:00:00 [run] summary: counterexample trace: run/engine_0/trace1.vcd\n"
+               "SBY 1:00:00 [run] summary:   failed assertion t._witness_.check_oracle_sv_14_assert_5 at "
+               "oracle.sv:14.27-14.40 steps 7, 9\n"
+               "SBY 1:00:00 [run] summary:   failed assertion t._witness_.check_oracle_sv_12_assert_3 at "
+               "oracle.sv:12.27-12.40 step 9\n"
+               "SBY 1:00:00 [run] DONE (FAIL, rc=2)\n")
+        self.assertEqual(fuzz.read_oracle_log(log), ("FAIL", {12: 0, 14: 7}))
+        self.assertEqual(fuzz.read_oracle_log(""), ("ERROR", {}))
+        self.assertEqual(fuzz.read_oracle_log("SBY [run] DONE (TIMEOUT, rc=8)\n"), ("TIMEOUT", {}))
+
+    def test_result_key(self):
+        self.assertEqual(fuzz.result_key(row("counter_overflow:r0#1", "FAIL", "r0 + 2 never wraps past 15 (4 bits)")),
+                         ("counter_overflow", "r0", 2))
+        self.assertEqual(fuzz.result_key(row("counter_underflow:r1", "PROVEN", "r1 - 3 never wraps below 0")),
+                         ("counter_underflow", "r1", 3))
+        self.assertIsNone(fuzz.result_key(row("counter_overflow:r1", "PROVEN", "something else")))
+        self.assertEqual(fuzz.result_key(row("mem_addr:mem.wr0", "PROVEN")), ("mem_addr", "mem.wr0"))
+
+
+class Oracle(TempDirCase):
+    OVF = ("counter_overflow", "q", 1)
+
+    def setUp(self):
+        super().setUp()
+        self.d = design(monitors={self.OVF: {"en": ["(e)"], "bad": ["(e && q > 4'd14)"]},
+                                  ("counter_underflow", "q", 1): {"en": ["(!e)"], "bad": ["(!e && q < 4'd1)"]},
+                                  ("mem_addr", "m.wr0"): {"en": ["e"], "bad": ["(e && q > 9)"]}})
+
+    def outdir(self, rows):
+        d = os.path.join(self.tmp, "out")
+        os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "results.json"), "w") as f:
             json.dump({"results": rows}, f)
         return d
 
-    def oracle(self, d, top, answer, depth=24, max_depth=80):
-        """answer(call_props) -> JobResult for the oracle's single BMC job."""
-        calls = []
+    def oracle(self, rows, fails=None, status="PASS", design=None, depth=24, max_depth=80, opts=None):
+        """fails: {text of a condition: step}; the fake SymbiYosys reports
+        every assertion whose line contains that text as failed at that step."""
+        fails = fails or {}
+        self.runs, self.texts = [], []
 
-        def fake_run(eng, tag, spec, props, mode, depth, multiclock, engine=None, **kw):
-            calls.append((tag, spec, props, mode, depth, multiclock, engine))
-            self.engine, self.extra = eng, kw
-            return answer(props)
-        with mock.patch.object(Engine, "run", fake_run), \
-                mock.patch.object(Toolchain, "discover",
-                                  staticmethod(lambda solver=None: mock.Mock(abc=None, solver="z3"))):
-            out = fuzz.oracle(d, top, depth, {}, max_depth)
-        return out, calls
+        class Tools:
+            solver = "z3"
 
+            def run_sby(tools, sby, cwd, timeout):
+                with open(sby) as f:
+                    text = f.read()
+                self.runs.append((text, timeout))
+                sv = text.rstrip().splitlines()[-1]
+                with open(os.path.join(cwd, sv)) as f:
+                    self.texts.append(f.read())
+                log = ""
+                for n, line in enumerate(self.texts[-1].splitlines(), 1):
+                    for cond, step in fails.items():
+                        if "assert (" in line and cond in line:
+                            log += f"SBY [run] summary:   failed assertion t.x at {sv}:{n}.1-1.2 step {step}\n"
+                name = os.path.splitext(sv)[0]
+                os.makedirs(os.path.join(cwd, name), exist_ok=True)
+                with open(os.path.join(cwd, name, "logfile.txt"), "w") as f:
+                    f.write(log + f"SBY [run] DONE ({status}, rc=0)\n")
+                return 0
+        with mock.patch.object(Toolchain, "discover", staticmethod(lambda solver=None: Tools())):
+            return fuzz.oracle(self.outdir(rows), design or self.d, depth, opts or {}, max_depth)
 
-class Oracle(OracleCase):
+    @property
+    def text(self):
+        return "\n".join(self.texts)
+
+    def asserts(self):
+        return [ln.strip() for ln in self.text.splitlines() if "assert (" in ln]
+
     def test_agreeing_verdicts(self):
-        d = self.outdir("snap_counters", {"counter_overflow:mod_q": "PROVEN", "counter_underflow:down_q": "FAIL",
-                                          "counter_overflow:free_q": "INFO"}, {"counter_underflow:down_q": 6})
-        (problems, inconclusive), calls = self.oracle(
-            d, "snap_counters", lambda props: JobResult("FAIL", {props[1].name: PropResult("fail")}))
-        self.assertEqual((problems, inconclusive), ([], []))
-        (tag, spec, props, mode, depth, mc, engine), = calls
-        self.assertEqual((tag, mode, depth, mc, engine), ("oracle_bmc", "bmc", 24, False, "smtbmc --keep-going z3"))
-        self.assertTrue(spec.full)                                      # the whole cone, no cuts
-        self.assertEqual([p.mode for p in props], [0, 0])
-        rst = Netlist.load(snapshot("snap_counters"), "snap_counters").ports["rst"]["bits"][0]
-        self.assertTrue(all((rst, 0) in p.conds for p in props))        # reset gating as in fvlint
-        self.assertEqual(self.engine.resets.primary.name, "rst")        # reset held as fvlint holds it
+        rows = [row("counter_overflow:q", "PROVEN", "q + 1 never wraps past 15 (4 bits)"),
+                row("counter_underflow:q", "VACUOUS", "q - 1 never wraps below 0"),
+                row("mem_addr:m.wr0", "FAIL", step=5), row("counter_overflow:other", "INFO")]
+        self.assertEqual(self.oracle(rows, fails={"(e && q > 9)": 3}), ([], []))
+        self.assertEqual(self.asserts(), ["always @* if (fvo_gate) assert (!((e && q > 4'd14)));",   # PROVEN: never bad
+                                          "always @* if (fvo_gate) assert (!((!e)));",   # VACUOUS: never even active
+                                          "always @* if (fvo_gate) assert (!((e && q > 9)));"])     # FAIL: must fail
+        (sby, timeout), = self.runs
+        self.assertEqual(sby, "[options]\nmode bmc\ndepth 24\ntimeout 300\n\n[engines]\nsmtbmc --keep-going z3\n\n"
+                              "[script]\nread_verilog -formal -sv oracle.sv\nprep -top t\n\n[files]\noracle.sv\n")
+        self.assertEqual(timeout, 300)
+        self.assertIn("assume (rst); else assume (!rst);", self.text)
+        self.assertIn("fvo_n < 8'd1)", self.text)                       # no synchronizer: one cycle of reset
 
     def test_disagreements(self):
-        d = self.outdir("snap_counters", {"counter_overflow:mod_q": "PROVEN", "counter_overflow:acc": "VACUOUS",
-                                          "counter_underflow:down_q": "FAIL"}, {"counter_underflow:down_q": 3})
-        (problems, inconclusive), calls = self.oracle(
-            d, "snap_counters", lambda props: JobResult("FAIL", {props[0].name: PropResult("fail"),
-                                                                 props[1].name: PropResult("fail")}))
-        self.assertEqual(problems, ["counter_overflow:mod_q: fvlint PROVEN, oracle found a violation",
-                                    "counter_overflow:acc: fvlint VACUOUS, oracle reached the check's condition",
-                                    "counter_underflow:down_q: fvlint FAIL, oracle found no violation within 24 steps"])
+        rows = [row("counter_overflow:q", "PROVEN", "q + 1 never wraps past 15 (4 bits)"),
+                row("counter_underflow:q", "VACUOUS", "q - 1 never wraps below 0"),
+                row("mem_addr:m.wr0", "FAIL", step=3)]
+        problems, inconclusive = self.oracle(rows, fails={"q > 4'd14": 6, "(!e)": 2}, status="FAIL")
+        self.assertEqual(problems, ["counter_overflow:q: fvlint PROVEN, oracle found a violation at step 6",
+                                    "counter_underflow:q: fvlint VACUOUS, oracle reached the check's condition",
+                                    "mem_addr:m.wr0: fvlint FAIL, oracle found no violation within 24 steps"])
         self.assertEqual(inconclusive, [])
-        self.assertEqual([p.mode for p in calls[0][2]], [0, 2, 0])      # VACUOUS: probe the condition
 
     def test_fail_beyond_the_oracle(self):
-        d = self.outdir("snap_counters", {"counter_underflow:down_q": "FAIL"}, {"counter_underflow:down_q": 90})
-        (problems, inconclusive), calls = self.oracle(d, "snap_counters", lambda props: JobResult("PASS"))
+        problems, inconclusive = self.oracle([row("mem_addr:m.wr0", "FAIL", step=90)])
         self.assertEqual(problems, [])
-        self.assertEqual(calls[0][4], 80)                               # bound capped at max_depth
-        self.assertIn("FAIL at step 90 beyond the oracle's reach (bound 80, job PASS)", inconclusive[0])
+        self.assertIn("depth 80\n", self.runs[0][0])                     # capped at max_depth
+        self.assertEqual(inconclusive,
+                         ["mem_addr:m.wr0: FAIL at step 90 beyond the oracle's reach (bound 80, job PASS)"])
+        self.oracle([row("mem_addr:m.wr0", "FAIL", step=30)])
+        self.assertIn("depth 34\n", self.runs[0][0])                     # step + 4
 
     def test_unfinished_oracle_job(self):
-        d = self.outdir("snap_counters", {"counter_underflow:down_q": "FAIL"}, {"counter_underflow:down_q": 2})
-        (problems, inconclusive), calls = self.oracle(d, "snap_counters", lambda props: JobResult("TIMEOUT"))
-        self.assertEqual((problems, len(inconclusive)), ([], 1))
-        self.assertEqual(calls[0][4], 24)                               # max(depth, step + 4)
+        rows = [row("mem_addr:m.wr0", "FAIL", step=2), row("counter_overflow:q", "PROVEN", "q + 1 never wraps")]
+        problems, inconclusive = self.oracle(rows, status="TIMEOUT")
+        self.assertEqual(problems, [])
+        self.assertEqual(inconclusive,
+                         ["mem_addr:m.wr0: FAIL at step 2 beyond the oracle's reach (bound 24, job TIMEOUT)",
+                          "counter_overflow:q: PROVEN not confirmed, oracle job TIMEOUT"])
+        problems, _ = self.oracle(rows, fails={"q > 4'd14": 3}, status="TIMEOUT")    # a found violation counts
+        self.assertEqual(problems, ["counter_overflow:q: fvlint PROVEN, oracle found a violation at step 3"])
+
+    def test_grouping(self):
+        two = {"en": ["(a)", "(b)"], "bad": ["(a && q > 4'd13)", "(b && q > 4'd13)"]}
+        d = design(monitors={("counter_overflow", "q", 2): two})
+        rows = [row("counter_overflow:q", "PROVEN", "q + 2 never wraps past 15 (4 bits)"),
+                row("counter_overflow:q#1", "PROVEN", "q + 2 never wraps past 15 (4 bits)")]
+        self.assertEqual(self.oracle(rows, design=d), ([], []))
+        self.assertEqual(self.asserts(), ["always @* if (fvo_gate) assert (!((a && q > 4'd13) || (b && q > 4'd13)));"])
+        rows[1]["status"] = "VACUOUS"
+        problems, inconclusive = self.oracle(rows, design=d)
+        self.assertEqual((problems, self.asserts()),
+                         ([], ["always @* if (fvo_gate) assert (!((a && q > 4'd13) || (b && q > 4'd13)));"]))
+        self.assertEqual(inconclusive, ["counter_overflow:q, counter_overflow:q#1: VACUOUS and PROVEN for constructs "
+                                        "the oracle watches together; only the absence of a violation is checked"])
+        rows[1]["status"], rows[1]["cex_step"] = "FAIL", 4
+        problems, inconclusive = self.oracle(rows, design=d, fails={"q > 4'd13": 2})
+        self.assertEqual(problems, [])
+        self.assertEqual(inconclusive, ["counter_overflow:q, counter_overflow:q#1: FAIL and PROVEN for constructs "
+                                        "the oracle watches together; only the FAIL is checked"])
+
+    def test_checks_without_a_monitor(self):
+        rows = [row("index_range:sel", "PROVEN"), row("counter_overflow:q", "FAIL", "q + 3 never wraps", 2),
+                row("counter_overflow:q#1", "UNKNOWN", "q + 1 never wraps")]
+        problems, inconclusive = self.oracle(rows)
+        self.assertEqual(problems, [])
+        self.assertEqual(inconclusive, ["index_range:sel: PROVEN, but the generator has no monitor for it",
+                                        "counter_overflow:q: FAIL, but the generator has no monitor for it"])
+        self.assertEqual(self.runs, [])                                 # nothing left to check: no job
 
     def test_unreachable_fsm_state(self):
-        d = self.outdir("snap_fsm", {"fsm_unreachable:st=2'b11": "FAIL", "fsm_trap:st={2'b10}": "WARN"})
-        (problems, _), calls = self.oracle(d, "snap_fsm", lambda props: JobResult("PASS"))
-        self.assertEqual(problems, [])
-        (p,) = calls[0][2]
-        self.assertEqual(p.ports, {"v": Netlist.load(snapshot("snap_fsm"), "snap_fsm").netnames["st"]["bits"]})
-        self.assertEqual((p.checker, p.params, p.mode),
-                         ("fvl_member", {"W": 2, "N": 3, "SET": 0 | (1 << 2) | (2 << 4)}, 0))
-        (problems, _), _ = self.oracle(d, "snap_fsm", lambda props: JobResult("FAIL", {"fvl_t0": PropResult("fail")}))
-        self.assertEqual(problems, ["fsm_unreachable:st=2'b11: fvlint says unreachable, oracle reached it"])
+        rows = [row("fsm_unreachable:q=4'b1010", "FAIL"), row("fsm_unreachable:q=4'd3", "FAIL"),
+                row("fsm_unreachable:a.b=2'b01", "FAIL"), row("fsm_unreachable:q=4'b0001", "PROVEN")]
+        self.assertEqual(self.oracle(rows), ([], []))
+        self.assertEqual(self.asserts(), ["always @* if (fvo_gate) assert (!((q == 4'b1010)));"])
+        problems, _ = self.oracle(rows[:1], fails={"q == 4'b1010": 1})
+        self.assertEqual(problems, ["fsm_unreachable:q=4'b1010: fvlint says unreachable, oracle reached it"])
+        self.assertNotIn(("state", "q=4'b1010"), self.d.monitors)      # the design's own monitors are untouched
 
-    def test_nothing_to_check(self):
-        d = self.outdir("snap_counters", {"counter_overflow:free_q": "INFO", "counter_overflow:mod_q": "UNKNOWN",
-                                          "fsm_unreachable:nope=2'b11": "FAIL", "fsm_unreachable:st=x": "FAIL",
-                                          "fsm_unreachable:free_q=4'b1111": "WAIVED"})
-        out, calls = self.oracle(d, "snap_counters", lambda props: self.fail("no job"))
-        self.assertEqual((out, calls), (([], []), []))
+    def test_clock_domains_get_their_own_jobs(self):
+        # q and a run on clk, p on clk2, and q's increment depends on p: that
+        # check spans two clocks; the memory address (a) check does not.
+        mon = {("counter_overflow", "q", 1): {"en": ["(e && p)"], "bad": ["(e && p && q > 4'd14)"]},
+               ("mem_addr", "m.wr0"): {"en": ["e"], "bad": ["(e && a > 9)"]}}
+        d = design(monitors=mon, stages=["s1", "s2"],
+                   clock={"q": "posedge clk", "a": "posedge clk", "p": "posedge clk2", "s1": "posedge clk",
+                          "s2": "posedge clk"},
+                   reads={"q": {"p"}, "a": {"e"}, "s2": {"s1"}, "s1": {"rst"}})
+        rows = [row("mem_addr:m.wr0", "FAIL", step=25), row("counter_overflow:q", "PROVEN", "q + 1 never wraps")]
+        problems, inconclusive = self.oracle(rows, design=d, depth=10, max_depth=30, fails={"a > 9": 20})
+        self.assertEqual((problems, inconclusive), ([], []))
+        (one, _), (two, _) = self.runs
+        self.assertIn("[files]\noracle.sv\n", one)
+        self.assertNotIn("multiclock", one)
+        self.assertIn("depth 29\n", one)                                 # step + 4, one step per cycle
+        self.assertIn("[files]\noracle_mc.sv\n", two)
+        self.assertIn("multiclock on\n", two)
+        self.assertIn("depth 20\n", two)                                 # two global steps per cycle
+        self.assertIn("fvo_n < 8'd3)", self.texts[0])                    # (1 + 2 stages) cycles
+        self.assertIn("fvo_n < 8'd6)", self.texts[1])                    # ... doubled
+        self.assertIn("wire fvo_gate = !rst && !s2;", self.texts[1])
+        self.assertEqual([[ln.strip() for ln in t.splitlines() if "assert (" in ln] for t in self.texts],
+                         [["always @* if (fvo_gate) assert (!((e && a > 9)));"],
+                          ["always @* if (fvo_gate) assert (!((e && p && q > 4'd14)));"]])
+        # A step of fvlint's that counts cycles is scaled to global steps in a two-clock job.
+        mon[("mem_addr", "m.wr0")] = {"en": ["e"], "bad": ["(e && p && a > 9)"]}
+        problems, inconclusive = self.oracle(rows[:1], design=d, depth=10, max_depth=30)
+        self.assertIn("depth 58\n", self.runs[0][0])
+        self.assertEqual(problems, ["mem_addr:m.wr0: fvlint FAIL, oracle found no violation within 58 steps"])
+        rows[0]["cex_step"] = 27
+        problems, inconclusive = self.oracle(rows[:1], design=d, depth=10, max_depth=30)
+        self.assertEqual((problems, inconclusive),
+                         ([], ["mem_addr:m.wr0: FAIL at step 27 beyond the oracle's reach (bound 60, job PASS)"]))
 
-    def test_wide_state_registers_are_skipped(self):
-        d = self.outdir("snap_counters", {"fsm_unreachable:acc=6'b111111": "FAIL",      # 6 bits: checked
-                                          "fsm_unreachable:o=32'b1": "FAIL"})          # too wide to enumerate
-        (_, _), calls = self.oracle(d, "snap_counters", lambda props: JobResult("PASS"))
-        self.assertEqual([p.params["W"] for p in calls[0][2]], [6])
+    def test_a_job_per_clock_edge(self):
+        mon = {("counter_overflow", "q", 1): {"en": ["(e)"], "bad": ["(e && q > 4'd14)"]},
+               ("counter_overflow", "n", 1): {"en": ["(e)"], "bad": ["(e && n > 4'd14)"]},
+               ("parallel_case", "y"): {"en": ["1'b1"], "bad": ["(e && f)"]}}
+        d = design(monitors=mon, clock={"q": "posedge clk", "n": "negedge clk"})
+        rows = [row("counter_overflow:q", "PROVEN", "q + 1 never wraps"),
+                row("counter_overflow:n", "PROVEN", "n + 1 never wraps"), row("parallel_case:y", "PROVEN")]
+        self.assertEqual(self.oracle(rows, design=d), ([], []))
+        self.assertEqual([r[0].rstrip().splitlines()[-1] for r in self.runs],
+                         ["oracle_negedge_clk.sv", "oracle.sv"])
+        self.assertEqual([[ln.strip() for ln in t.splitlines() if "assert (" in ln] for t in self.texts],
+                         [["always @* if (fvo_gate) assert (!((e && n > 4'd14)));"],
+                          ["always @* if (fvo_gate) assert (!((e && q > 4'd14)));",
+                           "always @* if (fvo_gate) assert (!((e && f)));"]])      # no registers: any one-clock job
+        problems, _ = self.oracle(rows, design=d, fails={"n > 4'd14": 4})
+        self.assertEqual(problems, ["counter_overflow:n: fvlint PROVEN, oracle found a violation at step 4"])
 
-    def test_eight_bit_state_registers_are_enumerated(self):
-        d = self.outdir("snap_ops", {"fsm_unreachable:w=8'b00000011": "FAIL"})
-        _, calls = self.oracle(d, "snap_ops", lambda props: JobResult("PASS"))
-        (p,) = calls[0][2]
-        self.assertEqual((p.params["W"], p.params["N"]), (8, 255))
+    def test_timeout_option(self):
+        self.oracle([row("mem_addr:m.wr0", "FAIL", step=1)], fails={"q > 9": 1}, opts={"timeout": 7})
+        self.assertIn("timeout 7\n", self.runs[0][0])
+        self.assertEqual(self.runs[0][1], 7)
 
-    def test_oracle_regenerates_checks_with_fvlints_default_level(self):
-        seen = []
-        real = detect_all
+    def test_missing_log(self):
+        class Silent:
+            solver = None
 
-        def spy(nl, max_level):
-            seen.append(max_level)
-            return real(nl, max_level)
-        d = self.outdir("snap_counters", {"counter_overflow:mod_q": "PROVEN"})
-        with mock.patch("fvlint.detect.detect_all", spy):
-            self.oracle(d, "snap_counters", lambda props: JobResult("PASS"))
-        self.assertEqual(seen, [cli.build_parser().parse_args(["--top", "t"]).max_level])
-
-    def test_timeout_reaches_the_oracle_engine(self):
-        d = self.outdir("snap_counters", {"counter_overflow:mod_q": "PROVEN"})
-        calls = []
-        with mock.patch.object(Engine, "run", lambda eng, *a, **kw: calls.append(eng.opts) or JobResult("PASS")), \
-                mock.patch.object(Toolchain, "discover",
-                                  staticmethod(lambda solver=None: mock.Mock(abc=None, solver="z3"))):
-            fuzz.oracle(d, "snap_counters", 24, {"timeout": 7}, 80)
-        self.assertEqual((calls[0].timeout, calls[0].engine), (7, "smtbmc"))
-
-    def test_active_high_primary_reset_gating(self):
-        # snap_counters' rst is active high: the oracle's own gating holds it at 0.
-        from fvlint.resets import ResetBit, Resets
-        nl = Netlist.load(snapshot("snap_counters"), "snap_counters")
-        rst, lim0 = nl.ports["rst"]["bits"][0], nl.netnames["lim"]["bits"][0]
-        resets = Resets(ResetBit("rst", rst, 1), [ResetBit("lim[0]", lim0, 1, 1)], 2)
-        d = self.outdir("snap_counters", {"counter_overflow:mod_q": "PROVEN"})
-        with mock.patch("fvlint.resets.discover", lambda *a, **kw: resets):
-            _, calls = self.oracle(d, "snap_counters", lambda props: JobResult("PASS"))
-        own, indep = calls[0][2]
-        chk = {c.id: c for c in detect_all(nl, 3)[0]}["counter_overflow:mod_q"]
-        settled = self.extra["extra_cells"]["fvo_settle"]["connections"]["done"][0]
-        self.assertEqual(own.conds, chk.conds + [(rst, 0), (lim0, 0)])
-        self.assertEqual(indep.conds, chk.conds + [(rst, 0), (settled, 1)])
-
-    def test_bound_and_reach(self):
-        # bound = min(max(depth, cex step + 4), max_depth); a FAIL counts as
-        # missed only if its step + 4 fits within a finished bound.
-        cases = [({"counter_underflow:down_q": None}, 2, 4), ({"counter_underflow:down_q": 6}, 2, 10),
-                 ({"counter_underflow:down_q": 77}, 2, 80)]
-        for steps, depth, bound in cases:
-            with self.subTest(steps=steps):
-                d = self.outdir("snap_counters", {"counter_underflow:down_q": "FAIL"}, steps)
-                (problems, inconc), calls = self.oracle(d, "snap_counters", lambda props: JobResult("PASS"),
-                                                        depth=depth)
-                self.assertEqual(calls[0][4], bound)
-                missed = steps["counter_underflow:down_q"] != 77                # 77 + 4 > 80: out of reach
-                self.assertEqual((len(problems), len(inconc)), (1, 0) if missed else (0, 1))
-                shutil.rmtree(d)
-
-    def test_index_checks_use_the_oracles_own_bounds(self):
-        # Bounds come from the $shiftx cell and are compared in wider signed
-        # arithmetic: the 0.2.0 signed-index false proof had a wrong bound.
-        d = self.outdir("snap_index", {"index_range:ys": "PROVEN", "index_range:yu": "FAIL"},
-                        {"index_range:yu": 1})
-        _, calls = self.oracle(d, "snap_index", lambda props: JobResult("FAIL", {props[1].name: PropResult("fail")}))
-        got = [(p.checker, p.params) for p in calls[0][2]]
-        self.assertEqual(got, [("fvo_index", {"BW": 4, "SIGNED": 1, "MAXOFF": 11}),
-                               ("fvo_index", {"BW": 4, "SIGNED": 0, "MAXOFF": 11})])
-        nl = Netlist.load(snapshot("snap_index"), "snap_index")
-        idx = {c.id: c for c in detect_all(nl, 3)[0]}
-        self.assertEqual([p.ports for p in calls[0][2]], [idx["index_range:ys"].ports, idx["index_range:yu"].ports])
-        self.assertEqual(set(self.extra["extra_files"]), {"fvo_oracle.v"})
-
-    def test_derived_resets_get_independent_gating(self):
-        # snap_reset: primary rst_n, synchronized r1 and r2 (reset held 3 cycles).
-        nl = Netlist.load(snapshot("snap_reset"), "snap_reset")
-        d = self.outdir("snap_reset", {"counter_overflow:q": "PROVEN"})
-        (problems, _), calls = self.oracle(
-            d, "snap_reset", lambda props: JobResult("FAIL", {props[1].name: PropResult("fail")}))
-        own, indep = calls[0][2]
-        rst_n = nl.ports["rst_n"]["bits"][0]
-        derived = [(nl.netnames[n]["bits"][0], 1) for n in ("r1", "r2")]
-        chk = {c.id: c for c in detect_all(nl, 3)[0]}["counter_overflow:q"]
-        settled = self.extra["extra_cells"]["fvo_settle"]["connections"]["done"][0]
-        self.assertEqual(own.conds, chk.conds + [(rst_n, 1)] + derived)
-        self.assertEqual(indep.conds, chk.conds + [(rst_n, 1), (settled, 1)])     # no derived resets
-        self.assertNotIn(settled, [b for n in nl.netnames.values() for b in n["bits"]])   # a fresh bit
-        self.assertEqual(self.extra["extra_cells"]["fvo_settle"],
-                         {"hide_name": 0, "type": "fvo_settled", "parameters": {"N": 3 + fuzz.SETTLE},
-                          "attributes": {}, "port_directions": {"done": "output"}, "connections": {"done": [settled]}})
-        self.assertEqual(calls[0][4], 24)
-        self.assertEqual((own.ports, indep.ports), (chk.ports, chk.ports))
-        _, calls = self.oracle(d, "snap_reset", lambda props: JobResult("PASS"), depth=2)
-        self.assertEqual(calls[0][4], 3 + fuzz.SETTLE + 6)              # deep enough to get past the settle time
-        with mock.patch("fvlint.cone.needs_multiclock", return_value=True):
-            self.oracle(d, "snap_reset", lambda props: JobResult("PASS"))
-        self.assertEqual(self.extra["extra_cells"]["fvo_settle"]["parameters"], {"N": 2 * (3 + fuzz.SETTLE)})
-        self.assertEqual(problems, ["counter_overflow:q: fvlint PROVEN, oracle found a violation "
-                                    "(with the oracle's own reset gating)"])
-
-    def test_fail_verdicts_use_fvlints_gating_only(self):
-        d = self.outdir("snap_reset", {"counter_overflow:q": "FAIL"}, {"counter_overflow:q": 4})
-        _, calls = self.oracle(d, "snap_reset", lambda props: JobResult("FAIL", {props[0].name: PropResult("fail")}))
-        self.assertEqual(len(calls[0][2]), 1)
-
-    def test_oracle_library_matches_its_props(self):
-        mods = dict(re.findall(r"module (\w+) #\((.*?)\)\s*\(", fuzz.ORACLE_V, re.S))
-        self.assertEqual(set(re.findall(r"parameter integer (\w+)", mods["fvo_index"])) - {"NC", "MODE"},
-                         {"BW", "SIGNED", "MAXOFF"})
-        self.assertIn("N", re.findall(r"parameter integer (\w+)", mods["fvo_settled"]))
-
-    def test_oracle_checks_match_fvlint_checks(self):
-        nl = Netlist.load(snapshot("snap_counters"), "snap_counters")
-        ids = {c.id for c in detect_all(nl, 3)[0]}
-        self.assertIn("counter_overflow:mod_q", ids)                    # the ids used above are real
+            def run_sby(self, sby, cwd, timeout):
+                return -1
+        with mock.patch.object(Toolchain, "discover", staticmethod(lambda solver=None: Silent())):
+            problems, inconclusive = fuzz.oracle(self.outdir([row("mem_addr:m.wr0", "PROVEN")]), self.d, 24, {})
+        self.assertEqual((problems, inconclusive), ([], ["mem_addr:m.wr0: PROVEN not confirmed, oracle job ERROR"]))
 
 
 class Driver(TempDirCase):
@@ -284,9 +423,9 @@ class Driver(TempDirCase):
             return 1
         oracle_calls = []
 
-        def fake_oracle(d, top, depth, opts):
-            oracle_calls.append((os.path.basename(d), top, depth))
-            return (["x: disagreement"], ["y: too deep"]) if top == "fz3" else ([], [])
+        def fake_oracle(d, design, depth, opts):
+            oracle_calls.append((os.path.basename(d), design.top, depth))
+            return (["x: disagreement"], ["y: too deep"]) if design.top == "fz3" else ([], [])
         with mock.patch.object(cli, "main", fake_main), mock.patch.object(fuzz, "oracle", fake_oracle), \
                 captured() as (_, err):
             s = fuzz.run([1, 2, 3, 4], self.tmp, depth=12, extra_args=["--engine", "pdr"], verbose=True)
@@ -304,7 +443,7 @@ class Driver(TempDirCase):
         self.assertEqual(s["inconclusive"], ["seed 3: y: too deep"])
         self.assertIn("seed 3: 2 checks, 1 problem(s)", err.getvalue())
         with open(os.path.join(self.tmp, "seed1", "fz1.v")) as f:
-            self.assertEqual(f.read(), fuzz.generate(1)[0])
+            self.assertEqual(f.read(), fuzz.generate(1).text)
 
     def test_main(self):
         captured_args = []

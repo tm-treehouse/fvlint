@@ -14,10 +14,16 @@ survivors are listed so a person can tell which.
     python tests/unit/mutation.py --list              # count mutants only
 
 Survivors that are equivalent or accepted are listed, each with a reason, in
-mutation_baseline.json; the report separates new survivors from those, and
---strict fails on new ones.  With --json, finished mutants are also appended
-to JSON.partial as they complete, and a rerun resumes from it as long as no
-source or test file changed.  Lines ending in `# pragma: no mutate` are skipped.  Needs no toolchain.
+mutation_baseline.json.  An entry names the module, the enclosing function
+(or class, or <module>), the line of code and the change, plus which
+occurrence it is among identical ones in that function, in source order; so
+edits elsewhere in the module, or later in the same function, leave it
+pointing at the same site.  The report separates new survivors from
+accepted ones and lists entries that are now killed or whose code is gone;
+--strict fails on any of those.  With --json, finished mutants are also
+appended to JSON.partial as they complete, and a rerun resumes from it as
+long as no source or test file changed.  Lines ending in
+`# pragma: no mutate` are skipped.  Needs no toolchain.
 """
 
 from __future__ import annotations
@@ -54,6 +60,23 @@ def _skip_lines(text: str) -> set:
 def _main_guard(node) -> bool:
     return (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
             and isinstance(node.test.left, ast.Name) and node.test.left.id == "__name__")
+
+
+def _scopes(tree: ast.AST) -> dict:
+    """id(node) -> qualified name of the innermost function or class whose
+    definition contains it ("Engine._grow", "main.one"), or "<module>".
+    Decorators, base classes and argument defaults count as part of the
+    definition they belong to."""
+    out = {}
+
+    def visit(node, scope):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            scope = node.name if scope == "<module>" else f"{scope}.{node.name}"
+        out[id(node)] = scope
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+    visit(tree, "<module>")
+    return out
 
 
 def _sites(tree: ast.AST, skip: set):
@@ -157,15 +180,21 @@ def _replace_with_operand(node):     # marker; handled in mutate()
 
 
 def mutants(path: str):
+    """(text, sites): every mutation site of the file, with the fields that
+    identify it in the baseline (scope, code, desc, nth) and where it is."""
     with open(path) as f:
         text = f.read()
     tree = ast.parse(text)
-    out, seen = [], {}
+    lines, scopes = text.splitlines(), _scopes(tree)
+    out = []
     for i, (node, kind, desc, _) in enumerate(_sites(tree, _skip_lines(text))):
-        src_line = text.splitlines()[node.lineno - 1].strip() if getattr(node, "lineno", None) else ""
-        nth = seen[(src_line, desc)] = seen.get((src_line, desc), -1) + 1     # same change twice on one line
-        out.append({"index": i, "line": getattr(node, "lineno", 0), "kind": kind, "desc": desc, "code": src_line,
-                    "nth": nth})
+        line = getattr(node, "lineno", 0)
+        out.append({"index": i, "line": line, "col": getattr(node, "col_offset", 0), "kind": kind, "desc": desc,
+                    "code": lines[line - 1].strip() if line else "", "scope": scopes[id(node)]})
+    groups = {}
+    for m in sorted(out, key=lambda m: (m["line"], m["col"], m["index"])):     # source order
+        k = (m["scope"], m["code"], m["desc"])
+        m["nth"] = groups[k] = groups.get(k, -1) + 1
     return text, out
 
 
@@ -188,7 +217,8 @@ def mutate(text: str, index: int) -> str:
 def _run_tests(src_root: str, timeout: float, tmpdir: str) -> tuple[str, float]:
     """Run the unit suite against src_root.  Temporary files go to tmpdir,
     which the caller removes, so a suite killed by the timeout leaks nothing."""
-    env = dict(os.environ, FVLINT_SRC=src_root, PYTHONDONTWRITEBYTECODE="1", TMPDIR=tmpdir)
+    env = dict(os.environ, FVLINT_SRC=src_root, FVLINT_MUTATION_RUN="1", PYTHONDONTWRITEBYTECODE="1",
+               TMPDIR=tmpdir)
     t0 = time.time()
     try:
         p = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests/unit", "-t", ".", "-f", "-q"],
@@ -212,17 +242,32 @@ def _tree_digest() -> str:
 
 
 def _site(r) -> tuple:
-    """How a mutant is matched against the baseline: by its code and change
-    (and which occurrence on that line), not by line number."""
-    return (r["module"], r["code"], r["desc"], r.get("nth", 0))
+    """How a mutant is matched against the baseline: by module, enclosing
+    function, code and change (and which occurrence of that in the
+    function), not by line number."""
+    return (r["module"], r["scope"], r["code"], r["desc"], r["nth"])
 
 
 def load_baseline(path: str) -> dict:
-    """Accepted survivors: {(module, code, desc, nth): reason}."""
+    """Accepted survivors: {(module, scope, code, desc, nth): reason}."""
     if not path or not os.path.exists(path):
         return {}
     with open(path) as f:
-        return {(e["module"], e["code"], e["desc"], e.get("nth", 0)): e["reason"] for e in json.load(f)["accepted"]}
+        entries = json.load(f)["accepted"]
+    out = {}
+    for e in entries:
+        k = _site(e)
+        if k in out:
+            raise ValueError(f"{path}: duplicate entry {k}")
+        if not e.get("reason", "").strip():
+            raise ValueError(f"{path}: entry without a reason {k}")
+        out[k] = e["reason"]
+    return out
+
+
+def all_sites(names) -> set:
+    """Baseline keys of every mutation site in the given modules."""
+    return {_site(dict(m, module=n)) for n in names for m in mutants(os.path.join(PKG, f"{n}.py"))[1]}
 
 
 def main(argv=None) -> int:
@@ -243,11 +288,13 @@ def main(argv=None) -> int:
 
     names = args.modules or sorted(f[:-3] for f in os.listdir(PKG) if f.endswith(".py"))
     kinds = set(args.kinds.split(",")) if args.kinds else None
+    baseline = load_baseline(args.baseline)        # fail early on a malformed baseline
     digest = _tree_digest()
-    work, texts = [], {}
+    work, texts, sites = [], {}, set()
     for name in names:
         text, ms = mutants(os.path.join(PKG, f"{name}.py"))
         texts[name] = text
+        sites |= {_site(dict(m, module=name)) for m in ms}
         work += [(name, dict(m, module=name, key=f"{name}:{m['index']}:{digest}")) for m in ms
                  if kinds is None or m["kind"] in kinds]
     if args.list:
@@ -328,12 +375,13 @@ def main(argv=None) -> int:
         results = resumed + list(ex.map(one, work))
     shutil.rmtree(tmp, ignore_errors=True)
 
-    baseline = load_baseline(args.baseline)
     valid = [r for r in results if r["outcome"] != "invalid"]
     survivors = [r for r in valid if r["outcome"] == "survived"]
     new = [r for r in survivors if _site(r) not in baseline]
+    judged = {_site(r) for r in valid}
     surviving_sites = {_site(r) for r in survivors}
-    stale = [k for k in baseline if k[0] in names and k not in surviving_sites]
+    stale = [k for k in baseline if k in judged and k not in surviving_sites]
+    orphaned = [k for k in baseline if k[0] in names and k not in sites]
 
     print(f"{'module':12} {'mutants':>8} {'killed':>7} {'(hangs)':>8} {'accepted':>9} {'new':>5} {'score':>6}")
     for name in names + ["total"]:
@@ -353,15 +401,19 @@ def main(argv=None) -> int:
         for r in new:
             print(f"  {r['module']}.py:{r['line']}: [{r['kind']}] {r['desc']}    {r['code'][:90]}")
     if stale:
-        print(f"\n{len(stale)} baseline entries no longer survive (killed now, or the code changed); remove them:")
-        for module, code, desc, _ in stale:
-            print(f"  {module}.py: {desc}    {code[:90]}")
+        print(f"\n{len(stale)} baseline entries are killed now; remove them:")
+        for module, scope, code, desc, nth in stale:
+            print(f"  {module}.py {scope} #{nth}: {desc}    {code[:90]}")
+    if orphaned:
+        print(f"\n{len(orphaned)} baseline entries match no code any more (it was changed); re-judge them:")
+        for module, scope, code, desc, nth in orphaned:
+            print(f"  {module}.py {scope} #{nth}: {desc}    {code[:90]}")
     if args.json:
         with open(args.json, "w") as f:
             json.dump(results, f, indent=1)
         if os.path.exists(partial):
             os.remove(partial)
-    return 1 if args.strict and new else 0
+    return 1 if args.strict and (new or stale or orphaned) else 0
 
 
 if __name__ == "__main__":

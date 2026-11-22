@@ -13,12 +13,13 @@ on:
 jobs:
   mutation:
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: {python-version: "3.12"}
       - run: python tests/unit/mutation.py -j 4 --timeout 60 --strict --json mutation.json | tee mutation.txt
         shell: bash -o pipefail {0}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with: {name: mutation, path: "mutation.txt\nmutation.json"}
