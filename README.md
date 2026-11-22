@@ -31,7 +31,7 @@ INFO  fsm_summary:u_framer.st             examples/demo/demo_top.sv:61  4 reacha
 |---|---|---|
 | `counter_overflow` / `counter_underflow` | register fed back through `+ c` / `- c` with a constant step (signed or unsigned) | the step is never taken when it would wrap (or overflow, for signed arithmetic) |
 | `parallel_case` | `unique case`, `unique casez`, `(* parallel_case *)` | at most one item matches whenever the result is used |
-| `full_case` | `unique` / full case with no default | some item always matches |
+| `full_case` | `unique` / `(* full_case *)` case with no default | an item that assigns the signal always matches (otherwise synthesis may differ from simulation) |
 | `index_range` | variable part/bit select (`x[i*8 +: 8]`) | the offset stays inside the vector |
 | `mem_addr` | memory whose depth is not a power of two | read/write addresses stay in range when enabled |
 | `fsm_unreachable` | FSM state register | every assigned or decoded state is reachable from reset |
@@ -86,8 +86,12 @@ the file.
 
 FSM checks need no solver. Yosys' FSM extraction treats control inputs as
 free, so a state that is unreachable in the extracted graph is truly
-unreachable. Transitions taken while a reset is asserted are ignored when
-looking for trap states, so synchronous-reset FSMs work too.
+unreachable. The start states are the ones a transition can enter while the
+reset is asserted (control inputs computed from the reset, such as
+`!rst_n || err`, are evaluated with it applied); Yosys' own guess of the reset
+state is used only for an asynchronous reset. Transitions taken while a reset
+is asserted are ignored when looking for trap states, so synchronous-reset
+FSMs work too.
 
 ### Reset model
 
@@ -166,6 +170,14 @@ module fvlint_assumptions (input [1:0] lane);
 endmodule
 ```
 
+A `full_case` FAIL means a cycle where no item that assigns the signal
+matches, so the pragma lets synthesis pick any value where simulation keeps
+the one assigned before the case. If the code assigns `'x` there (a common
+style: `alu_out = 'bx;` before the case), both agree and the finding can be
+waived. When fvlint can't follow a case result to the register that uses
+it, `parallel_case` is checked in every cycle, so overlapping items in a
+cycle whose result is never used also FAIL; those are harmless.
+
 Waive what is intentional, either in a file of check-id globs or with an
 attribute on the register or memory in the RTL:
 
@@ -219,7 +231,7 @@ fvlint's own suite:
 |---|---|
 | `tests/unit/` | unit tests of every module's internals, no toolchain needed (about 2 s). Netlists are built by hand for exact edge cases and also loaded from committed Yosys snapshots of `tests/unit/data/rtl` for the shapes Yosys really produces; SymbiYosys log parsing is tested on lines in the formats of real runs, verbatim for the irregular ones (a step-0 failure has no step number). The scheduler is tested with a scripted solver (refinement, replay, batching, deep BMC, vacuity) that also checks every job it is handed is closed (no bit a checker reads is left undriven), and against a solver that answers from a per-property truth table over many random mixes, so its verdicts must follow from the truth; external tools are tested with stub executables. Kept honest by branch coverage and mutation testing (below). |
 | `tests/regress/manifest.toml` | 57 case runs over the fixtures in `tests/fixtures`. Each fixture has clean structures and planted bugs, including a reproduction for every defect found in the design review: multi-clock false proofs, vacuous assumptions, parameter-disabled logic, synchronous-reset FSM traps, reset synchronizers, signed counters, register-bounded timers. Many cases run under both engines, plus a 200-counter throughput case. |
-| `fvlint.fuzz` | soundness fuzzer: random designs (counters, registered guards, case statements, part-selects including narrow signed indices, memories, second clocks, falling edges, synchronized resets, and flops that look like reset stages but that data can set). The generator writes down, for each construct it builds, when it is active and when it goes wrong, as plain Verilog. An independent oracle appends those monitors to its own copy of the design and re-checks every `PROVEN`, `VACUOUS`, `FAIL` and unreachable-state verdict with a plain bounded model check: it uses none of fvlint's netlist, slicing, refinement, lemmas, PDR, check parameters, path conditions or reset discovery. |
+| `fvlint.fuzz` | soundness fuzzer: random designs (counters, registered guards, case statements, part-selects including narrow signed indices, memories, state machines (some overridden after the reset branch), second clocks, falling edges, synchronized resets, and flops that look like reset stages but that data can set). The generator writes down, for each construct it builds, when it is active and when it goes wrong, as plain Verilog. An independent oracle appends those monitors to its own copy of the design and re-checks every `PROVEN`, `VACUOUS`, `FAIL` and unreachable-state verdict with a plain bounded model check: it uses none of fvlint's netlist, slicing, refinement, lemmas, PDR, check parameters, path conditions or reset discovery. |
 
 ```
 python -m unittest discover -s tests/unit -t .   # unit tests (no toolchain)

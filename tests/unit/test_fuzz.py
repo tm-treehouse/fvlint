@@ -48,7 +48,8 @@ class Generator(unittest.TestCase):
         for feature in ("posedge clk2", "negedge clk", "unique casez", "unique case (1'b1)", "*4 +: 4]",
                         "reg [3:0] mem [0:", "else if (r", "<= 1'b1; else ok", "r0 - ",
                         "s1 <= rst; s2 <= s1;", "if (s2) r", "msk <= 1'b1; else msk <= s1", "if (msk) r",
-                        "wire signed [3:0] sidx = {in", "wire signed [3:0] sidx = {1'b0"):
+                        "wire signed [3:0] sidx = {in", "wire signed [3:0] sidx = {1'b0",
+                        "else case (st) 2'd0: st <=", "endcase if (in", "endcase end", "if (s2) st <="):
             with self.subTest(feature=feature):
                 self.assertIn(feature, texts)
 
@@ -113,11 +114,33 @@ class Generator(unittest.TestCase):
                 seen.add("lanes")
         self.assertEqual(seen, {"casez", "onehot", "lanes"})
 
+    def test_state_machines(self):
+        # Pinned: a plain one, one overridden after the reset branch, one with an unconditional arm.
+        lines = lambda seed: [x for x in fuzz.generate(seed).text.splitlines() if " st" in x or "busy" in x]
+        self.assertEqual(lines(5), [
+            "  reg [1:0] st;",
+            "  always @(posedge clk) begin if (rst) st <= 2'd1; else case (st) 2'd0: st <= in0 ? 2'd3 : 2'd0; "
+            "2'd1: st <= in3 ? 2'd1 : 2'd3; 2'd2: st <= in1 ? 2'd1 : 2'd0; 2'd3: st <= in2 ? 2'd3 : 2'd1; endcase end",
+            "  wire busy = (st == 2'd1) || (st == 2'd2);",
+            "  assign o = {r0, r1, r2, r3, busy, sel, rd};"])
+        self.assertEqual(lines(8)[1],
+                         "  always @(posedge clk) begin if (s2) st <= 2'd2; else case (st) "
+                         "2'd0: st <= in2 ? 2'd1 : 2'd0; 2'd1: st <= in0 ? 2'd1 : 2'd3; "
+                         "2'd2: st <= in0 ? 2'd0 : 2'd2; 2'd3: st <= in0 ? 2'd2 : 2'd3; "
+                         "endcase if (in2 && in3) st <= 2'd0; end")
+        self.assertEqual(lines(12)[1],
+                         "  always @(posedge clk) begin if (rst) st <= 2'd0; else case (st) 2'd0: st <= 2'd3; "
+                         "2'd1: st <= in0 ? 2'd2 : 2'd1; 2'd2: st <= in1 ? 2'd3 : 2'd2; 2'd3: st <= in0 ? 2'd0 : 2'd3; "
+                         "endcase if (in3 && in2) st <= 2'd1; end")
+        self.assertNotIn("reg [1:0] st;", fuzz.generate(7).text)
+
     def test_reset_stages(self):
         # Only the synchronizer stages something uses survive elaboration.
         self.assertEqual(fuzz.generate(4).stages, ["s1", "s2"])         # a register resets on s2
         self.assertEqual(fuzz.generate(9).stages, ["s1"])               # s2 unused; s1 feeds msk, which is used
-        self.assertEqual(fuzz.generate(31).stages, [])                  # synchronizer present but unused
+        self.assertEqual(fuzz.generate(50).stages, [])                  # synchronizer present but unused
+        self.assertEqual(fuzz.generate(31).stages, ["s1", "s2"])        # the state machine resets on s2
+        self.assertEqual(fuzz.generate(31).regs[-1], ("st", 2))
         self.assertEqual(fuzz.generate(10).stages, [])                  # no synchronizer
         self.assertEqual(fuzz.generate(9).regs, [("r0", 4), ("r1", 4), ("r2", 3), ("s1", 1), ("s2", 1), ("msk", 1)])
         self.assertEqual(fuzz.generate(10).regs, [("r0", 2), ("r1", 5), ("r2", 5), ("r3", 2), ("ok0", 1), ("ok2", 1)])

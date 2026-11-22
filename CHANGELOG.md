@@ -5,15 +5,55 @@ SPDX-License-Identifier: ISC
 
 # Changelog
 
-## Unreleased
+## 0.3.2
 
-Test infrastructure only; fvlint's own behaviour is unchanged.
+Fixes for false findings and a lost FSM pass, found by running fvlint on
+PicoRV32 for the integration example, and two fixes for SymbiYosys's
+cut-short summaries, found by CI.
 
+### False findings (0.3.1 reported FAIL for a design without the problem)
+
+* **FSM reset state.** For a register without an asynchronous reset, Yosys
+  guesses the FSM's reset state "from the mux tree", and an assignment after
+  the reset branch (`if (!resetn) st <= FETCH; else case ...` followed by
+  `if (err) st <= TRAP;`) makes it guess the overriding state. fvlint took
+  the guess, so PicoRV32's `cpu_state` was reported as reaching only TRAP
+  and six of its states as unreachable. The start states now come from the
+  transitions that can fire while the reset is asserted; inputs computed
+  from the reset (`!resetn || trap`) are evaluated with the reset applied,
+  and the start set errs on the large side. Yosys' own reset state is used
+  only when the state register has an asynchronous reset. An FSM whose
+  start set has several states reports them as `{2'b00, 2'b11}`.
+* **full_case on a case with a default item.** Yosys marks every case
+  statement that has a default item `full_case`; when the default leaves a
+  signal at an `'x` assigned before the case, the result looked like a
+  `full_case` pragma, and fvlint reported "no item matches" whenever the
+  default was taken. The source's pragma is now told apart at elaboration
+  (renamed to `fvlint_full_case`), and only cases that carry it are checked.
+
+### FSM extraction
+
+* Yosys' `fsm_extract` can stop with an internal assertion on one register
+  (PicoRV32's `irq_state` with `ENABLE_IRQ=1`), and fvlint then skipped every
+  FSM check. The FSM pass now runs again on the saved design without that
+  register (up to three registers), and the warning names them.
+
+### Result parsing
+
+* When more than five properties of one SymbiYosys job fail, the log's
+  summary stops after five; the rest are now read from the job's status
+  file, so their counterexample traces are no longer missing.
 * The fuzzer's oracle now reads SBY's full summary file as well as its log.
   The log's summary lists only the first five counterexample traces, so a
   failure the oracle's BMC found in a later trace went unread, and a correct
   FAIL from fvlint was reported as a disagreement (seed 13 under the OSS CAD
   Suite, whose yices run writes one trace per failed assertion).
+
+### Fuzzer
+
+* Designs now include a small state machine, sometimes with an assignment
+  after the reset branch; with 0.3.1's FSM code the oracle reports the false
+  "unreachable" finding above.
 
 ## 0.3.1
 

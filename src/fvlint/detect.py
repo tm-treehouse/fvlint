@@ -337,11 +337,16 @@ def detect_case(nl: Netlist):
             kind="parallel_case", target=target, src=src,
             desc="at most one item of a unique/parallel_case statement matches",
             checker="fvl_onehot0", params={"W": len(sel)}, ports={"s": sel}, conds=conds))
+        # full_case from the source (renamed at elaboration; proc_rmdead also
+        # marks every case that has a default item).  Yosys implements it as
+        # an 'x default: when no item that assigns the signal matches, the
+        # synthesized value is arbitrary, while simulation keeps the value the
+        # code assigned before the case.
         a = nl.conn(cell, "A")
-        if attr_true(attrs.get("full_case")) and a and all(b == "x" for b in a):
+        if attr_true(attrs.get("fvlint_full_case")) and a and all(b == "x" for b in a):
             checks.append(Check(
                 kind="full_case", target=target, src=src,
-                desc="some item of a full/unique case statement without default always matches",
+                desc="an item of a full_case/unique case statement (no default) assigns the signal",
                 checker="fvl_nonzero", params={"W": len(sel)}, ports={"s": sel}, conds=conds))
     return _dedupe(checks)
 

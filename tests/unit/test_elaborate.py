@@ -9,7 +9,8 @@ import json
 import os
 import unittest
 
-from fvlint.elaborate import HDL_EXT, Sources, _slang_arg, _stage, elaborate, read_commands
+from fvlint.elaborate import (HDL_EXT, MAX_FSM_RETRIES, Sources, _fsm_commands, _slang_arg, _stage, elaborate,
+                              failed_fsm, read_commands)
 from fvlint.tools import ToolError
 
 from .support import TempDirCase
@@ -44,6 +45,26 @@ class FakeTools:
     def log_tail(log, n=15):
         with open(log) as f:
             return f.read()
+
+
+class ScriptedTools(FakeTools):
+    """A FakeTools whose successive Yosys runs write the given outputs, return
+    the given codes and leave the given logs (also as NAME.log.full)."""
+
+    def __init__(self, plan):
+        super().__init__()
+        self.plan = list(plan)
+
+    def run_yosys(self, script, cwd, name, allow_fail=False):
+        self.runs.append((name, script, cwd, allow_fail))
+        outputs, rc, log = self.plan.pop(0)
+        for suffix in (".log", ".log.full"):
+            with open(os.path.join(cwd, name + suffix), "w") as f:
+                f.write(log)
+        for out in outputs:
+            with open(os.path.join(cwd, out), "w") as f:
+                f.write("{}")
+        return rc
 
 
 class FileLists(TempDirCase):
@@ -201,7 +222,8 @@ class Elaboration(TempDirCase):
                              "assume_file": None})
         (name, script, cwd, allow_fail), = tools.runs
         self.assertEqual((name, cwd, allow_fail), ("elab", edir, True))
-        self.assertIn(f"read_verilog -sv {self.rtl}\nhierarchy -check -top top\ndesign -save fvl_elab\n", script)
+        self.assertIn(f"read_verilog -sv {self.rtl}\nhierarchy -check -top top\n"
+                      "attrmap -rename full_case fvlint_full_case\ndesign -save fvl_elab\n", script)
         main_part, fsm_part = script.split("design -load fvl_elab\n")
         self.assertIn("proc -noopt\nflatten\nmemory_collect\nopt_clean\nwrite_json main.json\n", main_part)
         self.assertIn("fsm_detect\nfsm_extract\nwrite_json fsm.json\n", fsm_part)
@@ -245,6 +267,60 @@ class Elaboration(TempDirCase):
         r = elaborate(Sources(files=[self.rtl]), "top", "yosys", FakeTools(rc=1), self.out)
         self.assertIsNotNone(r["fsm"])                                  # written, but Yosys still failed
         self.assertIsNotNone(r["fsm_warning"])
+
+    def test_fsm_extraction_retried_without_the_failing_register(self):
+        # fsm_extract stops Yosys on one register (an internal assertion): the
+        # FSM pass is run again on the saved design without it.
+        crash = ("Extracting FSM `\\cpu_state' from module `\\t'.\n  found ctrl input: x\n"
+                 "Extracting FSM `\\irq_state' from module `\\t'.\n"
+                 "ERROR: Assert `ce.stop_signals.check_all(undef)' failed in fsm_extract.cc:241.\n")
+        tools = ScriptedTools([(("main.json",), 1, crash), (("fsm.json",), 0, "")])
+        r = elaborate(Sources(files=[self.rtl]), "top", "yosys", tools, self.out)
+        self.assertEqual(r["fsm"], os.path.join(self.out, "elab", "fsm.json"))
+        self.assertIn("on irq_state; FSM checks skip it", r["fsm_warning"])
+        (name, script, cwd, allow_fail), = tools.runs[1:]
+        self.assertEqual((name, cwd, allow_fail), ("fsm", os.path.join(self.out, "elab"), True))
+        self.assertEqual(script, "read_rtlil fvl_elab.il\n" + _fsm_commands(["irq_state"]))
+        self.assertIn("design -save fvl_elab\nwrite_rtlil fvl_elab.il\n", tools.runs[0][1])
+        # Two registers in turn.
+        crash2 = "Extracting FSM `\\u.st' from module `\\t'.\nERROR: Assert failed\n"
+        tools = ScriptedTools([(("main.json",), 1, crash), ((), 1, crash2), (("fsm.json",), 0, "")])
+        r = elaborate(Sources(files=[self.rtl]), "top", "yosys", tools, self.out)
+        self.assertIn("on irq_state, u.st; FSM checks skip them", r["fsm_warning"])
+        self.assertEqual(tools.runs[2][1], "read_rtlil fvl_elab.il\n" + _fsm_commands(["irq_state", "u.st"]))
+
+    def test_fsm_extraction_retries_give_up(self):
+        crash = "Extracting FSM `\\a' from module `\\t'.\nERROR: Assert failed\n"
+        tools = ScriptedTools([(("main.json",), 1, crash)] + [((), 1, crash)] * 3)      # the same register again
+        r = elaborate(Sources(files=[self.rtl]), "top", "yosys", tools, self.out)
+        self.assertEqual((len(tools.runs), r["fsm"]), (2, None))
+        self.assertEqual(r["fsm_warning"], "FSM extraction failed in Yosys; FSM checks skipped (see fsm.log.full)")
+        logs = [f"Extracting FSM `\\r{i}' from module `\\t'.\nERROR: x\n" for i in range(MAX_FSM_RETRIES + 2)]
+        tools = ScriptedTools([(("main.json",), 1, logs[0])] + [((), 1, lg) for lg in logs[1:]])
+        r = elaborate(Sources(files=[self.rtl]), "top", "yosys", tools, self.out)
+        self.assertEqual(len(tools.runs), 1 + MAX_FSM_RETRIES)                      # then it stops
+        self.assertIn("FSM checks skipped", r["fsm_warning"])
+
+    def test_failed_fsm(self):
+        log = self.write("y.log.full", "Extracting FSM `\\st' from module `\\t'.\nok\n")
+        self.assertIsNone(failed_fsm(log))                                          # no error
+        self.assertIsNone(failed_fsm(os.path.join(self.tmp, "missing.log")))
+        log = self.write("y.log.full", "ERROR: syntax error\nExtracting FSM `\\st' from module `\\t'.\n")
+        self.assertIsNone(failed_fsm(log))                                          # the error came first
+        log = self.write("y.log.full", "Extracting FSM `u.st' from module `\\t'.\n\nERROR: x\n")
+        self.assertEqual(failed_fsm(log), "u.st")
+        log = self.write("y.log.full", "Extracting FSM `\\a' from module `\\t'.\nExtracting FSM `\\b[1]' "
+                                       "from module `\\t'.\nERROR: x\nExtracting FSM `\\c' from module `\\t'.\n")
+        self.assertEqual(failed_fsm(log), "b[1]")
+        with open(log, "wb") as f:                                                  # a stray byte in the log
+            f.write(b"\xff\nExtracting FSM `\\st' from module `\\t'.\nERROR: x\n")
+        self.assertEqual(failed_fsm(log), "st")
+
+    def test_fsm_commands(self):
+        self.assertEqual(_fsm_commands([]).splitlines()[-3:], ["fsm_detect", "fsm_extract", "write_json fsm.json"])
+        self.assertNotIn('"none"', _fsm_commands([]))
+        self.assertIn('setattr -set fsm_encoding "none" w:a w:g?0?.st w:x?y w:p?q w:b?s\nfsm_detect\n',
+                      _fsm_commands(["a", "g[0].st", "x*y", "p?q", "b\\s"]))
 
     def test_assumptions(self):
         assume = self.write("fv/assume.sv", "module fvlint_assumptions(input [1:0] lane); endmodule\n")

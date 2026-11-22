@@ -146,6 +146,7 @@ def parse_job(d: str, outdir: str, rc: int, engine: str, mode: str, names) -> Jo
     m = re.search(r"DONE \((\w+)", log)
     if m:
         res.status = m.group(1)
+        log += _complete_summary(wd, log, res.status)
     if "Assumptions are unsatisfiable" in log:
         res.error = "assumptions are unsatisfiable (contradictory --assume file or reset model)"
     rel = lambda p: os.path.relpath(os.path.join(wd, p), outdir)  # noqa: E731
@@ -202,6 +203,28 @@ def parse_job(d: str, outdir: str, rc: int, engine: str, mode: str, names) -> Jo
         for n in names:
             res.props.setdefault(n, PropResult("pass"))
     return res
+
+
+def _complete_summary(wd: str, log: str, status: str) -> str:
+    """The log's summary lists at most a few traces ("and 3 further traces,
+    see run/FAIL for a complete summary").  Return the rest from that file,
+    as summary lines with log-style paths, so nothing is lost; a repeat of a
+    listed trace changes nothing."""
+    path = os.path.join(wd, status)
+    if not re.search(r"summary: and \d+ further traces?", log) or not os.path.isfile(path):
+        return ""
+    base = os.path.basename(wd)
+    out = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            m = re.match(r"counterexample trace(?: \[(\w+)\])?: (\S+)$", line.strip())
+            if m:
+                if m.group(2).endswith(".vcd"):              # also lists the .yw/.aiw of each trace
+                    phase = f" [{m.group(1)}]" if m.group(1) else ""
+                    out.append(f"summary: counterexample trace{phase}: {base}/{m.group(2)}")
+            elif line.strip().startswith("failed assertion "):
+                out.append(f"summary:   {line.strip()}")
+    return "\n" + "\n".join(out) + "\n" if out else ""
 
 
 def _parse_pdr(wd: str, log: str, res: JobResult, rel):

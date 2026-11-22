@@ -16,20 +16,152 @@ from .checks import FAIL, INFO, WARN, Check, Lemma
 from .netlist import Netlist, const_value, param_int
 
 
+
 def _bits_lsb(v) -> str:
     """Yosys JSON constant (MSB-first string) -> LSB-first string."""
     return v[::-1] if isinstance(v, str) else format(v, "032b")[::-1]
+
+
+def _and3(vs):
+    return 0 if 0 in vs else (1 if all(v == 1 for v in vs) else None)
+
+
+def _or3(vs):
+    return 1 if 1 in vs else (0 if all(v == 0 for v in vs) else None)
+
+
+def _not3(v):
+    return None if v is None else 1 - v
+
+
+def _agree(vs):
+    return vs[0] if vs and all(v == vs[0] for v in vs) else None
+
+
+class _Eval:
+    """Three-valued (0, 1, None = unknown) evaluation of the word-level
+    combinational cells of a Yosys JSON module with some bits pinned.
+    Registers, unsupported cells and deep cones evaluate to unknown."""
+
+    MAX_DEPTH = 64
+
+    def __init__(self, mod: dict, pinned: dict):
+        self.cells, self.pinned, self.memo, self.busy = mod["cells"], pinned, {}, set()
+        self.driver = {}
+        for name, c in self.cells.items():
+            if c["type"] in _OPS:
+                for i, b in enumerate(c["connections"].get("Y", [])):
+                    self.driver[b] = (name, i)
+
+    def bit(self, b, depth=0):
+        if b in ("0", "1"):
+            return int(b)
+        if not isinstance(b, int):
+            return None
+        if b in self.pinned:
+            return self.pinned[b]
+        if b not in self.driver or depth > self.MAX_DEPTH:
+            return None
+        name, i = self.driver[b]
+        if name not in self.memo:
+            if name in self.busy:                    # combinational loop
+                return None
+            self.busy.add(name)
+            self.memo[name] = _OPS[self.cells[name]["type"]](self, self.cells[name], depth + 1)
+            self.busy.discard(name)
+        y = self.memo[name]
+        return y[i] if i < len(y) else None
+
+    def port(self, c, name, depth, width=None):
+        v = [self.bit(b, depth) for b in c["connections"].get(name, [])]
+        if width is None:
+            return v
+        if len(v) < width:                           # Yosys extends operands to the result width
+            signed = param_int(c["parameters"].get(name + "_SIGNED", 0))
+            v += [v[-1] if signed and v else 0] * (width - len(v))
+        return v[:width]
+
+
+def _width(c):
+    return len(c["connections"].get("Y", []))
+
+
+def _one_bit(c, v):
+    return [v] + [0] * (_width(c) - 1)
+
+
+def _op_bitwise(f):
+    return lambda ev, c, d: [f([a, b]) for a, b in zip(ev.port(c, "A", d, _width(c)), ev.port(c, "B", d, _width(c)))]
+
+
+def _op_reduce(f, invert=False):
+    return lambda ev, c, d: _one_bit(c, (_not3 if invert else (lambda v: v))(f(ev.port(c, "A", d))))
+
+
+def _op_logic(f):
+    return lambda ev, c, d: _one_bit(c, f([_or3(ev.port(c, "A", d)), _or3(ev.port(c, "B", d))]))
+
+
+def _op_eq(invert):
+    def op(ev, c, d):
+        w = max(len(c["connections"].get("A", [])), len(c["connections"].get("B", [])))
+        pairs = zip(ev.port(c, "A", d, w), ev.port(c, "B", d, w))
+        v = _and3([None if x is None or y is None else int(x == y) for x, y in pairs])
+        return _one_bit(c, _not3(v) if invert else v)
+    return op
+
+
+def _op_mux(ev, c, d):
+    w = _width(c)
+    a, b, (s,) = ev.port(c, "A", d, w), ev.port(c, "B", d, w), ev.port(c, "S", d)
+    return b if s == 1 else a if s == 0 else [_agree([x, y]) for x, y in zip(a, b)]
+
+
+def _op_pmux(ev, c, d):
+    w = _width(c)
+    a, b, s = ev.port(c, "A", d, w), ev.port(c, "B", d), ev.port(c, "S", d)
+    if s.count(1) > 1:
+        return [None] * w
+    cands = [b[k * w:(k + 1) * w] for k, v in enumerate(s) if v != 0]
+    if 1 not in s:
+        cands.append(a)
+    return [_agree([x[i] for x in cands]) for i in range(w)]
+
+
+_OPS = {
+    "$not": lambda ev, c, d: [_not3(v) for v in ev.port(c, "A", d, _width(c))],
+    "$and": _op_bitwise(_and3), "$or": _op_bitwise(_or3),
+    "$xor": _op_bitwise(lambda v: None if None in v else v[0] ^ v[1]),
+    "$xnor": _op_bitwise(lambda v: None if None in v else 1 - (v[0] ^ v[1])),
+    "$reduce_and": _op_reduce(_and3), "$reduce_or": _op_reduce(_or3), "$reduce_bool": _op_reduce(_or3),
+    "$logic_not": _op_reduce(_or3, invert=True), "$logic_and": _op_logic(_and3), "$logic_or": _op_logic(_or3),
+    "$eq": _op_eq(False), "$ne": _op_eq(True), "$mux": _op_mux, "$pmux": _op_pmux,
+}
 
 
 def read_fsm_cells(fsm_json: str, top: str, reset_names: dict | None = None) -> list:
     """Decode the $fsm cells written by fsm_extract.
 
     Returns dicts with 'name', 'states' (MSB-first code strings, index =
-    state number), 'reset' (state number or None) and 'trans' [(from, to)].
-    Transitions that require a reset input to be asserted are dropped
-    (`reset_names` maps signal names to their active level): with a
-    synchronous reset every state has an edge back to the reset state, which
-    would otherwise hide trap states.
+    state number), 'trans' [(from, to)], 'reset_targets' (the states a
+    transition can enter while the reset is asserted), 'state_rst' (Yosys'
+    STATE_RST, or None) and 'async_reset' (whether the state register has an
+    asynchronous reset, which STATE_RST then comes from).  Transitions that require a reset input to
+    be asserted are dropped from 'trans' (`reset_names` maps signal names to
+    their active level): with a synchronous reset every state has an edge
+    back to the reset state, which would otherwise hide trap states.
+
+    fsm_extract treats its control inputs as independent, but some are
+    functions of the reset (`!rst_n || err`).  Their values with the reset
+    asserted come from evaluating the logic in front of them, so a row that
+    needs `!rst_n || err` low is not taken to fire during reset.  Inputs
+    whose value is unknown match any row: the start set errs large, which
+    can only hide an unreachable state, never invent one.
+
+    STATE_RST is only trustworthy for an asynchronous reset (the cell's ARST
+    is connected): for anything else fsm_extract guesses it "from the mux
+    tree" (the constant at the root), which a late overriding assignment,
+    e.g. `if (err) st <= TRAP;` after the reset branch, makes wrong.
     """
     with open(fsm_json) as f:
         mod = json.load(f)["modules"][top]
@@ -38,6 +170,9 @@ def read_fsm_cells(fsm_json: str, top: str, reset_names: dict | None = None) -> 
         for i, b in enumerate(n["bits"]):
             bit_names.setdefault(b, set()).add(name if len(n["bits"]) == 1 else f"{name}[{i}]")
     reset_names = reset_names or {}
+    ev = _Eval(mod, {b: int(lvl) for b, nms in bit_names.items() for nm in nms
+                     if nm in reset_names and isinstance(b, int) for lvl in [reset_names[nm]]})
+    ev_free = _Eval(mod, {})                      # what is known without the reset (constants)
     out = []
     for c in mod["cells"].values():
         if c["type"] != "$fsm":
@@ -54,29 +189,38 @@ def read_fsm_cells(fsm_json: str, top: str, reset_names: dict | None = None) -> 
             for nm in bit_names.get(b, ()):
                 if nm in reset_names:
                     reset_inputs[j] = str(reset_names[nm])
+        at_reset = [ev.bit(b) for b in ctrl_in]
+        reset_known = any(v is not None and ev_free.bit(b) is None for b, v in zip(ctrl_in, at_reset))
         tt = _bits_lsb(p["TRANS_TABLE"])
         w = 2 * lg + ci + co
-        trans, dropped = [], 0
+        trans, dropped, targets = [], 0, set()
         for i in range(tn):
             e = tt[i * w:(i + 1) * w]
             cin = e[co + lg:co + lg + ci]
-            if any(cin[j] == lvl for j, lvl in reset_inputs.items() if j < len(cin)):
-                dropped += 1
-                continue
             s_out = int(e[co:co + lg][::-1] or "0", 2)
             s_in = int(e[co + lg + ci:][::-1] or "0", 2)
+            # A row whose inputs can all hold their values with the reset
+            # asserted can set the state while the reset is held.
+            if reset_known and s_out < sn and all(
+                    v not in "01" or r is None or int(v) == r for v, r in zip(cin, at_reset)):
+                targets.add(s_out)
+            held = [cin[j] for j in reset_inputs if j < len(cin)]
+            if any(v == reset_inputs[j] for j, v in zip(reset_inputs, held)):
+                dropped += 1
+                continue
             trans.append((s_in, s_out))
         rst = p.get("STATE_RST")
-        reset = None
+        state_rst = None
         if isinstance(rst, (str, int)):
             try:
                 r = param_int(rst)
-                reset = r if r < sn else None
+                state_rst = r if r < sn else None
             except ValueError:
-                reset = None
+                state_rst = None
         name = str(p.get("NAME", "")).lstrip("\\")
-        out.append({"name": name, "states": states, "reset": reset, "trans": trans,
-                    "reset_edges": dropped})
+        out.append({"name": name, "states": states, "trans": trans, "reset_targets": targets,
+                    "state_rst": state_rst, "reset_edges": dropped,
+                    "async_reset": any(isinstance(b, int) for b in c["connections"].get("ARST", []))})
     return out
 
 
@@ -129,6 +273,12 @@ def _fmt(code: str) -> str:
     return f"{len(code)}'b{code}"
 
 
+def _fmt_set(codes) -> str:
+    """One state as 3'b010; several (a reset that can land in more than one) as {3'b000, 3'b111}."""
+    codes = sorted(codes)
+    return _fmt(codes[0]) if len(codes) == 1 else "{" + ", ".join(_fmt(c) for c in codes) + "}"
+
+
 def analyse_fsms(nl: Netlist, fsm_json: str, reset_names: dict | None = None):
     checks, lemmas = [], {}
     q_to_ff = {}
@@ -150,16 +300,19 @@ def analyse_fsms(nl: Netlist, fsm_json: str, reset_names: dict | None = None):
             c.preset, c.detail = status, detail
             return c
 
-        if fsm["reset"] is None:
+        start = {codes[i] for i in fsm["reset_targets"]}
+        if fsm["async_reset"] and fsm["state_rst"] is not None:
+            start.add(codes[fsm["state_rst"]])          # Yosys took it from the asynchronous reset
+        if not start:
             checks.append(mk("fsm_reset", sig, INFO, f"FSM {sig} has a reset state",
                              "no reset state found; reachability not analysed"))
             continue
-        reset = codes[fsm["reset"]]
+        reset = _fmt_set(start)
         edges = {}
         for a, b in fsm["trans"]:
             if a < len(codes) and b < len(codes):
                 edges.setdefault(codes[a], set()).add(codes[b])
-        reach, todo = {reset}, [reset]
+        reach, todo = set(start), sorted(start)
         while todo:
             s = todo.pop()
             for t in edges.get(s, ()):
@@ -186,23 +339,23 @@ def analyse_fsms(nl: Netlist, fsm_json: str, reset_names: dict | None = None):
                    if code in assigned else
                    "decoded by the logic (case item / compare) but never assigned")
             checks.append(mk("fsm_unreachable", f"{sig}={_fmt(code)}", FAIL,
-                             f"state {_fmt(code)} of {sig} is reachable from reset {_fmt(reset)}",
+                             f"state {_fmt(code)} of {sig} is reachable from reset {reset}",
                              f"unreachable: {why}"))
 
         sub = {s: {t for t in edges.get(s, ()) if t in reach} for s in reach}
         for comp in _sccs(reach, sub):
-            if reset in comp:
+            if comp & start:
                 continue
             leaves = any(t not in comp for s in comp for t in sub.get(s, ()))
             if not leaves:
                 names = ", ".join(_fmt(s) for s in sorted(comp))
                 checks.append(mk("fsm_trap", f"{sig}={{{names}}}", WARN,
-                                 f"{sig} can always return to reset state {_fmt(reset)}",
+                                 f"{sig} can always return to reset state {reset}",
                                  f"once in {{{names}}} the FSM never leaves (only reset exits); "
                                  "fine for terminal states like DONE/READY, otherwise a deadlock"))
 
         checks.append(mk("fsm_summary", sig, INFO, f"FSM {sig} extracted",
-                         f"{len(reach)} reachable states from reset {_fmt(reset)}"))
+                         f"{len(reach)} reachable states from reset {reset}"))
 
         if bits and tuple(bits) in q_to_ff and reach:
             vals = sorted(int(s, 2) for s in reach)

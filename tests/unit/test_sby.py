@@ -13,7 +13,8 @@ import shutil
 import unittest
 
 from fvlint.replay import _norm, divergent, read_vcd, read_yw, stim_module
-from fvlint.sby import CHECKERS_V, JobResult, Prop, PropResult, instance, parse_job, prop_key, write_job, yw_for
+from fvlint.sby import (CHECKERS_V, JobResult, Prop, PropResult, _complete_summary, instance, parse_job, prop_key,
+                        write_job, yw_for)
 
 from .support import DATA, TempDirCase
 
@@ -331,6 +332,70 @@ class LogParsing(TempDirCase):
                                                        "basecase"))                 # summary step, not frame 18
         self.assertEqual(r.props["fvl_l0"], PropResult("fail", phase="basecase"))     # no trace reported
         self.assertEqual(set(r.props), {"fvl_t0", "fvl_t1", "fvl_t2", "fvl_l0"})
+
+    def test_cut_short_summary_is_completed_from_the_status_file(self):
+        # SymbiYosys lists five traces in the log, then "see run/FAIL for a
+        # complete summary" (formats from a real run with eight failures).
+        names = [f"fvl_t{i}" for i in range(7)]
+        log = line("summary: engine_0 (abc --keep-going pdr) returned FAIL")
+        full = "engine_0 (abc --keep-going pdr) returned FAIL\n"
+        for i, n in enumerate(names):
+            assertion = (f"failed assertion top._witness_.check_flatten_{n}__fvl_checkers_v_75_assert_74 "
+                         f"at x.v:1.2-1.3 step {i}")
+            if i < 5:
+                log += line(f"summary: counterexample trace: run/engine_0/trace_{i}.vcd")
+                log += line(f"summary:   {assertion}")
+            full += "".join(f"counterexample trace: engine_0/trace_{i}.{ext}\n" for ext in ("vcd", "yw", "aiw"))
+            full += f"  {assertion}\n"
+        log += line("summary: and 2 further traces") + line("summary: see run/FAIL for a complete summary")
+        log += line("DONE (FAIL, rc=2)")
+        d = self.run_dir(log, names)
+        with open(os.path.join(d, "run", "FAIL"), "w") as f:
+            f.write(full)
+        r = parse_job(d, self.tmp, 2, PDR, "prove", names)
+        jobrel = os.path.relpath(os.path.join(d, "run"), self.tmp)
+        self.assertEqual({n: (p.status, p.trace, p.step) for n, p in r.props.items()},
+                         {n: ("fail", os.path.join(jobrel, "engine_0", f"trace_{i}.vcd"), i)
+                          for i, n in enumerate(names)})
+        # The same log without the status file: the first five only.
+        os.remove(os.path.join(d, "run", "FAIL"))
+        self.assertEqual(set(parse_job(d, self.tmp, 2, PDR, "prove", names).props), set(names[:5]))
+
+    def test_cut_short_kinduction_summary(self):
+        # k-induction: the steps of traces past the fifth come from the status file too.
+        log = eng("Checking assertions in step 9..")
+        full = ""
+        for i in range(7):
+            log += assert_failed(f"fvl_t{i}__x") + eng(f"Writing trace to VCD file: engine_0/trace{i}.vcd")
+            full += f"counterexample trace [basecase]: engine_0/trace{i}.vcd\n"
+            full += f"  failed assertion top._witness_.check_flatten_fvl_t{i}__x at x.v:1.2-1.3 step {i}\n"
+        log += line("summary: and 2 further traces") + line("DONE (FAIL, rc=2)")
+        d = self.run_dir(log)
+        with open(os.path.join(d, "run", "FAIL"), "w") as f:
+            f.write(full)
+        r = parse_job(d, self.tmp, 2, SMTBMC, "prove", [f"fvl_t{i}" for i in range(7)])
+        self.assertEqual([r.props[f"fvl_t{i}"].step for i in range(7)], list(range(7)))
+        # The phase is kept: steps listed under an induction trace are not
+        # counterexample steps.  The file is read leniently (a stray byte).
+        with open(os.path.join(d, "run", "FAIL"), "wb") as f:
+            f.write(b"\xff\n" + full.replace("[basecase]", "[induction]").encode())
+        r = parse_job(d, self.tmp, 2, SMTBMC, "prove", [f"fvl_t{i}" for i in range(7)])
+        self.assertEqual([r.props[f"fvl_t{i}"].step for i in range(7)], [9] * 7)   # from the engine lines
+
+    def test_completed_summary_lines(self):
+        # The appended lines read like SymbiYosys's own: a phase only where the file has one.
+        d = os.path.join(self.tmp, "job")
+        os.makedirs(d)
+        with open(os.path.join(d, "FAIL"), "w") as f:
+            f.write("counterexample trace [basecase]: engine_0/trace0.vcd\n"
+                    "counterexample trace [basecase]: engine_0/trace0.yw\n"
+                    "  failed assertion top.x at x.v:1.2-1.3 step 3\n"
+                    "counterexample trace: engine_0/trace_1.vcd\n")
+        self.assertEqual(_complete_summary(d, "summary: and 1 further trace", "FAIL"),
+                         "\nsummary: counterexample trace [basecase]: job/engine_0/trace0.vcd\n"
+                         "summary:   failed assertion top.x at x.v:1.2-1.3 step 3\n"
+                         "summary: counterexample trace: job/engine_0/trace_1.vcd\n")
+        self.assertEqual(_complete_summary(d, "summary: counterexample trace: x.vcd", "FAIL"), "")   # not cut short
 
     def test_pdr_failure_at_step_zero(self):
         # Verbatim from a YoWASP 0.71 run: SymbiYosys leaves "step 0" out.

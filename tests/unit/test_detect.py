@@ -626,11 +626,17 @@ class CaseStatements(unittest.TestCase):
         self.assertEqual((c.params, c.ports, c.conds), ({"W": 3}, {"s": s}, [(en, 1)]))
 
     def test_full_case_without_default(self):
-        nl, s = self.build({"parallel_case": PAR, "full_case": PAR}, a=["x", "x"])
+        # The source's pragma arrives as fvlint_full_case (renamed at elaboration).
+        pragma = {"parallel_case": PAR, "fvlint_full_case": PAR, "full_case": PAR}
+        nl, s = self.build(pragma, a=["x", "x"])
         got = [(c.kind, c.checker, c.params, c.ports) for c in detect_case(nl)]
         self.assertEqual(got, [("parallel_case", "fvl_onehot0", {"W": 3}, {"s": s}),
                                ("full_case", "fvl_nonzero", {"W": 3}, {"s": s})])
-        nl, _ = self.build({"parallel_case": PAR, "full_case": PAR})            # has a default value
+        nl, _ = self.build(pragma)                                              # has a default value
+        self.assertEqual([c.kind for c in detect_case(nl)], ["parallel_case"])
+        # full_case alone is proc_rmdead's mark on a case with a default item; the
+        # default leaving the signal at an 'x assigned before the case is no pragma.
+        nl, _ = self.build({"parallel_case": PAR, "full_case": PAR}, a=["x", "x"])
         self.assertEqual([c.kind for c in detect_case(nl)], ["parallel_case"])
 
     def test_skipped_shapes(self):
@@ -846,6 +852,7 @@ class RealNetlists(unittest.TestCase):
         got = {c.id: c.params for c in checks}
         self.assertEqual(got, {
             "parallel_case:gnt": {"W": 3}, "parallel_case:y": {"W": 2}, "full_case:y": {"W": 2},
+            "parallel_case:z": {"W": 2}, "parallel_case:w": {"W": 2},       # no full_case:z: a default item, no pragma
             "index_range:lane": {"W": 32, "LO": 0, "HI": 8, "SIGNED": 0},
             "mem_addr:mem.rd0": {"W": 3, "LO": 0, "HI": 5, "SIGNED": 0},
             "mem_addr:mem.wr0": {"W": 3, "LO": 0, "HI": 5, "SIGNED": 0},

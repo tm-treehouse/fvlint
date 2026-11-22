@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 from dataclasses import dataclass, field
@@ -148,6 +149,39 @@ def _stage(src: Sources, assume_file, edir: str):
     return staged, (put(assume_file) if assume_file else None), (stage_root, orig_root)
 
 
+MAX_FSM_RETRIES = 3
+
+_EXTRACTING = re.compile(r"Extracting FSM `\\?(.+?)' from module")
+
+
+def _fsm_commands(skip: list) -> str:
+    """Yosys commands (after the elaborated design is loaded) that write
+    fsm.json, leaving the registers in `skip` out of FSM extraction."""
+    # Ask fsm_detect to consider every register (except ones driving ports),
+    # not only those it would re-encode for synthesis.
+    cmds = ("proc\nflatten\nopt -nodffe -nosdff\n"
+            "setattr -set fsm_encoding \"auto\" t:$dff t:$adff %u %co1:+[Q] w:* %i x:* %d\n")
+    if skip:
+        # Wildcards in a name would be patterns: let them match any character.
+        names = " ".join("w:" + re.sub(r"[][*?\\]", "?", n) for n in skip)
+        cmds += f"setattr -set fsm_encoding \"none\" {names}\n"
+    return cmds + "fsm_detect\nfsm_extract\nwrite_json fsm.json\n"
+
+
+def failed_fsm(log_full: str) -> str | None:
+    """The register fsm_extract was working on when Yosys stopped with an
+    error, from a Yosys log; None if the error was elsewhere."""
+    if not os.path.exists(log_full):
+        return None
+    with open(log_full, errors="replace") as f:
+        text = f.read()
+    err = text.find("\nERROR:")
+    if err < 0:
+        return None
+    names = _EXTRACTING.findall(text[:err])
+    return names[-1] if names else None
+
+
 def elaborate(src: Sources, top: str, frontend: str, tools: Toolchain, outdir: str,
               assume_file: str | None = None) -> dict:
     """One Yosys run producing main.json (structure preserved for detection
@@ -166,14 +200,12 @@ def elaborate(src: Sources, top: str, frontend: str, tools: Toolchain, outdir: s
     else:
         path = os.path.abspath
     script = (read_commands(src, top, frontend, tools, path) +
-              "design -save fvl_elab\n"
+              # Keep the source's full_case pragmas apart from the full_case
+              # that proc_rmdead puts on every case with a default item.
+              "attrmap -rename full_case fvlint_full_case\n"
+              "design -save fvl_elab\nwrite_rtlil fvl_elab.il\n"
               "proc -noopt\nflatten\nmemory_collect\nopt_clean\nwrite_json main.json\n"
-              "design -load fvl_elab\n"
-              "proc\nflatten\nopt -nodffe -nosdff\n"
-              # Ask fsm_detect to consider every register (except ones driving
-              # ports), not only those it would re-encode for synthesis.
-              "setattr -set fsm_encoding \"auto\" t:$dff t:$adff %u %co1:+[Q] w:* %i x:* %d\n"
-              "fsm_detect\nfsm_extract\nwrite_json fsm.json\n")
+              "design -load fvl_elab\n" + _fsm_commands([]))
     rc = tools.run_yosys(script, edir, "elab", allow_fail=True)
     main = os.path.join(edir, "main.json")
     fsm_json = os.path.join(edir, "fsm.json")
@@ -184,9 +216,22 @@ def elaborate(src: Sources, top: str, frontend: str, tools: Toolchain, outdir: s
         if frontend == "yosys" and "syntax error" in tail:
             hint = "\nhint: Yosys' built-in parser covers only part of SystemVerilog; try --frontend slang"
         raise ToolError(f"elaboration failed (see {log}.full):\n{tail}{hint}")
-    fsm_warning = None
-    if rc != 0 or not os.path.exists(fsm_json):
-        fsm_warning = "FSM extraction failed in Yosys; FSM checks skipped (see elab.log.full)"
+    # fsm_extract can stop Yosys on one register it can't handle (an internal
+    # assertion); extract the others without it.
+    fsm_warning, skipped, failed_log = None, [], log + ".full"
+    while rc != 0 or not os.path.exists(fsm_json):
+        name = failed_fsm(failed_log)
+        if name is None or name in skipped or len(skipped) >= MAX_FSM_RETRIES:
+            fsm_warning = (f"FSM extraction failed in Yosys; FSM checks skipped (see "
+                           f"{os.path.basename(failed_log)})")
+            break
+        skipped.append(name)
+        rc = tools.run_yosys("read_rtlil fvl_elab.il\n" + _fsm_commands(skipped), edir, "fsm", allow_fail=True)
+        failed_log = os.path.join(edir, "fsm.log.full")
+    else:
+        if skipped:
+            fsm_warning = (f"FSM extraction failed in Yosys on {', '.join(skipped)}; FSM checks skip "
+                           f"{'it' if len(skipped) == 1 else 'them'} (see elab.log.full)")
 
     assume_ports = None
     if assume_file:

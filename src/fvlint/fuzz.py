@@ -3,12 +3,12 @@
 """Soundness fuzzer.
 
 Generates small random designs (counters, cross-register conditions, case
-statements, part-selects, non-power-of-two memories, occasionally a second
-clock or a falling-edge register), runs fvlint on each, and then checks every
-verdict with an independent oracle.  The generator knows what it built, so
-for each construct it also writes down, as plain Verilog expressions, when
-the construct is active and when it goes wrong (an increment that wraps, two
-case items that match, an address past the end).  The oracle appends those
+statements, part-selects, non-power-of-two memories, state machines,
+occasionally a second clock or a falling-edge register), runs fvlint on each,
+and then checks every verdict with an independent oracle.  The generator
+knows what it built, so for each construct it also writes down, as plain
+Verilog expressions, when the construct is active and when it goes wrong (an
+increment that wraps, two case items that match, an address past the end).  The oracle appends those
 monitors to its own copy of the design and runs a plain bounded model check
 on it with SymbiYosys: no fvlint netlist, slicing, cut-points, replay,
 lemmas, PDR, check parameters, path conditions or reset discovery.  It
@@ -206,8 +206,29 @@ def generate(seed: int) -> Design:
             branches.append((c, e))
         lines.append(f"  always @({edge}) " + " ".join(body))
         chain(i, rst, branches)
-    d.stages = ["s1", "s2"] if "s2" in used else ["s1"] if "msk" in used else []
     extra = []
+    # A small state machine.  Drawn from its own random stream so that adding
+    # it left the rest of every design as it was.
+    f = random.Random(seed * 7919 + 17)
+    if f.random() < 0.4:
+        rst = f.choice(resets)
+        used.add(rst)
+        arms = []
+        for s_ in range(4):
+            a, b = f.randrange(4), f.randrange(4)
+            arms.append(f"2'd{s_}: st <= {f.choice(ins)} ? 2'd{a} : 2'd{b};" if a != b else f"2'd{s_}: st <= 2'd{a};")
+        body = f"if ({rst}) st <= 2'd{f.randrange(4)}; else case (st) {' '.join(arms)} endcase"
+        if f.random() < 0.5:
+            # An assignment after the reset branch wins over it, even during
+            # reset: Yosys then guesses the wrong reset state (PicoRV32's
+            # `cpu_state <= cpu_state_trap`).
+            body += f" if ({f.choice(ins)} && {f.choice(ins)}) st <= 2'd{f.randrange(4)};"
+        lines.append("  reg [1:0] st;")
+        lines.append(f"  always @(posedge clk) begin {body} end")
+        lines.append("  wire busy = (st == 2'd1) || (st == 2'd2);")   # not an output: fsm_detect skips those
+        d.regs.append(("st", 2))
+        extra.append("busy")
+    d.stages = ["s1", "s2"] if "s2" in used else ["s1"] if "msk" in used else []
     if r.random() < 0.5:   # unique case, sometimes with overlapping casez items
         k = r.randrange(n)
         if r.random() < 0.5:
