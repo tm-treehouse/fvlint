@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 
-from .checks import INFO, Check, Lemma
+from .checks import INFO, Check, Lemma, src_key
 from .netlist import FF_TYPES, Netlist, attr_true, const_value, is_const
 
 COMPARE_TYPES = {"$eq", "$ne", "$eqx", "$nex", "$lt", "$le", "$gt", "$ge"}
@@ -52,13 +52,17 @@ def mux_sources(nl: Netlist, bits: list, conds=(), depth=0, out=None):
 
     Returns [(bits_of_source, conditions)], conditions being (select_bit,
     value) pairs that must hold for that source to be selected.  Infeasible
-    paths (constant or contradictory selects) are dropped.
+    paths (constant or contradictory selects) are dropped.  Beyond the path
+    and depth limits a sub-tree is returned unexpanded, as one opaque source,
+    so the result always accounts for every way a value can arrive (reset
+    discovery relies on that).
     """
     if out is None:
         out = []
-    if len(out) >= MAX_PATHS or depth > 24:
-        return out
     if clean_conds(conds) is None:
+        return out
+    if len(out) >= MAX_PATHS or depth > 24:
+        out.append((bits, list(conds)))
         return out
     d = nl.whole_driver(bits)
     if d is None:
@@ -188,7 +192,7 @@ def _signed_val(v: int, w: int) -> int:
 def _compares(nl: Netlist, q: list):
     """(constants, other-operand bit lists) that q is compared against."""
     ks, others = set(), []
-    for cell in nl.compare_cells(q, COMPARE_TYPES):
+    for cell in sorted(nl.compare_cells(q, COMPARE_TYPES)):
         a, b = nl.conn(cell, "A"), nl.conn(cell, "B")
         for x, y in ((a, b), (b, a)):
             if _operand_is(x, q):
@@ -243,6 +247,7 @@ def detect_counters(nl: Netlist, max_level: int):
         waive = nl.net_attr(q, "fvlint_waive")
         ks, others = _compares(nl, q)
         any_signed = False
+        counts_up = False
         for direction, step_bits, signed, conds in steps:
             raw = const_value(step_bits)
             # A signed add of a negative constant is a decrement.
@@ -258,6 +263,7 @@ def detect_counters(nl: Netlist, max_level: int):
             if all_conds is None:
                 continue
             any_signed |= signed
+            counts_up |= direction == "up"
             bounded = nl.depends_on([b for b, _ in all_conds], set(q), max_level)
             kind = "counter_overflow" if direction == "up" else "counter_underflow"
             if signed:
@@ -281,21 +287,28 @@ def detect_counters(nl: Netlist, max_level: int):
 
         # Candidate invariants (Houdini-filtered later): q <= K for the
         # constants q is compared against (largest first: the clearing/limit
-        # compare usually bounds the counter) and the largest load value, and
-        # q <= r for signals q is compared with.  Kept small on purpose: each
-        # false candidate costs solver queries.
-        cands = sorted({k for k in ks if 0 <= k < _mask(w)}, reverse=True)[:3]
-        if loads and max(loads) < _mask(w) and max(loads) not in cands:
-            cands.append(max(loads))
+        # compare usually bounds the counter), the largest load value of a
+        # counter that only counts down, and q <= r for signals q is compared
+        # with.  Values are taken in the counter's own (signed or unsigned)
+        # domain; q <= min and q <= max say nothing useful about a counter and
+        # are skipped.  Kept small on purpose: each false candidate costs
+        # solver queries.
+        val = (lambda k: _signed_val(k, w)) if any_signed else (lambda k: k)
+        lo_end, hi_end = ((-(1 << (w - 1)), (1 << (w - 1)) - 1) if any_signed else (0, _mask(w)))
+        useful = lambda k: lo_end < val(k) < hi_end  # noqa: E731
+        cands = sorted({k for k in ks if useful(k)}, key=val, reverse=True)[:3]
+        top_load = max(loads, key=val) if loads else None
+        if not counts_up and top_load is not None and useful(top_load) and top_load not in cands:
+            cands.append(top_load)
         for k in cands:
-            if any_signed:
-                params = {"W": w, "LO": -(1 << (w - 1)), "HI": _signed_val(k, w), "SIGNED": 1}
-            else:
-                params = {"W": w, "LO": 0, "HI": k, "SIGNED": 0}
             lemmas.setdefault(cell, []).append(Lemma(
-                owner=cell, desc=f"{name} <= {k}", checker="fvl_range",
-                params=params, ports={"v": q}, bound=k))
-        for r in others[:2]:
+                owner=cell, desc=f"{name} <= {val(k)}", checker="fvl_range",
+                params={"W": w, "LO": lo_end, "HI": val(k), "SIGNED": int(any_signed)},
+                ports={"v": q}, bound=k))
+        # Whole signals first (a zero-extended slice is a weaker bound), then
+        # by name: the choice must not depend on cell names or set order.
+        ranked = sorted(others, key=lambda r: (sum(is_const(b) for b in r), nl.name_of(r)))
+        for r in ranked[:2]:
             lemmas.setdefault(cell, []).append(Lemma(
                 owner=cell, desc=f"{name} <= {nl.name_of(r)}", checker="fvl_rel",
                 params={"W": w, "SIGNED": int(any_signed)}, ports={"a": q, "b": r}))
@@ -349,8 +362,12 @@ def detect_index(nl: Netlist):
             continue
         bw = len(b)
         signed = nl.param(cell, "B_SIGNED", 0)
-        # Unsigned compare also rejects negative signed values (MSB set).
-        if not signed and hi >= _mask(bw):
+        # The offset is checked with an unsigned compare against 0..HI, which
+        # also rejects negative signed offsets (MSB set) as long as HI is
+        # below the sign bit; so HI is clamped to the largest offset B can
+        # express.  An unsigned offset that can never exceed hi needs no check.
+        top = (1 << (bw - 1)) - 1 if signed else _mask(bw)
+        if not signed and hi >= top:
             continue
         conds, dest = forward(nl, y)
         if conds is None:
@@ -359,8 +376,8 @@ def detect_index(nl: Netlist):
         checks.append(Check(
             kind="index_range", target=_dest_name(nl, dest, y, src), src=src,
             desc=f"variable select offset stays within 0..{hi} ({aw}-bit vector, {yw}-bit slice)",
-            checker="fvl_range", params={"W": bw, "LO": 0, "HI": hi, "SIGNED": 0}, ports={"v": b},
-            conds=conds))
+            checker="fvl_range", params={"W": bw, "LO": 0, "HI": min(hi, top), "SIGNED": 0},
+            ports={"v": b}, conds=conds))
     return _dedupe(checks)
 
 
@@ -413,15 +430,12 @@ def detect_memory(nl: Netlist):
 def _dedupe(checks):
     """Several objects with the same structural name (e.g. two case statements
     assigning one register) get '#n' suffixes in source order."""
-    def key(chk):
-        f, _, line = chk.src.rpartition(":")
-        return (f, int(line) if line.isdigit() else 0)
     groups = {}
     for chk in checks:
         groups.setdefault(chk.id, []).append(chk)
     for group in groups.values():
         if len(group) > 1:
-            for n, chk in enumerate(sorted(group, key=key)):
+            for n, chk in enumerate(sorted(group, key=lambda c: src_key(c.src))):
                 if n:
                     chk.target = f"{chk.target}#{n}"
     return checks

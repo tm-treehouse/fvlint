@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 The fvlint Authors
+# SPDX-License-Identifier: ISC
+#
+# Mutation testing of the unit tests (slow: run weekly or on demand).  Fails
+# when a planted bug survives that is not an accepted survivor in
+# tests/unit/mutation_baseline.json (each listed there with its reason).
+name: mutation
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: python tests/unit/mutation.py -j 4 --timeout 60 --strict --json mutation.json | tee mutation.txt
+        shell: bash -o pipefail {0}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: mutation, path: "mutation.txt\nmutation.json"}

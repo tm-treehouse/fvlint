@@ -13,6 +13,10 @@ from dataclasses import dataclass, field
 from .tools import IDENT, Toolchain, ToolError, yosys_arg
 
 
+# Simulator options in .f files that take a separate argument fvlint ignores.
+_ARG_OPTIONS = {"-y", "-timescale", "-top", "-l", "-o", "-L", "-work", "-sverilog_ext", "-libext"}
+
+
 @dataclass
 class Sources:
     files: list = field(default_factory=list)
@@ -21,9 +25,16 @@ class Sources:
     libs: list = field(default_factory=list)      # blackbox stubs (vendor primitives)
     params: list = field(default_factory=list)    # "NAME=VALUE" top-level overrides
 
-    def add_filelist(self, path: str):
-        """Parse a simple .f file: files, +incdir+, +define+, -I, -D, -f."""
-        base = os.path.dirname(os.path.abspath(path))
+    def add_filelist(self, path: str, relative_to_list: bool = False):
+        """Parse a simple .f file: files, +incdir+, +define+, -I, -D, nested
+        -f/-F lists and -v FILE (a library file, read as a source).  Other
+        simulator options are skipped, with their argument for the ones that
+        take one (-y DIR, -timescale ..., ...).
+
+        Relative paths follow the simulator convention (Verilator, VCS,
+        Xcelium): in a list given with -f they are relative to the current
+        directory, in one given with -F to the directory of the list itself."""
+        base = os.path.dirname(os.path.abspath(path)) if relative_to_list else os.getcwd()
         rel = lambda p: p if os.path.isabs(p) else os.path.normpath(os.path.join(base, p))
         with open(path) as f:
             toks = []
@@ -45,8 +56,10 @@ class Sources:
                 self.defines.append(next(it))
             elif t.startswith("-D"):
                 self.defines.append(t[2:])
-            elif t == "-f":
-                self.add_filelist(rel(next(it)))
+            elif t in ("-f", "-F"):
+                self.add_filelist(rel(next(it)), relative_to_list=(t == "-F"))
+            elif t in _ARG_OPTIONS:
+                next(it, None)
             elif t.startswith("-") or t.startswith("+"):
                 continue  # ignore simulator-specific options
             else:

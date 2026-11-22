@@ -28,7 +28,11 @@ _ASSERT_RE = re.compile(r"engine_\d+(?:\.(basecase|induction))?: .*Assert failed
 _COVER_RE = re.compile(r"engine_\d+: .*Reached cover statement in step (\d+) at \S+: \S+ \(([^)]*)\)")
 _TRACE_RE = re.compile(r"engine_\d+(?:\.(basecase|induction))?: .*Writing trace to VCD file: (\S+)")
 _STEP_RE = re.compile(r"engine_\d+(?:\.basecase)?: .*Checking assertions in step (\d+)")
-_SUMMARY_STEP_RE = re.compile(r"summary:\s+failed assertion (\S+) at \S+ step (\d+)")
+# SymbiYosys writes "... at file:pos step 4", "... steps 2, 5" (first is
+# earliest), "... steps 2, 5 and 3 further steps", and leaves the step out
+# altogether when it is 0.
+_SUMMARY_STEP_RE = re.compile(r"summary:\s+failed assertion (\S+) at \S+(?: steps? (\d+))?")
+_SUMMARY_TRACE_RE = re.compile(r"summary: counterexample trace(?: \[(\w+)\])?: (\S+)")
 _PDR_PROVED_RE = re.compile(r"Proved output (\d+)")
 _PDR_FAILED_RE = re.compile(r"Output (\d+) (?:of miter \S+ )?was asserted in frame\s+(\d+)")
 
@@ -152,12 +156,17 @@ def parse_job(d: str, outdir: str, rc: int, engine: str, mode: str, names) -> Jo
     pending = []
     last_step = None
     steps_by_name = {}
+    induction_trace = False
     for line in log.splitlines():
+        tm = _SUMMARY_TRACE_RE.search(line)
+        if tm:
+            induction_trace = tm.group(1) == "induction"
+            continue
         s = _SUMMARY_STEP_RE.search(line)
-        if s:
+        if s and not induction_trace:           # steps of an induction trace are not counterexample steps
             k = prop_key(s.group(1))
             if k:
-                steps_by_name[k] = int(s.group(2))
+                steps_by_name[k] = int(s.group(2) or 0)
     for line in log.splitlines():
         sm = _STEP_RE.search(line)
         if sm:
@@ -165,8 +174,11 @@ def parse_job(d: str, outdir: str, rc: int, engine: str, mode: str, names) -> Jo
         am = _ASSERT_RE.search(line)
         if am:
             k = prop_key(am.group(2))
-            if k and k not in res.props:
-                phase = am.group(1) or "basecase"
+            phase = am.group(1) or "basecase"
+            old = res.props.get(k)
+            # The basecase and induction tasks run concurrently, so an induction
+            # failure can be logged first; a basecase counterexample replaces it.
+            if k and (old is None or (phase == "basecase" and old.phase == "induction")):
                 st = steps_by_name.get(k, last_step if phase == "basecase" else None)
                 if phase == "induction":
                     res.props[k] = PropResult("unknown", phase="induction")
@@ -192,9 +204,6 @@ def parse_job(d: str, outdir: str, rc: int, engine: str, mode: str, names) -> Jo
     return res
 
 
-_SUMMARY_TRACE_RE = re.compile(r"summary: counterexample trace(?: \[\w+\])?: (\S+)")
-
-
 def _parse_pdr(wd: str, log: str, res: JobResult, rel):
     """Per-property PDR verdicts.  Proved outputs are reported by index (the
     witness map gives the order); failed ones are taken from the summary,
@@ -213,7 +222,7 @@ def _parse_pdr(wd: str, log: str, res: JobResult, rel):
     for line in log.splitlines():
         tm = _SUMMARY_TRACE_RE.search(line)
         if tm:
-            trace = tm.group(1)
+            trace = tm.group(2)
             continue
         sm = _SUMMARY_STEP_RE.search(line)
         if sm and trace:
@@ -221,7 +230,7 @@ def _parse_pdr(wd: str, log: str, res: JobResult, rel):
             if k:
                 path = os.path.join(os.path.dirname(wd), trace)
                 res.props[k] = PropResult("fail", trace=rel(os.path.relpath(path, wd)),
-                                          step=int(sm.group(2)), phase="basecase")
+                                          step=int(sm.group(2) or 0), phase="basecase")
             trace = None
     # A failure ABC reported but whose trace could not be produced.
     for m in _PDR_FAILED_RE.finditer(log):

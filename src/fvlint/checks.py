@@ -18,6 +18,12 @@ WAIVED = "WAIVED"
 SEVERITY = [FAIL, ERROR, VACUOUS, UNKNOWN, WARN, INFO, PROVEN, WAIVED]
 
 
+def src_key(src: str) -> tuple:
+    """Sort key for 'file:line' locations: by file, then numerically by line."""
+    f, _, line = (src or "").rpartition(":")
+    return (f, int(line)) if line.isdigit() else (src or "", 0)
+
+
 @dataclass
 class Check:
     kind: str                 # e.g. counter_overflow, parallel_case, mem_addr, fsm_unreachable

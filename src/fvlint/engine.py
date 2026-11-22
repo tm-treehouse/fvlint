@@ -26,7 +26,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from .checks import ERROR, FAIL, PROVEN, UNKNOWN, VACUOUS, Check, Result
+from .checks import ERROR, FAIL, PROVEN, UNKNOWN, VACUOUS, Check, Result, src_key
 from .cone import UNBOUNDED, ConeSpec, build_module, clocks, merge_specs, needs_multiclock, slice_spec
 from .netlist import Netlist
 from .replay import divergent, read_vcd, read_yw, stim_module
@@ -64,7 +64,6 @@ class St:
     spec: ConeSpec | None = None
     res: Result | None = None
     done: bool = False
-    inconclusive: bool = False      # last attempt neither proved nor refuted
     cex: tuple | None = None        # (trace, step, label) on a cut cone
     proven_spec: ConeSpec | None = None
     t0: float = 0.0
@@ -92,6 +91,14 @@ class Engine:
         self._n = 0
         self._lock = threading.Lock()
         self.stats = {"jobs": 0, "batches": 0, "replays": 0}
+        # Every check is gated on the resets being inactive, so every slice
+        # must contain them: the primary reset as a port, the derived ones
+        # with their synchronizer flops (anchored, never cut into free inputs).
+        self.reset_bits = [r.bit for r in resets.all()]
+        self.reset_cells = sorted({nl.driver[r.bit].cell for r in resets.derived if r.bit in nl.driver})
+
+    def _slice(self, chk: Check, keep: list, level: int) -> ConeSpec:
+        return slice_spec(self.nl, chk.roots() + self.reset_bits, list(chk.anchors) + self.reset_cells + keep, level)
 
     # ------------------------------------------------------------ job plumbing
     def _dir(self, tag: str) -> str:
@@ -181,10 +188,12 @@ class Engine:
         if not self.assume_ports and not self.resets.primary:
             return None
         spec = ConeSpec().finish(self.nl)
-        cell = {"fvl_s0": {"hide_name": 0, "type": "fvl_cover_true", "parameters": {},
+        # Reach the first step after reset release (plus one): an assumption
+        # that contradicts the release itself is only visible from there on.
+        n = min(self._reset_cycles(None) + 1, 254)
+        cell = {"fvl_s0": {"hide_name": 0, "type": "fvl_cover_true", "parameters": {"N": n},
                            "attributes": {}, "port_directions": {}, "connections": {}}}
-        r = self.run("env", spec, [], "cover", self._reset_cycles(None) + 4, False,
-                     engine=self.engine_str_cover(), extra_cells=cell)
+        r = self.run("env", spec, [], "cover", n + 2, False, engine=self.engine_str_cover(), extra_cells=cell)
         if r.error or r.get("fvl_s0").status != "fail":
             return ("the environment is unsatisfiable: the --assume constraints (with the reset "
                     "model) contradict each other, so every proof would be vacuous")
@@ -201,7 +210,7 @@ class Engine:
             if not active:
                 break
             for s in active:
-                s.spec = slice_spec(self.nl, s.chk.roots(), list(s.chk.anchors) + sorted(s.keep), s.level)
+                s.spec = self._slice(s.chk, sorted(s.keep), s.level)
             batches = self._pack(active)
             self.stats["batches"] += len(batches)
             with ThreadPoolExecutor(max_workers=max(1, self.opts.jobs)) as ex:
@@ -253,8 +262,9 @@ class Engine:
                 i = parent[i]
             return i
         owner = {}
+        shared = set(self.reset_cells)          # in every slice: not a reason to batch together
         for i, s in enumerate(states):
-            for cell in s.spec.kept_state:
+            for cell in s.spec.kept_state - shared:
                 j = owner.setdefault(cell, i)
                 if j != i:
                     parent[find(i)] = find(j)
@@ -269,7 +279,7 @@ class Engine:
         batches = []
         open_batches = []   # [states, keep, mc]
         for group in sorted(groups.values(), key=lambda g: -len(g)):
-            group.sort(key=lambda s: (s.chk.src, s.chk.id))
+            group.sort(key=lambda s: (src_key(s.chk.src), s.chk.id))
             keep = set().union(*(s.spec.keep for s in group))
             # Clock signature: groups are only packed with groups on the same
             # clock(s), so packing never turns a single-clock problem into a
@@ -320,7 +330,10 @@ class Engine:
             return out
         for n, s in targets.items():
             pr = r.get(n)
-            out[s.idx] = (pr.status if pr.status in ("pass", "fail") else "unknown", pr, "PDR", 0, mc)
+            if pr.status in ("pass", "fail"):
+                out[s.idx] = (pr.status, pr, "PDR", 0, mc)
+            else:
+                out[s.idx] = ("unknown", "timeout" if r.status == "TIMEOUT" else pr, "PDR", 0, mc)
         return out
 
     def _houdini(self, rnd, spec, mc, targets: dict, out: dict, max_iter: int | None = None) -> dict:
@@ -398,7 +411,10 @@ class Engine:
             else:
                 self._grow(s)
             return
-        s.inconclusive = True
+        # Keep the latest reason (timeout, induction failure, ...) so an
+        # UNKNOWN result says why; a deeper bounded search may replace it.
+        res.detail = (f"{info} on cone {label}" if isinstance(info, str) and info
+                      else f"undecided by {engine} on cone {label}")
         self._grow(s)
 
     def _grow(self, s: St):
@@ -444,7 +460,7 @@ class Engine:
         """Replay a slice counterexample on the check's full cone.
         Returns ("real", PropResult) | ("spurious", set of cells to restore)
         | ("none", None) when there is nothing to replay."""
-        full = slice_spec(self.nl, s.chk.roots(), s.chk.anchors, UNBOUNDED)
+        full = self._slice(s.chk, [], UNBOUNDED)
         trace_abs = os.path.join(self.outdir, pr.trace)
         yw = yw_for(trace_abs)
         if not yw:

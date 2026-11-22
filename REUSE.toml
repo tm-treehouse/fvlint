@@ -6,3 +6,16 @@ version = 1
 path = ["AUTHORS"]
 SPDX-FileCopyrightText = "2026 The fvlint Authors"
 SPDX-License-Identifier = "ISC"
+
+# Generated test data: Yosys netlists of tests/unit/data/rtl and traces from
+# fvlint's own runs (JSON, VCD and witness files cannot carry headers).
+[[annotations]]
+path = ["tests/unit/data/snapshots/**", "tests/unit/data/traces/**"]
+SPDX-FileCopyrightText = "2026 The fvlint Authors"
+SPDX-License-Identifier = "ISC"
+
+# The mutation-testing baseline is JSON, which cannot carry a header.
+[[annotations]]
+path = ["tests/unit/mutation_baseline.json"]
+SPDX-FileCopyrightText = "2026 The fvlint Authors"
+SPDX-License-Identifier = "ISC"

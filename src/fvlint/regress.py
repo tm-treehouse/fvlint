@@ -117,7 +117,7 @@ def run_case(case: Case, engine: str, outroot: str, budget_scale: float, abc: bo
     cmd = [sys.executable, "-m", "fvlint", "--top", case.top, "-o", out, "-j", "1",
            "--engine", engine, *case.files, *case.args]
     if case.filelist:
-        cmd += ["-f", case.filelist]
+        cmd += ["-F", case.filelist]       # manifest file lists are relative to themselves
     t0 = time.time()
     budget = case.budget_s * budget_scale
     try:

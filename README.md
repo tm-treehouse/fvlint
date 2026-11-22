@@ -120,7 +120,7 @@ fvlint --help
 ## Usage
 
 ```
-fvlint --top TOP [files...] [-f files.f] [-I dir] [-D define] [-P param=value]
+fvlint --top TOP [files...] [-f files.f | -F files.f] [-I dir] [-D define] [-P param=value]
        [--frontend yosys|slang] [--reset NAME[:LEVEL] | --no-reset] [--reset-cycles N]
        [--reset-anytime] [--uninit zero|free] [--assume assumptions.sv]
        [--waivers waivers.txt] [--checks kind,...] [--engine auto|pdr|smtbmc]
@@ -136,6 +136,10 @@ fvlint --top TOP [files...] [-f files.f] [-I dir] [-D define] [-P param=value]
   `OUTDIR/results.json` and `OUTDIR/junit.xml` are written every run, and
   counterexamples come with a VCD trace.
 * `--list` shows the detected checks without proving anything.
+* File lists follow the simulator convention: relative paths in a list given
+  with `-f` are relative to the current directory, with `-F` relative to the
+  list file. Inside a list, `+incdir+`, `+define+`, `-I`, `-D`, nested
+  `-f`/`-F` and `-v FILE` are understood; other simulator options are skipped.
 
 ### Results
 
@@ -213,18 +217,41 @@ fvlint's own suite:
 
 | Suite | What it covers |
 |---|---|
-| `tests/test_unit.py` | pure-Python logic: parsers, path conditions, slicing and unions, multi-clock detection, reset discovery, quoting, FSM reset-edge filtering, PDR log parsing (no toolchain needed) |
-| `tests/regress/manifest.toml` | 50 case runs over the fixtures in `tests/fixtures`. Each fixture has clean structures and planted bugs, including a reproduction for every defect found in the design review: multi-clock false proofs, vacuous assumptions, parameter-disabled logic, synchronous-reset FSM traps, reset synchronizers, signed counters, register-bounded timers. Many cases run under both engines, plus a 200-counter throughput case. |
-| `fvlint.fuzz` | soundness fuzzer: random designs (counters, registered guards, case statements, part-selects, memories, second clocks, falling edges). Every `PROVEN`, `VACUOUS`, `FAIL` and unreachable-state verdict is re-checked by a plain bounded model check of the whole design, with no slicing, refinement, lemmas or PDR. |
+| `tests/unit/` | unit tests of every module's internals, no toolchain needed (about 1 s). Netlists are built by hand for exact edge cases and also loaded from committed Yosys snapshots of `tests/unit/data/rtl` for the shapes Yosys really produces; SymbiYosys log parsing is tested on lines in the formats of real runs, verbatim for the irregular ones (a step-0 failure has no step number). The scheduler is tested with a scripted solver (refinement, replay, batching, deep BMC, vacuity) that also checks every job it is handed is closed (no bit a checker reads is left undriven), external tools with stub executables. Kept honest by branch coverage and mutation testing (below). |
+| `tests/regress/manifest.toml` | 57 case runs over the fixtures in `tests/fixtures`. Each fixture has clean structures and planted bugs, including a reproduction for every defect found in the design review: multi-clock false proofs, vacuous assumptions, parameter-disabled logic, synchronous-reset FSM traps, reset synchronizers, signed counters, register-bounded timers. Many cases run under both engines, plus a 200-counter throughput case. |
+| `fvlint.fuzz` | soundness fuzzer: random designs (counters, registered guards, case statements, part-selects including narrow signed indices, memories, second clocks, falling edges, synchronized resets, and flops that look like reset stages but that data can set). Every `PROVEN`, `VACUOUS`, `FAIL` and unreachable-state verdict is re-checked by a plain bounded model check of the whole design, with no slicing, refinement, lemmas or PDR. Proofs are checked twice: under fvlint's own reset gating and under the oracle's (primary reset released plus a settle time, ignoring fvlint's derived resets); part-select bounds are computed by the oracle itself. |
 
 ```
-python -m unittest -v tests.test_unit
-python -m fvlint.regress -j 4 --fuzz 30
-python -m unittest -v tests.test_regress       # same, as unittest (FVLINT_FUZZ_SEEDS=...)
+python -m unittest discover -s tests/unit -t .   # unit tests (no toolchain)
+python -m fvlint.regress -j 4 --fuzz 30          # end-to-end regression + fuzzer
+python -m unittest -v tests.test_regress         # same, as unittest (FVLINT_FUZZ_SEEDS=...)
 ```
 
-`.github/workflows/ci.yml` runs lint, REUSE and unit tests, then the full
-regression with the fuzzer on both the pip toolchain and OSS CAD Suite.
+The unit tests are checked two ways. Branch coverage (`coverage run
+--branch --source=src/fvlint -m unittest discover -s tests/unit -t .`) must
+stay at 95% or more in CI. Mutation testing plants one small bug at a time in
+a copy of the sources (a flipped comparison, an off-by-one constant, a negated
+condition, a dropped `break`, a changed string) and reports every bug the unit
+tests miss:
+
+```
+python tests/unit/mutation.py -j 4                 # all modules (~30 min)
+python tests/unit/mutation.py detect cone          # selected modules
+```
+
+A surviving mutant is either a missing test, an equivalent change (one that
+cannot alter behaviour), or an accepted one (a tuning constant, wording of a
+message). Equivalent and accepted survivors are listed with their reason in
+`tests/unit/mutation_baseline.json`; the report separates new survivors from
+those, and `--strict` (used by the weekly CI run) fails on new ones.
+
+The committed Yosys snapshots are regenerated with
+`python tests/unit/data/make_snapshots.py` (`--check` reports drift).
+
+`.github/workflows/ci.yml` runs lint, REUSE and the unit tests with coverage
+on Python 3.11 to 3.13, then the full regression with the fuzzer on both the
+pip toolchain and OSS CAD Suite. `mutation.yml` runs mutation testing weekly
+or on demand.
 
 ## Limitations
 
@@ -246,7 +273,14 @@ regression with the fuzzer on both the pip toolchain and OSS CAD Suite.
   branch identical to `default` is merged away by the frontend.
 * **The fuzzer's oracle is bounded** (24+ cycles), so it can't see a
   disagreement deeper than that. Designs are kept small so the bound covers
-  them.
+  them. Apart from part-select bounds and reset gating, it still uses
+  fvlint's own check parameters and path conditions, so a mistake there would
+  be shared.
+* **Derived resets are recognised conservatively.** A register counts as a
+  synchronized reset only if every way it can change other than through its D
+  input (asynchronous reset, load, set or clear, synchronous reset, enable) is
+  off or driven by a known reset. Otherwise checks are not gated on it, which
+  can only add (true) failures inside unusual reset networks.
 * **Every `FAIL` is real only relative to the block's inputs**, since those
   are unconstrained: read it as "true at this block boundary".
 

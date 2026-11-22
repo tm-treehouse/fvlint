@@ -4,16 +4,21 @@ name: ci
 on: [push, pull_request]
 
 jobs:
+  # Unit tests of the internals: no Yosys, SymbiYosys or solver needed.
   unit:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: "3.12"}
-      - run: pip install ruff reuse
+        with: {python-version: "${{ matrix.python }}"}
+      - run: pip install ruff reuse coverage
       - run: ruff check src tests --select E,F,W --ignore E731 --line-length 120
       - run: reuse lint
-      - run: python -m unittest -v tests.test_unit
+      - run: python -m coverage run --branch --source=src/fvlint -m unittest discover -s tests/unit -t . -v
+      - run: python -m coverage report --fail-under=95
 
   # Pip-only toolchain: YoWASP Yosys + SymbiYosys, Z3, and yosys-abc from pyosys.
   regress-pip:
@@ -23,7 +28,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
-      - run: pip install .[yowasp]
+      # Pinned to the Yosys release fvlint is tested with (netlist.TESTED_YOSYS)
+      # and that made the unit tests' committed netlist snapshots.
+      - run: pip install .[yowasp] "yowasp-yosys==0.71.*"
+      - run: python tests/unit/data/make_snapshots.py --check
       - run: python -m fvlint.regress tests/regress/manifest.toml -j 2 --budget-scale 2 --fuzz 20 --junit regress.xml -o regress_out
       - uses: actions/upload-artifact@v4
         if: always()
@@ -39,6 +47,8 @@ jobs:
         with: {python-version: "3.12"}
       - uses: YosysHQ/setup-oss-cad-suite@v3
       - run: pip install .
+      # A newer Yosys may elaborate the snapshot sources differently: report it.
+      - run: python tests/unit/data/make_snapshots.py --check || echo "::warning::unit-test netlist snapshots differ under this Yosys"
       - run: python -m fvlint.regress tests/regress/manifest.toml -j 2 --fuzz 20 --junit regress.xml -o regress_out
       - uses: actions/upload-artifact@v4
         if: always()

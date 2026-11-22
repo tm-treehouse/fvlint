@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .netlist import FF_TYPES, Netlist, const_value, is_const
+from .netlist import FF_TYPES, LATCH_TYPES, Netlist, const_value, is_const
 
 _RESET_RE = re.compile(r"(^|_)(a?rst|a?reset|rst_?sync)(_?n|_ni|_b|_i)?$", re.I)
 
@@ -73,9 +73,13 @@ def _bit_sources(nl: Netlist, d_bit):
 
 
 def find_derived(nl: Netlist, primary: ResetBit, max_depth: int = 8) -> list:
+    """Derived resets up to `max_depth` register stages after the primary
+    reset (iterated to a fixpoint, so the result does not depend on the
+    order of cells in the netlist)."""
     known = {primary.bit: primary}
     derived = []
-    for _ in range(max_depth):
+    added = True
+    while added:
         added = False
         for cell, c in nl.cells.items():
             if c["type"] not in FF_TYPES or "D" not in c["connections"]:
@@ -85,7 +89,7 @@ def find_derived(nl: Netlist, primary: ResetBit, max_depth: int = 8) -> list:
                 if is_const(q) or q in known:
                     continue
                 r = _derived_bit(nl, cell, i, d, known)
-                if r is None:
+                if r is None or r[1] > max_depth:
                     continue
                 active, depth = r
                 name = nl.bit_name.get(q, str(q))
@@ -93,8 +97,6 @@ def find_derived(nl: Netlist, primary: ResetBit, max_depth: int = 8) -> list:
                 known[q] = rb
                 derived.append(rb)
                 added = True
-        if not added:
-            break
     return derived
 
 
@@ -127,15 +129,48 @@ def _derived_bit(nl: Netlist, cell: str, i: int, d, known: dict):
     """(active value, depth) if bit i of FF `cell` behaves like a reset: it is
     forced to a constant while a reset is active (asynchronously or through
     its D logic) or simply copies another reset, and otherwise only ever
-    moves towards its inactive value."""
+    moves towards its inactive value.
+
+    Every way the register can change other than through D (asynchronous
+    reset/load/set/clear, synchronous reset, a clock enable) must be either
+    constantly off or driven by a known reset at its active level.  A control
+    that data can assert would let the design re-enter "reset" at any time,
+    and since checks are switched off while a reset is active, treating such
+    a register as a reset could hide real violations."""
+    if nl.ctype(cell) in LATCH_TYPES:
+        return None
     conns = nl.cells[cell]["connections"]
+
+    def control(port, asserted, idx=0):
+        """None if never asserted, the ResetBit if asserted exactly while
+        that reset is active, False otherwise."""
+        b = nl.conn(cell, port)[idx]
+        if is_const(b):
+            return None if b in ("0", "1") and b != str(asserted) else False
+        hit = _as_reset(nl, b, known)
+        return hit[0] if hit and hit[1] == asserted else False
+
+    if "EN" in conns and control("EN", 1 - nl.param(cell, "EN_POLARITY", 1)) is not None:
+        return None                     # may hold its value: not guaranteed to follow D
+    forcing = []                        # (control, active level, value forced on bit i)
+    for port, value in (("ARST", "ARST_VALUE"), ("SRST", "SRST_VALUE")):
+        if port in conns:
+            forcing.append((port, 0, nl.param(cell, port + "_POLARITY", 1), (nl.param(cell, value, 0) >> i) & 1))
+    if "ALOAD" in conns:
+        ad = nl.conn(cell, "AD")[i] if "AD" in conns else "x"
+        forcing.append(("ALOAD", 0, nl.param(cell, "ALOAD_POLARITY", 1), int(ad) if ad in ("0", "1") else None))
+    for port, value in (("SET", 1), ("CLR", 0)):
+        if port in conns:
+            forcing.append((port, i, nl.param(cell, port + "_POLARITY", 1), value))
     forced = None
     depth = 0
-    if "ARST" in conns:
-        hit = _as_reset(nl, nl.conn(cell, "ARST")[0], known)
-        if hit and nl.param(cell, "ARST_POLARITY", 1) == hit[1]:
-            forced = (nl.param(cell, "ARST_VALUE", 0) >> i) & 1
-            depth = hit[0].depth
+    for port, idx, pol, value in forcing:
+        r = control(port, pol, idx)
+        if r is None:
+            continue
+        if r is False or value is None or (forced is not None and forced != value):
+            return None
+        forced, depth = value, max(depth, r.depth)
     consts, copies = set(), []
     for bits, conds in _bit_sources(nl, d):
         in_reset = []

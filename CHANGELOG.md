@@ -1,0 +1,94 @@
+<!--
+SPDX-FileCopyrightText: 2026 The fvlint Authors
+SPDX-License-Identifier: ISC
+-->
+
+# Changelog
+
+## 0.3.0
+
+Unit tests for the internals (`tests/unit/`), checked by branch coverage and
+mutation testing, and an independent review of them. Writing and reviewing
+the tests found the following defects in 0.2.0.
+
+### Soundness (0.2.0 could report PROVEN for a check that can fail)
+
+* **Narrow signed part-select index.** The upper bound of an `index_range`
+  check was truncated to the index width, so a 4-bit signed index into a
+  12-bit vector accepted `-8` as offset 8. Fixture `index/idx_signed_bug`.
+* **Registers that data can force were taken for resets.** A flop that copies
+  a reset synchronizer stage but that a data input can also set
+  asynchronously (or load, clear, reset synchronously, or hold through an
+  enable) was treated as a derived reset, switching every check off whenever
+  that input was high. Fixture `reset/rst_data_set`.
+* **Mux traversal dropped paths** beyond its path and depth limits, so reset
+  discovery could miss a hold path in a large case statement and take the
+  register for a reset.
+
+### Missed failures
+
+* With the smtbmc engine, the basecase and induction tasks log concurrently.
+  When the induction task finished first, the basecase counterexample of the
+  same check was ignored and the check came out UNKNOWN ("induction failed")
+  instead of FAIL; the step listed for an induction trace in the summary
+  could also replace the counterexample's step. Timing-dependent; found by
+  the regression (`index/idx_signed_bug`, smtbmc).
+
+### False failures and diagnostics
+
+* Derived (synchronized) resets were left out of every proof slice, so the
+  solver treated them as free inputs: checks fired inside the synchronizer
+  window and the counterexample was "confirmed by replay". Fixture
+  `reset/rst_sync_window`.
+* A PDR failure at step 0 lost its trace and step ("counterexample at step
+  None"): SymbiYosys leaves "step 0" out of its summary. Plural
+  `steps a, b` summaries are understood too.
+* The environment check (`--assume` against the reset model) looked at step 2,
+  inside the reset window when reset is held 2+ cycles, so a contradictory
+  assumption went unnoticed with `--no-vacuity`.
+* UNKNOWN results keep their reason (`timeout on cone 1`, `induction failed
+  on cone full`) instead of a generic message, for k-induction and PDR.
+* An unclocked memory write port is treated as level-sensitive (multi-clock
+  model), like a latch.
+
+### Behaviour changes
+
+* `-f` file lists follow the simulator convention: relative paths are
+  relative to the current directory. New `-F` for paths relative to the list
+  file (the 0.2.0 behaviour of `-f`). Inside lists, `-y DIR` and other
+  option arguments are no longer read as source files.
+* Check ids for part of a vector name the bit range (`q[3:2]`) instead of
+  only its width (`q[2b]`), so two slices of one vector no longer collide.
+* Waiver files: `#` starts a comment only at the start of a line or after
+  whitespace, and `[`/`]` are literal, so every reported id (`gnt#1`,
+  `q[3:2]`, FSM codes) can be waived as written.
+* Counter lemma candidates are taken in the counter's own signed or unsigned
+  domain, skip bounds that say nothing (`q <= 0`, `q <= max`), and are chosen
+  deterministically (whole signals first).
+* Derived-reset depth limits count register stages, independent of netlist
+  order.
+* Reports sort source lines numerically (`a.v:9` before `a.v:10`).
+* `--checks` with an unknown kind is an error (exit 2); a typo used to
+  select nothing and report a clean run.
+
+### Testing
+
+* `tests/unit/`: about 430 unit tests, no toolchain needed, ~1 s. Branch
+  coverage 99% (CI gate 95%) on Python 3.11 to 3.13.
+* `tests/unit/mutation.py`: mutation testing with a committed baseline of
+  equivalent and accepted survivors, each with its reason; weekly CI job
+  fails on any new survivor.
+* The fuzzer's oracle no longer shares fvlint's part-select bounds or reset
+  gating, and the generator produces synchronized resets, data-settable
+  reset look-alikes and narrow signed indices.
+* CI pins the pip toolchain's Yosys to the tested release and fails on
+  drift of the unit tests' netlist snapshots.
+
+## 0.2.0
+
+Design review fixes and the regression system (manifest runner, soundness
+fuzzer).
+
+## 0.1.0
+
+First prototype.

@@ -9,3 +9,5 @@ tests/_out/
 fvlint_regress/
 fvlint_fuzz/
 regress_out/
+.coverage
+htmlcov/

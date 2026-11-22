@@ -158,14 +158,18 @@ class Toolchain:
         raise ToolError("--frontend slang: Yosys has no read_slang command and the yosys-slang "
                         "plugin could not be loaded")
 
+    # Seconds SymbiYosys gets beyond its own `timeout` option to shut down.
+    SBY_GRACE = 30.0
+
     def run_sby(self, sby_file: str, cwd: str, timeout: float | None) -> int:
         """Run SymbiYosys.  The job's own `timeout` option normally ends it;
-        this is a backstop that kills the whole process group."""
+        this is a backstop that kills the whole process group.  Returns the
+        exit code, or -1 if the backstop fired."""
         p = subprocess.Popen([self.sby, "-f", os.path.basename(sby_file)], cwd=cwd,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env,
                              start_new_session=True)
         try:
-            return p.wait(timeout=None if timeout is None else timeout + 30)
+            return p.wait(timeout=None if timeout is None else timeout + self.SBY_GRACE)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(p.pid, signal.SIGKILL)

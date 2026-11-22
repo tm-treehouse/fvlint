@@ -35,6 +35,7 @@ FF_TYPES = {
 MEM_TYPES = {"$mem", "$mem_v2", "$memrd", "$memrd_v2", "$memwr", "$memwr_v2"}
 LATCH_TYPES = {"$dlatch", "$adlatch", "$dlatchsr", "$sr"}
 STATEFUL = FF_TYPES | MEM_TYPES
+_INDEXED = re.compile(r"(.*)\[(\d+)\]")
 _GATE_STATE = re.compile(r"^\$_(DFF|DFFE|SDFF|SDFFE|SDFFCE|ALDFF|ALDFFE|DFFSR|DFFSRE|DLATCH|DLATCHSR|SR|FF)_")
 
 # Yosys versions the test suite has been run against.
@@ -251,9 +252,13 @@ class Netlist:
         if nets:
             return nets[0][0]
         names = [self.bit_name.get(b, str(b)) for b in bits]
-        base = {nm.rsplit("[", 1)[0] for nm in names}
-        if len(base) == 1:
-            return f"{base.pop()}[{len(bits)}b]"
+        if len(names) == 1:
+            return names[0]
+        parts = [_INDEXED.fullmatch(n) for n in names]
+        if all(parts) and len({m.group(1) for m in parts}) == 1:
+            idx = [int(m.group(2)) for m in parts]
+            if idx == list(range(idx[0], idx[0] + len(idx))):
+                return f"{parts[0].group(1)}[{idx[-1]}:{idx[0]}]"
         return "{" + ",".join(reversed(names)) + "}"
 
     def visible_name(self, bits: list) -> str | None:
@@ -324,8 +329,9 @@ class Netlist:
                 "conds": conds}
 
     def clocks(self, cell: str) -> set:
-        """(clock bit, polarity) pairs a state cell is sensitive to; latches
-        and unclocked memories report ('latch', 0)."""
+        """(clock bit, polarity) pairs a state cell is sensitive to.  Latches
+        and memories with an unclocked (level-sensitive) write port report
+        ('latch', 0); unclocked read ports are combinational and add nothing."""
         t = self.ctype(cell)
         if t in LATCH_TYPES:
             return {("latch", 0)}
@@ -334,14 +340,19 @@ class Netlist:
             return set() if is_const(clk) else {(clk, self.param(cell, "CLK_POLARITY", 1))}
         out = set()
         if t == "$mem_v2":
+            width = self.param(cell, "WIDTH", 1)
             for kind in ("RD", "WR"):
                 n = self.param(cell, f"{kind}_PORTS", 0)
                 en = self.param(cell, f"{kind}_CLK_ENABLE", 0)
                 pol = self.param(cell, f"{kind}_CLK_POLARITY", 0)
                 clks = self.conn(cell, f"{kind}_CLK")
+                wen = self.conn(cell, "WR_EN")
                 for i in range(n):
-                    if (en >> i) & 1 and i < len(clks) and not is_const(clks[i]):
-                        out.add((clks[i], (pol >> i) & 1))
+                    if (en >> i) & 1:
+                        if i < len(clks) and not is_const(clks[i]):
+                            out.add((clks[i], (pol >> i) & 1))
+                    elif kind == "WR" and any(b != "0" for b in wen[i * width:(i + 1) * width]):
+                        out.add(("latch", 0))
         return out
 
 

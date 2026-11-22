@@ -191,6 +191,42 @@ strict = true
 tags = ["index", "bug"]
 
 [[case]]
+name = "reset/rst_data_set"
+files = ["../fixtures/resets.sv"]
+top = "rst_data_set"
+expect = { "index_range:y" = "FAIL" }
+strict = true
+engines = ["pdr", "smtbmc"]
+tags = ["reset", "bug", "soundness"]
+
+[[case]]
+name = "reset/rst_sync_window"
+files = ["../fixtures/resets.sv"]
+top = "rst_sync_window"
+args = ["--checks", "index_range"]
+expect = { "index_range:y" = "PROVEN" }
+strict = true
+engines = ["pdr", "smtbmc"]
+tags = ["reset"]
+
+[[case]]
+name = "index/idx_signed_bug"
+files = ["../fixtures/index.sv"]
+top = "idx_signed_bug"
+expect = { "index_range:y" = "FAIL" }
+strict = true
+engines = ["pdr", "smtbmc"]
+tags = ["index", "bug", "signed"]
+
+[[case]]
+name = "index/idx_signed_ok"
+files = ["../fixtures/index.sv"]
+top = "idx_signed_ok"
+expect = { "index_range:y" = "PROVEN" }
+strict = true
+tags = ["index", "signed"]
+
+[[case]]
 name = "index/lane_sel_fixed"
 files = ["../fixtures/index.sv"]
 top = "lane_sel_fixed"

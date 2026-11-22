@@ -56,3 +56,29 @@ module fsm_sync (input clk, input rst, input go, input stop, output busy);
       endcase
   assign busy = (st == RUN);
 endmodule
+
+// BUG: q copies a synchronizer stage but a data input (func) can also set it
+// asynchronously, so it is not a reset.  Treating it as one switches every
+// check off while func is high, hiding the out-of-range index (a false
+// PROVEN in fvlint 0.2.0).
+module rst_data_set (input clk, input rst, input func, input [11:0] vec, output reg y);
+  reg r1;
+  always @(posedge clk) r1 <= rst;
+  reg q;
+  always @(posedge clk or posedge func) if (func) q <= 1'b1; else q <= r1;
+  wire [3:0] idx = func ? 4'd15 : {3'b000, q};
+  always @(posedge clk) y <= vec[idx];
+endmodule
+
+// Clean: the offset leaves the vector only in cycle 3, while the synchronized
+// reset (r1, r2) is still active, so the check is off then.  fvlint 0.2.0 left
+// the synchronizer out of the proof and reported a false FAIL.
+module rst_sync_window (input clk, input rst, input [11:0] vec, output reg y, output reg rdy);
+  reg r1, r2;
+  always @(posedge clk) begin r1 <= rst; r2 <= r1; end
+  always @(posedge clk) rdy <= !r2;
+  reg [2:0] t = 3'd0;
+  always @(posedge clk) if (t != 3'd7) t <= t + 3'd1;
+  wire [3:0] idx = (t == 3'd3) ? 4'd15 : 4'd0;
+  always @(posedge clk) y <= vec[idx];
+endmodule

@@ -8,11 +8,14 @@ import json
 from collections import Counter
 from xml.sax.saxutils import escape, quoteattr
 
-from .checks import ERROR, FAIL, PROVEN, SEVERITY, UNKNOWN, VACUOUS, WAIVED
+from .checks import ERROR, FAIL, PROVEN, SEVERITY, UNKNOWN, VACUOUS, WAIVED, src_key
 
+
+# Console column caps (longer ids / locations run into the next column).
+ID_WIDTH, SRC_WIDTH = 60, 32
 
 def _order(r):
-    return (SEVERITY.index(r.status), r.check.src, r.check.id)
+    return (SEVERITY.index(r.status), src_key(r.check.src), r.check.id)
 
 
 def console(results, verbose=False) -> str:
@@ -23,8 +26,8 @@ def console(results, verbose=False) -> str:
             if verbose or r.status not in (PROVEN, WAIVED)]
     if rows:
         w1 = max(len(x[0]) for x in rows)
-        w2 = min(max(len(x[1]) for x in rows), 60)
-        w3 = min(max(len(x[2]) for x in rows), 32)
+        w2 = min(max(len(x[1]) for x in rows), ID_WIDTH)
+        w3 = min(max(len(x[2]) for x in rows), SRC_WIDTH)
         for st, cid, src, detail in rows:
             lines.append(f"{st:<{w1}}  {cid:<{w2}}  {src:<{w3}}  {detail}")
     if not verbose and (counts[PROVEN] or counts[WAIVED]):

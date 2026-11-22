@@ -124,9 +124,9 @@ module fvl_reset_init #(parameter ACTIVE = 1, parameter integer CYCLES = 1,
 endmodule
 
 // Environment sanity probe: reachable iff reset + assumptions are satisfiable.
-module fvl_cover_true;
+module fvl_cover_true #(parameter integer N = 2);   // N < 255: the step to reach
   (* gclk *) wire gclk;
   reg [7:0] n = 8'd0;
   always @(posedge gclk) if (n != 8'hff) n <= n + 8'd1;
-  always @* cover (n == 8'd2);
+  always @* cover (n == N);
 endmodule

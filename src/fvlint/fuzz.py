@@ -67,14 +67,28 @@ def generate(seed: int) -> tuple[str, str]:
              f"input in3, input [3:0] din, output [63:0] o);"]
     for i, w in enumerate(widths):
         lines.append(f"  reg [{w - 1}:0] r{i};")
+    # Reset structure: the primary reset, a two-stage synchronized copy, and
+    # sometimes a flop that copies the synchronizer but that a data input can
+    # also set asynchronously (not a reset, though it looks like one).
+    resets = ["rst"]
+    if r.random() < 0.35:
+        lines.append("  reg s1, s2;")
+        lines.append("  always @(posedge clk) begin s1 <= rst; s2 <= s1; end")
+        resets.append("s2")
+        if r.random() < 0.5:
+            trig = r.choice(ins)
+            lines.append("  reg msk;")
+            lines.append(f"  always @(posedge clk or posedge {trig}) if ({trig}) msk <= 1'b1; else msk <= s1;")
+            resets.append("msk")
     for i, w in enumerate(widths):
         edge = "negedge clk" if i == neg else ("posedge clk2" if two_clocks and i == n - 1 else "posedge clk")
         style = r.choice(["random", "bounded", "credit"])
+        rst = r.choice(resets)
         mx = (1 << w) - 1
         if style == "bounded":
             # Clears at a limit: overflow-safe unless the limit is the maximum.
             lim = r.choice([r.randrange(1, mx + 1), mx])
-            lines.append(f"  always @({edge}) if (rst) r{i} <= {w}'d0; "
+            lines.append(f"  always @({edge}) if ({rst}) r{i} <= {w}'d0; "
                          f"else if (r{i} == {w}'d{lim}) r{i} <= {w}'d0; "
                          f"else if ({cond(i)}) r{i} <= r{i} + {w}'d1;")
             continue
@@ -83,12 +97,12 @@ def generate(seed: int) -> tuple[str, str]:
             # threshold leaves one count of slack (needs a larger cone).
             lim = r.choice([mx - 1, mx - 1, mx])
             lines.append(f"  reg ok{i};")
-            lines.append(f"  always @({edge}) if (rst) ok{i} <= 1'b1; else ok{i} <= (r{i} < {w}'d{lim});")
-            lines.append(f"  always @({edge}) if (rst) r{i} <= {w}'d0; "
+            lines.append(f"  always @({edge}) if ({rst}) ok{i} <= 1'b1; else ok{i} <= (r{i} < {w}'d{lim});")
+            lines.append(f"  always @({edge}) if ({rst}) r{i} <= {w}'d0; "
                          f"else if ({r.choice(ins)} && ok{i}) r{i} <= r{i} + {w}'d1; "
                          f"else if ({r.choice(ins)} && r{i} != {w}'d0) r{i} <= r{i} - {w}'d1;")
             continue
-        body = [f"if (rst) r{i} <= {w}'d{r.randrange(1 << w)};"]
+        body = [f"if ({rst}) r{i} <= {w}'d{r.randrange(1 << w)};"]
         for b in range(r.randint(1, 3)):
             body.append(f"else if ({cond(i)}) r{i} <= {expr(i)};")
         lines.append(f"  always @({edge}) " + " ".join(body))
@@ -111,6 +125,14 @@ def generate(seed: int) -> tuple[str, str]:
         lines.append(f"  wire [{lanes * 4 - 1}:0] lanes = {{{lanes}{{din}}}} ^ {lanes * 4}'d{mask};")
         lines.append(f"  wire [3:0] sel = lanes[r{k}*4 +: 4];")
         extra.append("sel")
+    if r.random() < 0.3:   # bit-select with a narrow signed index (negative when its top bit is set)
+        k = r.randrange(n)
+        top_bit = r.choice(["1'b0", r.choice(ins)])
+        lines.append(f"  wire [2:0] lo3 = r{k};")
+        lines.append(f"  wire signed [3:0] sidx = {{{top_bit}, lo3}};")
+        lines.append("  wire [11:0] vec12 = {3{din}};")
+        lines.append("  wire sbit = vec12[sidx];")
+        extra.append("sbit")
     if r.random() < 0.4:   # non-power-of-two memory
         k = r.randrange(n)
         depth = r.choice([3, 5, 6, 7, 10, 12])
@@ -135,13 +157,62 @@ def _quiet(fn, *a, **kw):
         return fn(*a, **kw)
 
 
+# Oracle-only checkers.  They deliberately do not reuse fvlint's checker
+# library or its parameter encoding: the oracle exists to catch mistakes there.
+ORACLE_V = """\
+// Oracle: a variable select offset v lies in 0..MAXOFF, compared in
+// (BW+1)-bit signed arithmetic, so nothing is truncated to the offset width.
+module fvo_index #(parameter integer BW = 1, parameter integer SIGNED = 0, parameter integer MAXOFF = 0,
+                   parameter integer NC = 1, parameter [NC-1:0] POL = 1, parameter integer MODE = 0)
+                  (input [BW-1:0] v, input [NC-1:0] c);
+  wire en = &(c ~^ POL);
+  wire signed [BW:0] sv = SIGNED ? $signed({v[BW-1], v}) : $signed({1'b0, v});
+  wire ok = (sv >= 0) && (sv <= MAXOFF);
+  generate if (MODE == 2) begin : g_v
+    always @* assert (!en);
+  end else begin : g_a
+    always @* if (en) assert (ok);
+  end endgenerate
+endmodule
+
+// Oracle: high from global step N on.
+module fvo_settled #(parameter integer N = 12) (output done);
+  (* gclk *) wire gclk;
+  reg [7:0] n = 8'd0;
+  always @(posedge gclk) if (n != 8'hff) n <= n + 8'd1;
+  assign done = (n >= N);
+endmodule
+"""
+
+SETTLE = 10      # cycles after the primary reset that genuine synchronizers need
+
+
+def _index_prop(nl, c, name, conds, mode):
+    """The oracle's own encoding of an index_range check, from the $shiftx cell."""
+    from .sby import Prop
+    v = c.ports["v"]
+    for cell, cc in nl.cells.items():
+        if cc["type"] == "$shiftx" and cc["connections"].get("B") == v:
+            maxoff = len(cc["connections"]["A"]) - len(cc["connections"]["Y"])
+            return Prop(name, "fvo_index", {"BW": len(v), "SIGNED": nl.param(cell, "B_SIGNED", 0),
+                                            "MAXOFF": maxoff}, {"v": v}, conds, mode)
+    return None
+
+
 def oracle(out: str, top: str, depth: int, engine_opts, max_depth: int = 80) -> tuple[list, list]:
-    """Re-check fvlint's verdicts in `out` with plain BMC on the whole design."""
-    from .cone import UNBOUNDED, merge_specs, needs_multiclock, slice_spec
+    """Re-check fvlint's verdicts in `out` with plain BMC on the whole design.
+
+    Each PROVEN / VACUOUS verdict is checked twice: under fvlint's own gating
+    (path conditions, every reset inactive, from step 0) and under gating the
+    oracle decides by itself (path conditions, the primary reset inactive,
+    and SETTLE cycles after start), so a register wrongly taken for a reset
+    shows up as a disagreement.  index_range checks use the oracle's own
+    property (bounds from the $shiftx cell); the other kinds still use
+    fvlint's checker parameters."""
+    from .cone import UNBOUNDED, needs_multiclock, slice_spec
     from .detect import detect_all
     from .engine import Engine, Options
-    from .fsm import analyse_fsms
-    from .netlist import Netlist
+    from .netlist import Netlist, is_const
     from .resets import discover
     from .sby import Prop
     from .tools import Toolchain
@@ -153,59 +224,74 @@ def oracle(out: str, top: str, depth: int, engine_opts, max_depth: int = 80) -> 
     checks, _ = detect_all(nl, 3)
     by_id = {c.id: c for c in checks}
     resets = discover(nl, None, False, None)
-    fsm_json = os.path.join(edir, "fsm.json")
-    if os.path.exists(fsm_json):
-        analyse_fsms(nl, fsm_json, resets.names())
     tools = Toolchain.discover()
     eng = Engine(nl, tools, os.path.join(out, "oracle"), {}, resets,
                  Options(engine="smtbmc", timeout=engine_opts.get("timeout", 300)))
 
+    # A fresh bit for the settle flag.
+    bits = [b for n in nl.netnames.values() for b in n["bits"]]
+    bits += [b for c in nl.cells.values() for v in c["connections"].values() for b in v]
+    settled = max([b for b in bits if not is_const(b)], default=1) + 1
+    primary = [(resets.primary.bit, 1 - resets.primary.active)] if resets.primary else []
+
     props, expect, roots = [], {}, []
+
+    def add(prop, cid, st, gating):
+        props.append(prop)
+        expect[prop.name] = (cid, st, gating)
+
     for cid, res in results.items():
         st = res["status"]
         if cid in by_id and st in ("PROVEN", "VACUOUS", "FAIL"):
             c = by_id[cid]
-            name = f"fvl_t{len(props)}"
             mode = 2 if st == "VACUOUS" else 0
-            props.append(Prop(name, c.checker, c.params, c.ports,
-                              c.conds + resets.inactive_conds(), mode))
-            expect[name] = (cid, st)
+            gatings = [("fvlint", c.conds + resets.inactive_conds())]
+            if st != "FAIL" and resets.derived:
+                gatings.append(("independent", c.conds + primary + [(settled, 1)]))
+            for gating, conds in gatings:
+                name = f"fvl_t{len(props)}"
+                p = _index_prop(nl, c, name, conds, mode) if c.kind == "index_range" else None
+                add(p or Prop(name, c.checker, c.params, c.ports, conds, mode), cid, st, gating)
             roots += c.roots()
         elif st == "FAIL" and res["kind"] == "fsm_unreachable":
             sig, _, code = res["target"].partition("=")
             net = nl.netnames.get(sig)
             if not net or "'b" not in code:
                 continue
-            bits, val = net["bits"], int(code.split("'b")[1], 2)
-            w = len(bits)
+            fbits, val = net["bits"], int(code.split("'b")[1], 2)
+            w = len(fbits)
             if w > 8:
                 continue
             others = [v for v in range(1 << w) if v != val]
             setv = sum(v << (i * w) for i, v in enumerate(others))
-            name = f"fvl_t{len(props)}"
-            props.append(Prop(name, "fvl_member", {"W": w, "N": len(others), "SET": setv},
-                              {"v": bits}, resets.inactive_conds(), 0))
-            expect[name] = (cid, "UNREACHABLE")
-            roots += bits
+            add(Prop(f"fvl_t{len(props)}", "fvl_member", {"W": w, "N": len(others), "SET": setv},
+                     {"v": fbits}, resets.inactive_conds(), 0), cid, "UNREACHABLE", "fvlint")
+            roots += fbits
     if not props:
         return [], []
     spec = slice_spec(nl, roots + [r.bit for r in resets.all()], [], UNBOUNDED)
-    spec = merge_specs(nl, [spec])
-    steps = {cid: results[cid].get("cex_step") or 0 for cid, _ in expect.values() if cid in results}
-    bound = min(max([depth] + [v + 4 for v in steps.values()]), max_depth)
-    r = eng.run("oracle_bmc", spec, props, "bmc", bound, needs_multiclock(nl, spec),
-                engine=eng.smtbmc_str())
+    mc = needs_multiclock(nl, spec)
+    settle = (resets.cycles + SETTLE) * (2 if mc else 1)        # in global steps
+    cells = {"fvo_settle": {"hide_name": 0, "type": "fvo_settled", "parameters": {"N": settle},
+                            "attributes": {}, "port_directions": {"done": "output"},
+                            "connections": {"done": [settled]}}}
+    steps = {cid: results[cid].get("cex_step") or 0 for cid, _, _ in expect.values() if cid in results}
+    need = resets.cycles + SETTLE + 6 if any(g == "independent" for _, _, g in expect.values()) else 0
+    bound = min(max([depth, need] + [v + 4 for v in steps.values()]), max_depth)
+    r = eng.run("oracle_bmc", spec, props, "bmc", bound, mc, engine=eng.smtbmc_str(),
+                extra_cells=cells, extra_files={"fvo_oracle.v": ORACLE_V})
     finished = r.status in ("PASS", "FAIL")
     problems, inconclusive = [], []
-    for name, (cid, st) in expect.items():
+    for name, (cid, st, gating) in expect.items():
         failed = r.get(name).status == "fail"
+        how = "" if gating == "fvlint" else " (with the oracle's own reset gating)"
         # A violation the oracle finds is a definite witness, even if its job
         # then timed out; *not* finding one only counts if the search finished
         # deep enough.
         if st == "PROVEN" and failed:
-            problems.append(f"{cid}: fvlint PROVEN, oracle found a violation")
+            problems.append(f"{cid}: fvlint PROVEN, oracle found a violation{how}")
         elif st == "VACUOUS" and failed:
-            problems.append(f"{cid}: fvlint VACUOUS, oracle reached the check's condition")
+            problems.append(f"{cid}: fvlint VACUOUS, oracle reached the check's condition{how}")
         elif st == "UNREACHABLE" and failed:
             problems.append(f"{cid}: fvlint says unreachable, oracle reached it")
         elif st == "FAIL" and not failed:

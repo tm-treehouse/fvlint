@@ -33,7 +33,10 @@ def build_parser():
                     "properties about each one on a sliced cone of logic.")
     p.add_argument("files", nargs="*", help="Verilog/SystemVerilog sources")
     p.add_argument("--top", required=True, help="top module")
-    p.add_argument("-f", dest="filelists", action="append", default=[], help="file list (.f)")
+    p.add_argument("-f", dest="filelists", action="append", default=[], type=lambda v: (v, False),
+                   metavar="FILE", help="file list (.f); its relative paths are relative to the current directory")
+    p.add_argument("-F", dest="filelists", action="append", type=lambda v: (v, True),
+                   metavar="FILE", help="file list (.f) whose relative paths are relative to the list itself")
     p.add_argument("-I", dest="incdirs", action="append", default=[], help="include directory")
     p.add_argument("-D", dest="defines", action="append", default=[], help="preprocessor define")
     p.add_argument("-P", dest="params", action="append", default=[], help="top parameter NAME=VALUE")
@@ -93,8 +96,13 @@ def main(argv=None) -> int:
     t0 = time.time()
     src = Sources(files=list(args.files), incdirs=list(args.incdirs), defines=list(args.defines),
                   libs=list(args.lib), params=list(args.params))
-    for fl in args.filelists:
-        src.add_filelist(fl)
+    for fl, relative_to_list in args.filelists:
+        src.add_filelist(fl, relative_to_list)
+    want = {k.strip() for k in args.checks.split(",") if k.strip()} if args.checks else None
+    if want is not None and not want <= set(KINDS):
+        print(f"fvlint: --checks: unknown check kind(s) {', '.join(sorted(want - set(KINDS)))}; "
+              f"known: {', '.join(KINDS)}", file=sys.stderr)
+        return 2
     if not src.files:
         print("fvlint: no source files", file=sys.stderr)
         return 2
@@ -137,8 +145,7 @@ def main(argv=None) -> int:
     checks += fsm_checks
     for k, v in fsm_lemmas.items():
         lemmas.setdefault(k, []).extend(v)
-    if args.checks:
-        want = {k.strip() for k in args.checks.split(",")}
+    if want is not None:
         checks = [c for c in checks if c.kind in want]
 
     rdesc = "none"
