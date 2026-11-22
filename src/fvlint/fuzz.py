@@ -315,15 +315,20 @@ def oracle_text(design: Design, asserts: list, hold: int, edge: str | None = Non
     return "\n".join(lines) + "\n", first
 
 
-_SUMMARY_FAIL = re.compile(r"summary:\s+failed assertion \S+ at (\S+?):(\d+)\.\S*(?: steps? (\d+))?")
+# A failed-assertion line of an SBY summary: "summary:   failed assertion ..."
+# in the log, "  failed assertion ..." in the job's full summary file.
+_SUMMARY_FAIL = re.compile(r"^(?:.*summary:)?\s+failed assertion \S+ at (\S+?):(\d+)\.\S*(?: steps? (\d+))?")
 _DONE = re.compile(r"DONE \((\w+)")
 
 
-def read_oracle_log(log: str, source: str = "oracle.sv") -> tuple[str, dict]:
-    """(status, {line of `source`: earliest failing step}) from a SymbiYosys BMC log."""
+def read_oracle_log(log: str, source: str = "oracle.sv", summary: str = "") -> tuple[str, dict]:
+    """(status, {line of `source`: earliest failing step}) from a SymbiYosys BMC log
+    and, if given, the job's full summary file (`<workdir>/<status>`).  The log
+    only has a short summary: SBY lists the first five traces there and ends
+    with "and N further traces", so the failures in the rest are in the file."""
     status = "ERROR"
     fails = {}
-    for line in log.splitlines():
+    for line in log.splitlines() + summary.splitlines():
         m = _SUMMARY_FAIL.search(line)
         if m and m.group(1) == source:
             ln, step = int(m.group(2)), int(m.group(3) or 0)
@@ -420,7 +425,13 @@ def oracle(out: str, design: Design, depth: int, engine_opts, max_depth: int = 8
         if os.path.exists(log_path):
             with open(log_path, errors="replace") as f:
                 log = f.read()
-        status, fails = read_oracle_log(log, f"{name}.sv")
+        status = read_oracle_log(log)[0]
+        summary = ""
+        summary_path = os.path.join(d, name, status)
+        if re.fullmatch(r"[A-Z]+", status) and os.path.isfile(summary_path):
+            with open(summary_path, errors="replace") as f:
+                summary = f.read()
+        status, fails = read_oracle_log(log, f"{name}.sv", summary)
         finished = status in ("PASS", "FAIL")
         for n, i in enumerate(idx):
             ids, st, step = expect[i]

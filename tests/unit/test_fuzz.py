@@ -195,6 +195,26 @@ class OracleText(unittest.TestCase):
         self.assertEqual(fuzz.read_oracle_log(""), ("ERROR", {}))
         self.assertEqual(fuzz.read_oracle_log("SBY [run] DONE (TIMEOUT, rc=8)\n"), ("TIMEOUT", {}))
 
+    def test_full_summary(self):
+        # SBY's log lists five traces, then "and N further traces"; the rest
+        # are only in the job's full summary file (here as yices reported
+        # seed 13 of the fuzzer: one trace per assertion).
+        traces = [(28, 1), (26, 2), (25, 2), (27, 2), (29, 5), (30, 5)]
+        log = "".join(f"SBY 1:00:00 [oracle] summary: counterexample trace: oracle/engine_0/trace{i}.vcd\n"
+                      f"SBY 1:00:00 [oracle] summary:   failed assertion fz13._witness_.check_oracle_sv_{ln}_assert_1 "
+                      f"at oracle.sv:{ln}.27-{ln}.66 step {st}\n" for i, (ln, st) in enumerate(traces[:5]))
+        log += ("SBY 1:00:00 [oracle] summary: and 1 further trace\n"
+                "SBY 1:00:00 [oracle] summary: see oracle/FAIL for a complete summary\n"
+                "SBY 1:00:00 [oracle] DONE (FAIL, rc=2)\n")
+        summary = ("engine_0 (smtbmc --keep-going yices) returned FAIL\n"
+                   + "".join(f"counterexample trace: engine_0/trace{i}.vcd\n"
+                             f"  failed assertion fz13._witness_.check_oracle_sv_{ln}_assert_1 at "
+                             f"oracle.sv:{ln}.27-{ln}.66 step {st}\n" for i, (ln, st) in enumerate(traces)))
+        self.assertNotIn(30, fuzz.read_oracle_log(log)[1])
+        self.assertEqual(fuzz.read_oracle_log(log, summary=summary), ("FAIL", dict(traces)))
+        self.assertEqual(fuzz.read_oracle_log("", summary=summary)[0], "ERROR")    # the status comes from the log
+        self.assertEqual(fuzz.read_oracle_log(log, "other.sv", summary), ("FAIL", {}))
+
     def test_result_key(self):
         self.assertEqual(fuzz.result_key(row("counter_overflow:r0#1", "FAIL", "r0 + 2 never wraps past 15 (4 bits)")),
                          ("counter_overflow", "r0", 2))
@@ -220,9 +240,12 @@ class Oracle(TempDirCase):
             json.dump({"results": rows}, f)
         return d
 
-    def oracle(self, rows, fails=None, status="PASS", design=None, depth=24, max_depth=80, opts=None):
+    def oracle(self, rows, fails=None, status="PASS", design=None, depth=24, max_depth=80, opts=None,
+               log_limit=None):
         """fails: {text of a condition: step}; the fake SymbiYosys reports
-        every assertion whose line contains that text as failed at that step."""
+        every assertion whose line contains that text as failed at that step.
+        It writes them all to the full summary file, and the first `log_limit`
+        of them (all by default) to the log's short summary, as SBY does."""
         fails = fails or {}
         self.runs, self.texts = [], []
 
@@ -236,15 +259,21 @@ class Oracle(TempDirCase):
                 sv = text.rstrip().splitlines()[-1]
                 with open(os.path.join(cwd, sv)) as f:
                     self.texts.append(f.read())
-                log = ""
+                found = []
                 for n, line in enumerate(self.texts[-1].splitlines(), 1):
                     for cond, step in fails.items():
                         if "assert (" in line and cond in line:
-                            log += f"SBY [run] summary:   failed assertion t.x at {sv}:{n}.1-1.2 step {step}\n"
+                            found.append(f"  failed assertion t.x at {sv}:{n}.1-1.2 step {step}\n")
+                shown = found if log_limit is None else found[:log_limit]
+                log = "".join(f"SBY [run] summary: {ln}" for ln in shown)
+                if len(shown) < len(found):
+                    log += f"SBY [run] summary: and {len(found) - len(shown)} further traces\n"
                 name = os.path.splitext(sv)[0]
                 os.makedirs(os.path.join(cwd, name), exist_ok=True)
                 with open(os.path.join(cwd, name, "logfile.txt"), "w") as f:
                     f.write(log + f"SBY [run] DONE ({status}, rc=0)\n")
+                with open(os.path.join(cwd, name, status), "w") as f:
+                    f.write("".join(found))
                 return 0
         with mock.patch.object(Toolchain, "discover", staticmethod(lambda solver=None: Tools())):
             return fuzz.oracle(self.outdir(rows), design or self.d, depth, opts or {}, max_depth)
@@ -280,6 +309,17 @@ class Oracle(TempDirCase):
                                     "counter_underflow:q: fvlint VACUOUS, oracle reached the check's condition",
                                     "mem_addr:m.wr0: fvlint FAIL, oracle found no violation within 24 steps"])
         self.assertEqual(inconclusive, [])
+
+    def test_failures_past_the_short_summary(self):
+        # The log's summary stops after a few traces; the oracle must read the
+        # job's full summary file for the rest (seed 13 in CI, with yices).
+        rows = [row("counter_overflow:q", "FAIL", "q + 1 never wraps past 15 (4 bits)", step=4),
+                row("counter_underflow:q", "FAIL", "q - 1 never wraps below 0", step=1),
+                row("mem_addr:m.wr0", "FAIL", step=5)]
+        fails = {"q > 4'd14": 4, "q < 4'd1": 1, "q > 9": 5}
+        self.assertEqual(self.oracle(rows, fails=fails, status="FAIL", log_limit=1), ([], []))
+        problems, _ = self.oracle(rows, fails={"q > 4'd14": 4, "q < 4'd1": 1}, status="FAIL", log_limit=1)
+        self.assertEqual(problems, ["mem_addr:m.wr0: fvlint FAIL, oracle found no violation within 24 steps"])
 
     def test_fail_beyond_the_oracle(self):
         problems, inconclusive = self.oracle([row("mem_addr:m.wr0", "FAIL", step=90)])

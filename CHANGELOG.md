@@ -5,6 +5,16 @@ SPDX-License-Identifier: ISC
 
 # Changelog
 
+## Unreleased
+
+Test infrastructure only; fvlint's own behaviour is unchanged.
+
+* The fuzzer's oracle now reads SBY's full summary file as well as its log.
+  The log's summary lists only the first five counterexample traces, so a
+  failure the oracle's BMC found in a later trace went unread, and a correct
+  FAIL from fvlint was reported as a disagreement (seed 13 under the OSS CAD
+  Suite, whose yices run writes one trace per failed assertion).
+
 ## 0.3.1
 
 Test infrastructure only; fvlint's own behaviour is unchanged.
