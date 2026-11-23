@@ -282,9 +282,9 @@ def elaborate_without_full_case(src: Sources, top: str, frontend: str, tools: To
     """Elaborate the design once more with its full_case pragmas removed, for
     telling harmless pragmas apart (see detect.harmless_full_case): Yosys'
     frontend replaces the value a blocking assignment gave a signal before a
-    full_case statement with 'x, so the main netlist can't show it.  Returns (netlist JSON,
-    Yosys directory, (staged root, original root)), or None if Yosys
-    failed."""
+    full_case statement with 'x, so the main netlist can't show it.  Returns
+    (netlist JSON, Yosys directory, (staged root, original root)), or None
+    if Yosys failed."""
     edir = os.path.join(outdir, "elab_nofc")
     os.makedirs(edir, exist_ok=True)
     out = os.path.join(edir, "nofc.json")
