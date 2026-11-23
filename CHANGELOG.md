@@ -5,12 +5,32 @@ SPDX-License-Identifier: ISC
 
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 Fewer findings that need a waiver, and the integration work a project had
 to do by hand, both from the PicoRV32 integration example: 12 of its 15
 findings on the default configuration were patterns fvlint can settle
 itself.
+
+### Breaking changes
+
+* **Check ids of case statements.** A case statement that assigns several
+  signals is one check, named after all of them
+  (`parallel_case:alu_wait,alu_wait_2,cpu_state,mem_do_rinst`), not one
+  check per signal; statements that would share a name get the FSM state
+  they sit in (`@cpu_state=8'b00010000`). Waivers and CI expectations for
+  the old per-signal ids no longer match.
+* **Checks settled without a proof** no longer fail: logic in an
+  unreachable FSM state, counters that can't wrap within the horizon, and
+  `full_case` pragmas that change nothing are `INFO`, which never fails a
+  run, where they used to be `VACUOUS`, `FAIL` or proved.
+* **`--horizon` is on by default** (2^60 cycles): counters that provably
+  can't wrap sooner are `INFO` instead of checked.
+
+Migration: run once with your waiver files. Every line reported as
+matching no check needs the new id, which `--list` shows; with `--config`,
+lines are reported after all configurations ran. `--horizon 0` restores
+checking every counter.
 
 ### Fewer false or redundant findings
 
@@ -25,14 +45,19 @@ itself.
   one.
 * **`full_case` on a signal first set to `'x`** is `INFO`: simulation and
   synthesis agree. Yosys' frontend replaces the value a blocking assignment
-  gave the signal before a full_case statement with `'x`, so fvlint elaborates the design once more with its
-  pragmas neutralised (attribute, `synopsys` comment, `unique`, `priority`)
-  to see it. Before, both this harmless style and the real hazard were
-  reported alike.
+  gave the signal before a full_case statement with `'x`, so fvlint
+  elaborates the design once more with its pragmas neutralised (attribute,
+  `synopsys` comment, `unique`, `priority`) to see it. Before, both this
+  harmless style and the real hazard were reported alike.
 * **Counters that can't wrap within `--horizon`** (default 2^60 cycles) are
   `INFO`: a counter that only resets or loads constants and steps by
-  constants needs at least its distance to the end divided by its step. A
-  counter that ends `UNKNOWN` says how many cycles a wrap needs.
+  constants needs at least its distance to the end divided by its step. One
+  that steps both ways needs that for the first wrap of either kind (0 - 1
+  is all ones, one increment from overflowing). A counter that ends
+  `UNKNOWN` says how many cycles a wrap needs, as a `--horizon` value that
+  can be pasted back.
+* `results.json` gives each `INFO` result a machine-readable `reason`:
+  `free_running`, `horizon`, `dead_state` or `full_case_x`.
 * **Path conditions through fan-out.** Where a value fans out into several
   mux trees (nested if/else inside a case item), every branch is followed
   and the conditions all of them need are kept; before, the walk stopped
@@ -44,7 +69,8 @@ itself.
   (`parallel_case:alu_wait,alu_wait_2,cpu_state,mem_do_rinst`), with the FSM
   state it sits in where two would share a name (`@cpu_state=8'b00010000`).
   The property is still proven for each signal; the result names the one
-  that failed. PicoRV32's 53 per-signal checks become 20.
+  that failed. Each instance of a module has its own checks. PicoRV32's 53
+  per-signal checks become 20.
 * **Names instead of line numbers**: a case result that reaches its register
   through fan-out, or through Yosys' intermediate nets (`$0\cpu_state`,
   `$0$memwr$\cpuregs`), is named after that register; the `file:line`
@@ -54,11 +80,13 @@ itself.
 
 * **Project files**: `fvlint --config fvlint.toml [NAME...]` runs several
   configurations (tops, parameters, assumptions, waivers) into OUT/NAME and
-  exits with the worst status.
+  exits with the worst status. A waiver file that several configurations
+  share is judged over all of them.
 * **CI**: `--summary-md FILE` (Markdown summary) and `--github` (annotations
   on the source lines, and the summary in `$GITHUB_STEP_SUMMARY`), and a
   GitHub Action (`uses: tm-treehouse/fvlint@...`) that installs the OSS CAD
-  Suite and fvlint, runs a project file and uploads the results.
+  Suite and fvlint, runs a project file and uploads the results. fvlint's
+  own CI runs the Action from the checkout on a small project file.
 * **Waivers**: lines that match no check are reported (stale after a rename
   or a fix), and `--recheck-waived` proves waived checks and names the
   waivers no longer needed. A waiver on a case statement's id covers it.
@@ -75,8 +103,23 @@ itself.
 
 ### Tests
 
+* The soundness fuzzer's oracle also checks the verdicts that skip a proof.
+  The generator adds a case statement inside a state of its FSM (dead when
+  the state is unreachable), counters that step both ways, `full_case` on a
+  signal set to `'x` and on one set to a value, and counters behind a
+  parameter guard, each from its own random stream so existing seeds keep
+  their designs; about half the seeds run with a small `--horizon`. The
+  oracle checks dead logic like `VACUOUS`, a horizon claim with a bounded
+  model check exactly as deep as the claim, a harmless `full_case` against
+  what the generator wrote, and that live guarded logic has a check. With
+  the up/down wrap bound fixed in this release planted back, it reports the
+  false horizon claims (in 2 of 50 seeds); with the fix, 50 seeds are clean.
+* The mutation runner runs each test suite in a directory of its own:
+  parallel workers shared the checkout, and a test writing a relative path
+  gave 36 false "killed" verdicts under `-j 8`.
 * The unit tests pass on macOS (temporary directories through `/private`).
-* Regression fixtures for each pattern above (`tests/fixtures/review.sv`).
+* Regression fixtures for each pattern above (`tests/fixtures/review.sv`),
+  a module instantiated twice, and a 64-bit up/down counter.
 
 ## 0.3.2
 
