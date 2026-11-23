@@ -95,9 +95,27 @@ def src_short(src: str | None, base: str | None = None, src_map=None) -> str:
 
 
 def display_path(p: str) -> str:
-    """Relative to the CWD when below it, absolute otherwise."""
-    r = os.path.relpath(p)
-    return p if r.startswith("..") else r
+    """Relative to the CWD when below it or at most two levels up from it,
+    absolute otherwise.  Symbolic links are resolved for the comparison only,
+    so a CWD reached through a link (macOS's /tmp, /var) still gives short
+    paths."""
+    cwd = os.getcwd()
+    best = None
+    for path, base in ((p, cwd), (os.path.realpath(p), os.path.realpath(cwd))):
+        try:
+            r = os.path.relpath(path, base)
+        except ValueError:                      # another drive (Windows)
+            continue
+        if best is None or r.count("..") < best.count(".."):
+            best = r
+    if best is None:
+        return p
+    ups = 0
+    for part in best.split(os.sep):
+        if part != "..":
+            break
+        ups += 1
+    return best if ups <= 2 else os.path.abspath(p)
 
 
 @dataclass(frozen=True)
@@ -217,6 +235,24 @@ class Netlist:
     def cell_src(self, cell: str) -> str:
         return self.src(self.attrs(cell).get("src"))
 
+    def instance(self, cell: str) -> str:
+        """The hierarchy path of the instance a flattened cell came from
+        ('u_a', 'p0.u_a'), '' for a cell of the top module.  flatten keeps
+        `hdlname` ("p0 u_a name") on cells with a public name and names the
+        others `$flatten\\p0.\\u_a.$procmux$7`; all instances of a module share
+        the cell's `src`, so this is what tells them apart."""
+        hdl = self.attrs(cell).get("hdlname")
+        if isinstance(hdl, str) and hdl.split():
+            return ".".join(hdl.split()[:-1])
+        if cell.startswith("$flatten\\"):
+            rest = cell[len("$flatten\\"):]
+            path, sep, _ = rest.partition(".$")
+            path = path if sep else rest.rpartition(".")[0]
+            return path.replace(".\\", ".").lstrip("\\")
+        if not cell.startswith("$") and "." in cell:
+            return cell.rsplit(".", 1)[0]
+        return ""
+
     def is_stateful(self, cell: str) -> bool:
         return self._kind[cell] == "state"
 
@@ -290,6 +326,31 @@ class Netlist:
                 if self.ctype(cell) in types:
                     out.add(cell)
         return out
+
+    def equality(self, bit, value: int):
+        """(signal bits, constant) if the condition `bit == value` means
+        `signal == constant`: bit is the output of an $eq/$eqx that must
+        hold, or of a $ne/$nex that must not, between a signal and a
+        constant.  Yosys zero-extends the narrower operand (`{2'b0, st} ==
+        4'd9`); the signal is returned without that extension, so the
+        constant may not fit it.  Otherwise None."""
+        d = self.driver.get(bit)
+        if d is None or d.port != "Y" or d.offset != 0:
+            return None
+        t = self.ctype(d.cell)
+        if not ((t in ("$eq", "$eqx") and value == 1) or (t in ("$ne", "$nex") and value == 0)):
+            return None
+        a, b = self.conn(d.cell, "A"), self.conn(d.cell, "B")
+        for x, y in ((a, b), (b, a)):
+            k = const_value(y)
+            if k is None:
+                continue
+            x = list(x)
+            while x and x[-1] == "0":
+                x.pop()
+            if x and not any(is_const(v) for v in x):
+                return x, k
+        return None
 
     def depends_on(self, bits, targets: set, max_seq: int) -> bool:
         """True if any of `bits` depends on any bit in `targets`, crossing at

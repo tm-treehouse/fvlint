@@ -10,9 +10,12 @@ check is about), so waivers survive edits elsewhere in the source.
 from __future__ import annotations
 
 import os
+import re
+from dataclasses import dataclass
 
-from .checks import INFO, Check, Lemma, src_key
-from .netlist import FF_TYPES, Netlist, attr_true, const_value, is_const
+from .checks import FREE_RUNNING, FULL_CASE_X, INFO, Check, Lemma, src_key
+from .fsm import _Eval
+from .netlist import FF_TYPES, Netlist, attr_true, const_value, is_const, param_int
 
 COMPARE_TYPES = {"$eq", "$ne", "$eqx", "$nex", "$lt", "$le", "$gt", "$ge"}
 MAX_PATHS = 64
@@ -23,12 +26,30 @@ def _mask(w: int) -> int:
     return (1 << w) - 1
 
 
-def clean_conds(conds):
+def _const_eval(nl: Netlist) -> _Eval:
+    """Constant evaluation of the netlist's combinational logic, kept with
+    the netlist.  Elaboration runs no opt_expr (the structure is kept as
+    written), so a select such as `ENABLE_IRQ && timer` with the parameter
+    at 0 is a $logic_and with a constant input, not a constant bit."""
+    ev = getattr(nl, "_const_eval", None)
+    if ev is None:
+        ev = nl._const_eval = _Eval(nl.mod, {})
+    return ev
+
+
+def clean_conds(conds, nl: Netlist | None = None):
     """Drop constant-true and duplicate conditions.  Returns None when the
     conditions can never hold (a constant mismatch or a contradiction): the
-    logic is dead, so the check is skipped rather than reported."""
+    logic is dead, so the check is skipped rather than reported.  With `nl`,
+    a condition bit whose logic evaluates to a constant counts as that
+    constant (parameter-disabled logic)."""
     out, seen = [], {}
+    ev = _const_eval(nl) if nl is not None else None
     for b, v in conds:
+        if ev is not None and not is_const(b):
+            k = ev.bit(b)
+            if k is not None:
+                b = str(k)
         if is_const(b):
             if b in ("0", "1") and b != str(v):
                 return None
@@ -59,7 +80,7 @@ def mux_sources(nl: Netlist, bits: list, conds=(), depth=0, out=None):
     """
     if out is None:
         out = []
-    if clean_conds(conds) is None:
+    if clean_conds(conds, nl) is None:
         return out
     if len(out) >= MAX_PATHS or depth > 24:
         out.append((bits, list(conds)))
@@ -95,78 +116,154 @@ def mux_sources(nl: Netlist, bits: list, conds=(), depth=0, out=None):
     return out
 
 
+MAX_FORWARD = 256          # mux cells one forward() walk may visit across all branches
+
+
+def _forward_step(nl: Netlist, cell: str, port: str, offs: list):
+    """One step of forward(): ("ff", conditions, Q bits) into a register,
+    ("mux", conditions, Y bits) through a mux data input, or None where the
+    value meets other logic (or spans several inputs of one mux)."""
+    t = nl.ctype(cell)
+    if t in FF_TYPES and port == "D":
+        q = nl.conn(cell, "Q")
+        return "ff", list(nl.ff_info(cell)["conds"]), [q[o] for o in offs]
+    if t == "$mux" and port in ("A", "B"):
+        return "mux", [(nl.conn(cell, "S")[0], 0 if port == "A" else 1)], [nl.conn(cell, "Y")[o] for o in offs]
+    if t == "$pmux" and port in ("A", "B"):
+        width = nl.param(cell, "WIDTH")
+        sel = nl.conn(cell, "S")
+        if port == "A":
+            return "mux", [(s, 0) for s in sel], [nl.conn(cell, "Y")[o] for o in offs]
+        idx = {o // width for o in offs}
+        if len(idx) != 1:
+            return None
+        i = idx.pop()
+        return "mux", [(sel[i], 1)], [nl.conn(cell, "Y")[o - i * width] for o in offs]
+    if t == "$bmux" and port == "A":
+        width = nl.param(cell, "WIDTH")
+        sel = nl.conn(cell, "S")
+        idx = {o // width for o in offs}
+        if len(idx) != 1:
+            return None
+        i = idx.pop()
+        return "mux", list(zip(sel, _bits_of(i, len(sel)))), [nl.conn(cell, "Y")[o - i * width] for o in offs]
+    return None
+
+
+def _forward_walk(nl: Netlist, cur: list, conds: list, depth: int, budget: list):
+    dest = None
+    while depth > 0:
+        depth -= 1
+        if any(is_const(b) for b in cur):
+            break
+        readers, single = {}, True
+        for b in cur:
+            rs = nl.readers.get(b, [])
+            if not rs:
+                single = None                            # an unused bit: stop here
+                break
+            if len(rs) != 1:
+                single = False
+            for cell, port, off in rs:
+                readers.setdefault((cell, port), []).append(off)
+        if single is None:
+            break
+        if single and len(readers) == 1:
+            (cell, port), offs = next(iter(readers.items()))
+            step = _forward_step(nl, cell, port, offs)
+            if step is None:
+                break
+            kind, more, nxt = step
+            conds = conds + more
+            if kind == "ff":
+                dest = nxt
+                break
+            cur = nxt
+            continue
+        # The value fans out: follow every branch, keep what all of them need.
+        live = []
+        for (cell, port), offs in readers.items():
+            budget[0] -= 1
+            step = _forward_step(nl, cell, port, offs) if budget[0] > 0 else None
+            if step is None:
+                live.append((clean_conds(conds, nl), cur))           # used by other logic as it is
+            elif step[0] == "ff":
+                live.append((clean_conds(conds + step[1], nl), step[2]))
+            else:
+                live.append(_forward_walk(nl, step[2], conds + step[1], depth, budget))
+        live = [(c, d) for c, d in live if c is not None]
+        if not live:
+            return None, cur
+        common = [cd for cd in live[0][0] if all(cd in c for c, _ in live[1:])]
+        same = all(d == live[0][1] for _, d in live[1:])
+        return common, (live[0][1] if same else cur)
+    return clean_conds(conds, nl), (dest or cur)
+
+
 def forward(nl: Netlist, bits: list, max_depth=16):
-    """Follow `bits` through the mux tree that consumes them.
+    """Follow `bits` through the mux trees that consume them.
 
     Returns (conditions, destination_bits): the conditions under which the
     value propagates, and where it ends up (a register's Q, or the net where
-    the mux chain stops).  conditions is None if it can never propagate.
+    the mux chain stops).  Where the value fans out into several mux trees,
+    each branch is followed and only the conditions every branch needs are
+    kept (a value written in one state of an FSM reaches the state register
+    through several nested if/else muxes, all inside that state's case
+    item).  conditions is None if the value can never propagate.
     """
-    conds = []
-    cur = list(bits)
-    dest = None
-    for _ in range(max_depth):
-        if any(is_const(b) for b in cur):
-            break
-        readers = {}
-        ok = True
-        for b in cur:
-            rs = nl.readers.get(b, [])
-            if len(rs) != 1:
-                ok = False
-                break
-            readers.setdefault((rs[0][0], rs[0][1]), []).append(rs[0][2])
-        if not ok or len(readers) != 1:
-            break
-        (cell, port), offs = next(iter(readers.items()))
-        t = nl.ctype(cell)
-        if t in FF_TYPES and port == "D":
-            conds += nl.ff_info(cell)["conds"]
-            q = nl.conn(cell, "Q")
-            dest = [q[o] for o in offs]
-            break
-        if t == "$mux" and port in ("A", "B"):
-            conds.append((nl.conn(cell, "S")[0], 0 if port == "A" else 1))
-            cur = [nl.conn(cell, "Y")[o] for o in offs]
-        elif t == "$pmux" and port in ("A", "B"):
-            width = nl.param(cell, "WIDTH")
-            sel = nl.conn(cell, "S")
-            if port == "A":
-                conds += [(s, 0) for s in sel]
-                cur = [nl.conn(cell, "Y")[o] for o in offs]
-            else:
-                idx = {o // width for o in offs}
-                if len(idx) != 1:
-                    break
-                i = idx.pop()
-                conds.append((sel[i], 1))
-                cur = [nl.conn(cell, "Y")[o - i * width] for o in offs]
-        elif t == "$bmux" and port == "A":
-            width = nl.param(cell, "WIDTH")
-            sel = nl.conn(cell, "S")
-            idx = {o // width for o in offs}
-            if len(idx) != 1:
-                break
-            i = idx.pop()
-            conds += list(zip(sel, _bits_of(i, len(sel))))
-            cur = [nl.conn(cell, "Y")[o - i * width] for o in offs]
-        else:
-            break
-    return clean_conds(conds), (dest or cur)
+    return _forward_walk(nl, list(bits), [], max_depth, [MAX_FORWARD])
+
+
+# Yosys' names for a signal's intermediate values: `$0\q[3:0]` from proc (and
+# `$flatten\u_x.$0\q`, `u_x.$0\q` once flattened), `$0$memwr$\mem$...` for
+# the data a memory write port writes.
+_PROC_TEMP = re.compile(r"^(?:\$flatten\\)?((?:[^$]*\.)?)\$\d+\\([^\[$]+)")
+_MEMWR_TEMP = re.compile(r"^(?:\$flatten\\)?((?:[^$]*\.)?)\$\d+\$memwr\$\\([^$]+)\$")
+
+
+def _written(name: str) -> bool:
+    """A name as the user wrote it: not one Yosys made up ($procmux$7_Y), and
+    not an intermediate value of a signal (u_x.$0\\q[3:0]), which is named
+    in its last hierarchy component."""
+    return bool(name) and not name.startswith("$") and "$" not in name.rsplit(".", 1)[-1]
+
+
+def _label(name: str) -> str | None:
+    """A net name as the user wrote it, or None for an anonymous net."""
+    if not name:
+        return None
+    if _written(name):
+        return name
+    m = _MEMWR_TEMP.match(name) or _PROC_TEMP.match(name)
+    return (m.group(1) + m.group(2)) if m else None
+
+
+def _bits_label(nl: Netlist, bits: list) -> str | None:
+    """The user's name for these bits: a visible net of exactly these bits,
+    the one visible net they belong to, or the signal Yosys' intermediate
+    names stand for."""
+    if not bits:
+        return None
+    for name, n in nl.nets_for(bits):
+        if not n.get("hide_name", 0) and _written(name):
+            return name
+    names = {nl.bit_name.get(b, "").rsplit("[", 1)[0] for b in bits if not is_const(b)}
+    names.discard("")
+    visible = {n for n in names if _written(n)}
+    if len(visible) == 1:
+        return visible.pop()
+    labels = {_label(n) for n in names} - {None}
+    if len(labels) == 1:
+        return labels.pop()
+    return None
 
 
 def _dest_name(nl: Netlist, dest: list, fallback_bits: list, src: str) -> str:
     """Structural name for an anonymous object: the signal its value lands in."""
     for bits in (dest, fallback_bits):
-        name = nl.visible_name(bits) if bits else None
+        name = _bits_label(nl, bits)
         if name:
             return name
-        if bits:
-            names = {nl.bit_name.get(b, "").rsplit("[", 1)[0] for b in bits if not is_const(b)}
-            names.discard("")
-            visible = [n for n in names if not n.startswith("$")]
-            if len(visible) == 1:
-                return visible[0]
     return os.path.basename(src)
 
 
@@ -206,7 +303,102 @@ def _compares(nl: Netlist, q: list):
     return ks, others
 
 
-def detect_counters(nl: Netlist, max_level: int):
+# Flip-flop types whose value comes only from D, plus a constant reset value.
+_PLAIN_FF = {"$dff": None, "$dffe": None, "$adff": "ARST_VALUE", "$adffe": "ARST_VALUE",
+             "$sdff": "SRST_VALUE", "$sdffe": "SRST_VALUE", "$sdffce": "SRST_VALUE"}
+
+
+def min_cycles_to_wrap(nl: Netlist, cell: str, q: list, paths, up: bool, step: int,
+                       uninit: str = "zero") -> int | None:
+    """A lower bound on the cycles before `q op step` can wrap, or None.
+
+    Holds when every value the register can take next is itself (hold), a
+    constant (a load or reset value), or itself plus or minus a constant,
+    and its start value is known: then it moves at most the largest step per
+    cycle away from the extreme load or start value.  A 64-bit instruction
+    counter that only resets to 0 and adds 1 can't wrap in fewer than
+    2^64 - 1 cycles.  Unsigned counters only; anything else gives None.
+
+    A register that steps both ways can wrap the other way first (0 - 1 is
+    all ones, one increment from overflowing), so then the bound is the
+    cycles before the first wrap of any kind: until then the value stays
+    within [lowest start - n * largest down step, highest start + n *
+    largest up step].  None when that first wrap can come at once.  With
+    steps in one direction only, wraps never help (an overflow only lowers
+    the value), and the bound is for `q op step` itself."""
+    t = nl.ctype(cell)
+    if t not in _PLAIN_FF:
+        return None
+    w = len(q)
+    mask = _mask(w)
+    values, k_up, k_down = [], 0, 0
+    if _PLAIN_FF[t]:
+        values.append(nl.param(cell, _PLAIN_FF[t], 0))
+    init = nl.net_attr(q, "init")
+    if init is not None:
+        try:
+            values.append(param_int(init) & mask)
+        except ValueError:
+            return None                                  # an x in the initial value
+    elif uninit == "zero":
+        values.append(0)
+    else:
+        return None                                      # free power-up value
+    for sbits, _ in paths:
+        if sbits == q:
+            continue                                     # hold
+        k = const_value(sbits)
+        if k is not None:
+            values.append(k & mask)
+            continue
+        drv = nl.whole_driver(sbits)
+        if drv is None:
+            return None
+        acell, aport, aoff = drv
+        at = nl.ctype(acell)
+        if aport != "Y" or aoff != 0 or at not in ("$add", "$sub"):
+            return None
+        if nl.param(acell, "A_SIGNED", 0) or nl.param(acell, "B_SIGNED", 0):
+            return None
+        a, b = nl.conn(acell, "A"), nl.conn(acell, "B")
+        if _operand_is(a, q) and const_value(b) is not None:
+            k = const_value(b)
+        elif at == "$add" and _operand_is(b, q) and const_value(a) is not None:
+            k = const_value(a)
+        else:
+            return None
+        if k > mask:
+            return None
+        if at == "$add":
+            k_up = max(k_up, k)
+        else:
+            k_down = max(k_down, k)
+    if (k_up if up else k_down) <= 0:
+        return None
+
+    def cycles(gap, speed):                              # to get there, then the wrapping step
+        return -(-gap // speed) + 1 if gap > 0 else None
+
+    # q + k wraps when q > mask - k, and q grows by at most k_up a cycle;
+    # q - k wraps when q < k, and q shrinks by at most k_down a cycle.
+    if not k_down:
+        return cycles((mask - step + 1) - max(values), k_up)
+    if not k_up:
+        return cycles(min(values) - (step - 1), k_down)
+    bounds = [cycles((mask - k_up + 1) - max(values), k_up), cycles(min(values) - (k_down - 1), k_down)]
+    return None if None in bounds else min(bounds)
+
+
+def fmt_cycles(n: int) -> str:
+    """A cycle count for messages: exact when small, else the power of two
+    below it (still a true lower bound)."""
+    if n < 1 << 20:
+        return f"{n:,}"
+    e = n.bit_length() - 1
+    return f"2^{e}" if n == 1 << e else f"more than 2^{e}"
+
+
+def detect_counters(nl: Netlist, max_level: int, uninit: str = "zero"):
     checks, lemmas = [], {}
     for cell, c in nl.cells.items():
         if c["type"] not in FF_TYPES or c["type"] == "$anyinit" or "D" not in c["connections"]:
@@ -259,12 +451,16 @@ def detect_counters(nl: Netlist, max_level: int):
                 step = raw
             if step <= 0 or step > _mask(w):
                 continue
-            all_conds = clean_conds(conds + ff["conds"])
+            all_conds = clean_conds(conds + ff["conds"], nl)
             if all_conds is None:
                 continue
             any_signed |= signed
             counts_up |= direction == "up"
-            bounded = nl.depends_on([b for b, _ in all_conds], set(q), max_level)
+            # Free-running or not is judged on the conditions as written: a
+            # compare that can never hold (q == 200 for a 7-bit q) still shows
+            # the counter was meant to be bounded, so it is checked (and fails).
+            raw = [b for b, _ in conds + ff["conds"] if not is_const(b)]
+            bounded = nl.depends_on(raw, set(q), max_level)
             kind = "counter_overflow" if direction == "up" else "counter_underflow"
             if signed:
                 smin, smax = -(1 << (w - 1)), (1 << (w - 1)) - 1
@@ -278,9 +474,11 @@ def detect_counters(nl: Netlist, max_level: int):
             chk = Check(kind=kind, target=name, src=src, desc=desc, checker="fvl_range",
                         params={"W": w, "LO": lo, "HI": hi, "SIGNED": int(signed)},
                         ports={"v": q}, conds=all_conds, anchors=[cell], waive_attr=waive,
-                        depth_hint=(1 << w) // step + 2)
+                        depth_hint=(1 << w) // step + 2,
+                        min_cycles=None if signed else min_cycles_to_wrap(
+                            nl, cell, q, paths, direction == "up", step, uninit))
             if not bounded:
-                chk.preset = INFO
+                chk.preset, chk.reason = INFO, FREE_RUNNING
                 chk.detail = ("free-running: the increment condition does not depend on the "
                               "counter, so wrap-around looks intentional; not checked")
             checks.append(chk)
@@ -316,8 +514,54 @@ def detect_counters(nl: Netlist, max_level: int):
 
 
 # ------------------------------------------------------------ case / pmux
-def detect_case(nl: Netlist):
-    checks = []
+def _guard(nl: Netlist, conds) -> str | None:
+    """The innermost `signal == constant` among path conditions, as
+    `@signal=W'bCODE`: where a case statement sits inside an FSM's case.
+    The same reading of a condition as fsm.dead_in_unreachable_states
+    (Netlist.equality), so a name and a dead state can't disagree."""
+    for bit, value in conds:
+        hit = nl.equality(bit, value)
+        if hit is None:
+            continue
+        x, k = hit
+        name = nl.visible_name(x)
+        if name and k < (1 << len(x)):
+            return f"@{name}={len(x)}'b{format(k, f'0{len(x)}b')}"
+    return None
+
+
+def _statement_name(names: list, src: str, instance: str = "") -> str:
+    """Name of a case statement from the signals it assigns (sorted; past
+    four, the first three and a count).  One that assigns no named signal
+    is named after its source line, in its instance."""
+    if not names:
+        return f"{instance}.{os.path.basename(src)}" if instance else os.path.basename(src)
+    if len(names) <= 4:
+        return ",".join(names)
+    return ",".join(names[:3]) + f",+{len(names) - 3}"
+
+
+@dataclass
+class _Part:
+    """One $pmux of a case statement: Yosys makes one per signal assigned."""
+    cell: str
+    conds: list                   # path conditions from forward()
+    signal: str | None            # the signal it assigns, None if it has no name
+
+
+@dataclass
+class _Statement:
+    target: str                   # the check id's target
+    src: str
+    instance: str                 # hierarchy path of the instance it is in ('' at the top)
+    parts: list                   # [_Part]
+
+
+def _case_statements(nl: Netlist) -> list:
+    """The parallel_case statements of the netlist, unnamed: their $pmux
+    cells grouped by source location and instance (after flatten, every
+    instance of a module has the same `src`)."""
+    stmts = {}                                           # (src attribute, instance) -> [_Part]
     for cell, c in nl.cells.items():
         if c["type"] != "$pmux":
             continue
@@ -332,23 +576,121 @@ def detect_case(nl: Netlist):
         if conds is None:
             continue   # the case result is never used (constant-disabled logic)
         src = nl.cell_src(cell)
-        target = _dest_name(nl, dest, y, src)
-        checks.append(Check(
-            kind="parallel_case", target=target, src=src,
-            desc="at most one item of a unique/parallel_case statement matches",
-            checker="fvl_onehot0", params={"W": len(sel)}, ports={"s": sel}, conds=conds))
-        # full_case from the source (renamed at elaboration; proc_rmdead also
-        # marks every case that has a default item).  Yosys implements it as
-        # an 'x default: when no item that assigns the signal matches, the
-        # synthesized value is arbitrary, while simulation keeps the value the
-        # code assigned before the case.
-        a = nl.conn(cell, "A")
-        if attr_true(attrs.get("fvlint_full_case")) and a and all(b == "x" for b in a):
-            checks.append(Check(
-                kind="full_case", target=target, src=src,
-                desc="an item of a full_case/unique case statement (no default) assigns the signal",
-                checker="fvl_nonzero", params={"W": len(sel)}, ports={"s": sel}, conds=conds))
-    return _dedupe(checks)
+        name = _dest_name(nl, dest, y, src)
+        stmts.setdefault((attrs.get("src") or cell, nl.instance(cell)), []).append(
+            _Part(cell, conds, None if name == os.path.basename(src) else name))
+    return [_Statement("", nl.cell_src(parts[0].cell), inst, parts) for (_, inst), parts in stmts.items()]
+
+
+def _name_statements(nl: Netlist, stmts: list):
+    """Set each statement's target: the signals it assigns; statements that
+    would share a name are told apart by the FSM state they sit in, then by
+    number in source order."""
+    for st in stmts:
+        st.target = _statement_name(sorted({p.signal for p in st.parts if p.signal}), st.src, st.instance)
+    by_name = {}
+    for st in stmts:
+        by_name.setdefault(st.target, []).append(st)
+    for group in by_name.values():
+        if len(group) < 2:
+            continue
+        for st in group:
+            # The parts sit in the same place in the source; take the guard
+            # most of them see (ties: the first by name).
+            guards = [g for g in (_guard(nl, p.conds) for p in st.parts) if g]
+            if guards:
+                st.target += min(set(guards), key=lambda g: (-guards.count(g), g))
+    by_name = {}
+    for st in stmts:
+        by_name.setdefault(st.target, []).append(st)
+    for group in by_name.values():
+        for n, st in enumerate(sorted(group, key=lambda st: (src_key(st.src), st.instance))):
+            if n:
+                st.target = f"{st.target}#{n}"
+
+
+def _statement_checks(nl: Netlist, st: _Statement, kind: str) -> list:
+    """The part checks of one statement: one per $pmux, grouped under the
+    statement's id when there are several."""
+    mine = []
+    for part in st.parts:
+        sel = nl.conn(part.cell, "S")
+        if kind == "parallel_case":
+            chk = Check(kind=kind, target=st.target, src=st.src,
+                        desc="at most one item of a unique/parallel_case statement matches",
+                        checker="fvl_onehot0", params={"W": len(sel)}, ports={"s": sel}, conds=part.conds)
+        else:
+            # full_case from the source (renamed at elaboration; proc_rmdead
+            # also marks every case that has a default item).  Yosys
+            # implements it as an 'x default: when no item that assigns the
+            # signal matches, the synthesized value is arbitrary, while
+            # simulation keeps the value the code assigned before the case.
+            a = nl.conn(part.cell, "A")
+            attrs = nl.cells[part.cell].get("attributes", {})
+            if not (attr_true(attrs.get("fvlint_full_case")) and a and all(b == "x" for b in a)):
+                continue
+            chk = Check(kind=kind, target=st.target, src=st.src,
+                        desc="an item of a full_case/unique case statement (no default) assigns the signal",
+                        checker="fvl_nonzero", params={"W": len(sel)}, ports={"s": sel}, conds=part.conds)
+        chk.part = part.signal or part.cell
+        mine.append(chk)
+    if len(mine) > 1:
+        for i, chk in enumerate(mine):
+            chk.group = chk.id
+            chk.target = f"{st.target}~{i}"
+    return mine
+
+
+def detect_case(nl: Netlist):
+    """parallel_case and full_case checks, one per case statement.
+
+    Yosys turns a case statement into one $pmux per signal it assigns, so
+    the property is proven for each of them; a statement with several gets
+    one part check per signal, all with the statement's id in `group` (the
+    report merges them).  A statement is named after the signals it assigns;
+    statements that would share a name are told apart by the FSM state they
+    sit in (`@cpu_state=8'b00010000`), then by number in source order."""
+    stmts = _case_statements(nl)
+    _name_statements(nl, stmts)
+    checks = []
+    for st in sorted(stmts, key=lambda st: (src_key(st.src), st.instance)):
+        for kind in ("parallel_case", "full_case"):
+            checks += _statement_checks(nl, st, kind)
+    return checks
+
+
+def harmless_full_case(checks: list, nl_nofc: Netlist) -> int:
+    """full_case checks whose pragma changes nothing: in `nl_nofc`, the same
+    design elaborated without full_case pragmas, the signal's value when no
+    item matches is 'x as well, because the code sets it to 'x before the
+    case (PicoRV32's `alu_out_0 = 'bx; case ...`).  Simulation then gives 'x
+    too, so synthesis's freedom costs nothing: INFO, not checked.  Matched
+    by source line, signal and item count; anything ambiguous keeps its
+    check.  Returns how many."""
+    defaults = {}
+    for cell, c in nl_nofc.cells.items():
+        if c["type"] != "$pmux" or not attr_true(c.get("attributes", {}).get("parallel_case")):
+            continue
+        sel = nl_nofc.conn(cell, "S")
+        y = nl_nofc.conn(cell, "Y")
+        conds, dest = forward(nl_nofc, y)
+        if conds is None:
+            continue
+        src = nl_nofc.cell_src(cell)
+        name = _dest_name(nl_nofc, dest, y, src)
+        a = nl_nofc.conn(cell, "A")
+        defaults.setdefault((src, name, len(sel)), []).append(bool(a) and all(b == "x" for b in a))
+    n = 0
+    for c in checks:
+        if c.kind != "full_case" or c.preset is not None:
+            continue
+        found = defaults.get((c.src, c.part, c.params.get("W")))
+        if found == [True]:
+            c.preset, c.reason = INFO, FULL_CASE_X
+            c.detail = (f"the code sets {c.part} to 'x before the case, so when no item matches simulation "
+                        "gives 'x just as synthesis may: the full_case pragma changes nothing; not checked")
+            n += 1
+    return n
 
 
 # ------------------------------------------------------- part-select index
@@ -446,7 +788,7 @@ def _dedupe(checks):
     return checks
 
 
-def detect_all(nl: Netlist, max_level: int):
-    counters, lemmas = detect_counters(nl, max_level)
+def detect_all(nl: Netlist, max_level: int, uninit: str = "zero"):
+    counters, lemmas = detect_counters(nl, max_level, uninit)
     checks = counters + detect_case(nl) + detect_index(nl) + detect_memory(nl)
     return checks, lemmas

@@ -33,27 +33,56 @@ def _glob_match(check_id: str, pat: str) -> bool:
 
 class Waivers:
     def __init__(self):
-        self.rules = []   # (glob, reason)
+        self.rules = []   # (glob, reason, line number)
+        self.path = None
+        self.used = set()
 
     @classmethod
     def load(cls, path: str | None) -> "Waivers":
         w = cls()
+        w.path = path
         if path:
             with open(path) as f:
-                for line in f:
+                for n, line in enumerate(f, 1):
                     m = _COMMENT.search(line)
                     pat, reason = (line[:m.start()], line[m.end():]) if m else (line, "")
                     pat = pat.strip()
                     if pat:
-                        w.rules.append((pat, reason.strip() or "waived"))
+                        w.rules.append((pat, reason.strip() or "waived", n))
         return w
 
     def match(self, check) -> str | None:
-        for pat, reason in self.rules:
-            if check.id == pat or _glob_match(check.id, pat):
-                return f"waiver file: {pat} ({reason})"
+        """The waiver for a check, if any.  Every rule that matches counts as
+        used (see unused), not only the first."""
+        cid = check.group or check.id                    # a case statement's parts share its id
+        found = None
+        for i, (pat, reason, _) in enumerate(self.rules):
+            if cid == pat or _glob_match(cid, pat):
+                self.used.add(i)
+                if found is None:
+                    found = f"waiver file: {pat} ({reason})"
+        if found:
+            return found
         if check.waive_attr:
             kinds = {k.strip() for k in str(check.waive_attr).split(",")}
             if "all" in kinds or check.kind in kinds:
                 return f"fvlint_waive attribute ({check.waive_attr})"
         return None
+
+    def used_lines(self) -> list:
+        """Line numbers of the rules that matched a check."""
+        return sorted(self.rules[i][2] for i in self.used)
+
+    def unused(self, kinds=None) -> list:
+        """(line number, pattern) of rules that matched no check: stale after a
+        design change or a renamed check.  With `kinds` (the check kinds that
+        ran), a rule for another kind is not reported."""
+        out = []
+        for i, (pat, _, n) in enumerate(self.rules):
+            if i in self.used:
+                continue
+            kind = pat.split(":", 1)[0]
+            if kinds is not None and not any(c in kind for c in "*?") and kind not in kinds:
+                continue
+            out.append((n, pat))
+        return out

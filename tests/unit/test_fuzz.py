@@ -58,8 +58,8 @@ class Generator(unittest.TestCase):
             d = fuzz.generate(seed)
             with self.subTest(seed=seed):
                 sites = set()
-                for i, op, k in re.findall(r"r(\d+) <= r\1 ([+-]) \d+'d(\d+);", d.text):
-                    sites.add(("counter_overflow" if op == "+" else "counter_underflow", f"r{i}", int(k)))
+                for reg, op, k in re.findall(r"(\w+) <= \1 ([+-]) \d+'d(\d+);", d.text):
+                    sites.add(("counter_overflow" if op == "+" else "counter_underflow", reg, int(k)))
                 self.assertEqual({k for k in d.monitors if k[0].startswith("counter")}, sites)
 
     def test_monitors_only_name_signals_of_the_design(self):
@@ -86,7 +86,10 @@ class Generator(unittest.TestCase):
         self.assertEqual(m[("mem_addr", "mem.wr0")], {"en": ["in3"], "bad": ["(in3 && (r2[3:0]) > 9)"]})
         self.assertEqual(m[("mem_addr", "mem.rd0")], {"en": ["1'b1"], "bad": ["((r2[3:0]) > 9)"]})
         self.assertEqual(m[("index_range", "sbit")]["en"], ["1'b1"])               # always evaluated
-        self.assertEqual(len(m), 9)
+        # Settled-without-proof constructs come on top (their own random stream).
+        self.assertEqual(m[("full_case", "fx")], {"en": ["1'b1"], "bad": ["(!(in2) && !(!in2))"]})
+        self.assertEqual(m[("parallel_case", "fx")]["bad"], ["((in2) && (!in2))"])
+        self.assertEqual(len(m), 11)
 
     def test_case_and_part_select_monitors(self):
         seen = set()
@@ -114,6 +117,92 @@ class Generator(unittest.TestCase):
                 seen.add("lanes")
         self.assertEqual(seen, {"casez", "onehot", "lanes"})
 
+    def test_settled_constructs(self):
+        # Constructs fvlint can settle without a proof: drawn from their own
+        # stream, so the rest of each design is what it was without them.
+        seen = set()
+        for seed in range(1, 80):
+            d = fuzz.generate(seed)
+            m, text = d.monitors, d.text
+            with self.subTest(seed=seed):
+                self.assertEqual("output [31:0] o2" in text, "assign o2 = {" in text)
+                if "reg [1:0] pv;" in text:
+                    k = re.search(r"else case \(st\) 2'd(\d): begin \(\* parallel_case \*\)", text).group(1)
+                    self.assertEqual(m[("parallel_case", "pv")]["en"], [f"(st == 2'd{k})"])
+                    self.assertTrue(m[("parallel_case", "pv")]["bad"][0].startswith(f"(st == 2'd{k} && ("))
+                    self.assertIn("reg [1:0] st;", text)                     # only inside the FSM
+                    seen.add("nested")
+                if "ud <= ud - " in text:
+                    self.assertIn(("counter_overflow", "ud", 1), m)
+                    self.assertIn(("counter_underflow", "ud", 1), m)
+                    self.assertEqual("initial ud = " in text, ("ud", int(re.search(r"reg \[(\d)", text[
+                        text.index("ud;") - 12:]).group(1)) + 1) not in d.regs)
+                    seen.add("updown-initial" if "initial ud = " in text else "updown")
+                self.assertEqual(d.x_defaults, {"fx"} if "fx = 2'bx;" in text else set())
+                if "fv = 2'd3;" in text:
+                    self.assertIn(("full_case", "fv"), m)
+                    seen.add("full_case-value")
+                if d.x_defaults:
+                    seen.add("full_case-x")
+                pe = re.search(r"localparam PE = (\d);", text)
+                if pe:
+                    keys = {k for k in m if k[1] == "pq"}
+                    self.assertEqual(len(keys), 1)
+                    self.assertEqual(d.required, keys if pe.group(1) == "1" else set())
+                    self.assertIn("PE && pq", " ".join(m[next(iter(keys))]["en"]))
+                    seen.add(f"param{pe.group(1)}")
+                else:
+                    self.assertEqual(d.required, set())
+                if d.args:
+                    self.assertEqual(d.args[0], "--horizon")
+                    self.assertIn(int(d.args[1]), (6, 8, 12, 16))
+                    seen.add("horizon")
+        self.assertEqual(seen, {"nested", "updown", "updown-initial", "full_case-x", "full_case-value", "param0",
+                                "param1", "horizon"})
+
+    def test_settled_constructs_of_known_designs(self):
+        # Exact text and monitors (checked by hand: a 3-bit `ud + 1` wraps from 7, so
+        # ud > 6; `pq - 1` wraps from 0, so pq < 1), and which registers start at zero.
+        d = fuzz.generate(1)
+        self.assertIn("output [63:0] o, output [31:0] o2);", d.text)
+        self.assertIn("  always @(posedge clk) if (rst) ud <= 3'd3; else if (in2 && ud != 3'd6) ud <= ud + 3'd1; "
+                      "else if (in0) ud <= ud - 3'd1;\n", d.text)
+        self.assertEqual(d.monitors[("counter_overflow", "ud", 1)]["bad"],
+                         ["(!(rst) && (in2 && ud != 3'd6) && (ud > 3'd6))"])
+        self.assertEqual(d.monitors[("counter_underflow", "ud", 1)]["bad"],
+                         ["(!(rst) && !(in2 && ud != 3'd6) && (in0) && (ud < 3'd1))"])
+        self.assertIn("  always @* begin fx = 2'bx; (* parallel_case, full_case *) case (1'b1) in2: fx = 2'd1; "
+                      "!in2: fx = 2'd2; endcase end\n", d.text)
+        self.assertEqual(d.monitors[("parallel_case", "fx")], {"en": ["1'b1"], "bad": ["((in2) && (!in2))"]})
+        self.assertEqual(d.monitors[("full_case", "fx")]["bad"], ["(!(in2) && !(!in2))"])
+        self.assertIn("  localparam PE = 1;\n  reg [3:0] pq;\n  always @(posedge clk) if (rst) pq <= 4'd0; else if "
+                      "(in3) pq <= 4'd14; else if (PE && pq != 4'd14) pq <= pq + 4'd1;\n", d.text)
+        self.assertEqual(d.monitors[("counter_overflow", "pq", 1)]["bad"],
+                         ["(!(rst) && !(in3) && (PE && pq != 4'd14) && (pq > 4'd14))"])
+        self.assertEqual(d.required, {("counter_overflow", "pq", 1)})
+        self.assertIn("  assign o2 = {ud, fx, pq};\n", d.text)
+        self.assertEqual([r for r in d.regs if r[0] in ("ud", "pq", "pv")], [("ud", 3), ("pq", 4)])
+        self.assertEqual((d.args, d.x_defaults), ([], {"fx"}))
+        d = fuzz.generate(4)                                             # its own power-up value
+        self.assertIn("  reg [3:0] ud;\n  initial ud = 4'd8;\n", d.text)
+        self.assertNotIn("ud", [r[0] for r in d.regs])
+        self.assertEqual(d.monitors[("counter_overflow", "ud", 1)]["bad"],
+                         ["(!(rst) && (in2 && ud != 4'd8) && (ud > 4'd14))"])
+        self.assertEqual(d.args, ["--horizon", "16"])
+        d = fuzz.generate(5)
+        self.assertIn("\n  reg [1:0] pv;\n  always @(posedge clk) if (rst) pv <= 2'd0; else case (st) 2'd0: begin "
+                      "(* parallel_case *) case (1'b1) in2: pv <= 2'd1; !in2: pv <= 2'd2; endcase end endcase\n",
+                      d.text)
+        self.assertEqual(d.monitors[("parallel_case", "pv")], {"en": ["(st == 2'd0)"],
+                                                               "bad": ["(st == 2'd0 && (in2) && (!in2))"]})
+        self.assertIn("  always @* begin fv = 2'd3; (* parallel_case, full_case *)", d.text)
+        self.assertIn("else if (PE && pq) pq <= pq - 3'd1;\n", d.text)
+        self.assertEqual(d.monitors[("counter_underflow", "pq", 1)]["bad"],
+                         ["(!(rst) && !(in3) && (PE && pq) && (pq < 3'd1))"])
+        self.assertEqual([r for r in d.regs if r[0] in ("ud", "pq", "pv")], [("pv", 2), ("pq", 3)])
+        self.assertIn("  assign o2 = {pv, fx, fv, pq};\n", d.text)
+        self.assertEqual(d.x_defaults, {"fx"})
+
     def test_state_machines(self):
         # Pinned: a plain one, one overridden after the reset branch, one with an unconditional arm.
         lines = lambda seed: [x for x in fuzz.generate(seed).text.splitlines() if " st" in x or "busy" in x]
@@ -140,7 +229,7 @@ class Generator(unittest.TestCase):
         self.assertEqual(fuzz.generate(9).stages, ["s1"])               # s2 unused; s1 feeds msk, which is used
         self.assertEqual(fuzz.generate(50).stages, [])                  # synchronizer present but unused
         self.assertEqual(fuzz.generate(31).stages, ["s1", "s2"])        # the state machine resets on s2
-        self.assertEqual(fuzz.generate(31).regs[-1], ("st", 2))
+        self.assertIn(("st", 2), fuzz.generate(31).regs)
         self.assertEqual(fuzz.generate(10).stages, [])                  # no synchronizer
         self.assertEqual(fuzz.generate(9).regs, [("r0", 4), ("r1", 4), ("r2", 3), ("s1", 1), ("s2", 1), ("msk", 1)])
         self.assertEqual(fuzz.generate(10).regs, [("r0", 2), ("r1", 5), ("r2", 5), ("r3", 2), ("ok0", 1), ("ok2", 1)])
@@ -150,7 +239,7 @@ class Generator(unittest.TestCase):
         # depend on clk registers only.
         d = fuzz.generate(7)
         self.assertEqual(d.clock, {"r0": "posedge clk", "ok1": "posedge clk", "r1": "posedge clk",
-                                   "r2": "posedge clk2", "mem": "posedge clk"})
+                                   "r2": "posedge clk2", "mem": "posedge clk", "ud": "posedge clk"})
         self.assertEqual(d.reads["sel"], {"wire", "lanes", "r1"})
         self.assertEqual(d.clocks_of(" ".join(d.monitors[("counter_overflow", "r1", 1)]["bad"])), {"posedge clk"})
         self.assertEqual(d.clocks_of(" ".join(d.monitors[("mem_addr", "mem.rd0")]["bad"])),
@@ -171,6 +260,10 @@ def design(**kw):
 def row(cid, status, prop="", step=None):
     kind, _, target = cid.partition(":")
     return {"id": cid, "kind": kind, "target": target, "property": prop, "status": status, "cex_step": step}
+
+
+def info(cid, reason, prop=""):
+    return dict(row(cid, "INFO", prop), reason=reason)
 
 
 class OracleText(unittest.TestCase):
@@ -256,15 +349,15 @@ class Oracle(TempDirCase):
                                   ("counter_underflow", "q", 1): {"en": ["(!e)"], "bad": ["(!e && q < 4'd1)"]},
                                   ("mem_addr", "m.wr0"): {"en": ["e"], "bad": ["(e && q > 9)"]}})
 
-    def outdir(self, rows):
+    def outdir(self, rows, meta=None):
         d = os.path.join(self.tmp, "out")
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "results.json"), "w") as f:
-            json.dump({"results": rows}, f)
+            json.dump({"meta": meta or {}, "results": rows}, f)
         return d
 
     def oracle(self, rows, fails=None, status="PASS", design=None, depth=24, max_depth=80, opts=None,
-               log_limit=None):
+               log_limit=None, meta=None):
         """fails: {text of a condition: step}; the fake SymbiYosys reports
         every assertion whose line contains that text as failed at that step.
         It writes them all to the full summary file, and the first `log_limit`
@@ -299,7 +392,7 @@ class Oracle(TempDirCase):
                     f.write("".join(found))
                 return 0
         with mock.patch.object(Toolchain, "discover", staticmethod(lambda solver=None: Tools())):
-            return fuzz.oracle(self.outdir(rows), design or self.d, depth, opts or {}, max_depth)
+            return fuzz.oracle(self.outdir(rows, meta), design or self.d, depth, opts or {}, max_depth)
 
     @property
     def text(self):
@@ -452,6 +545,83 @@ class Oracle(TempDirCase):
         problems, _ = self.oracle(rows, design=d, fails={"n > 4'd14": 4})
         self.assertEqual(problems, ["counter_overflow:n: fvlint PROVEN, oracle found a violation at step 4"])
 
+    def test_dead_logic(self):
+        # INFO "dead logic": the check's condition never holds, as for VACUOUS.
+        rows = [info("counter_overflow:q", "dead_state", "q + 1 never wraps past 15 (4 bits)"),
+                info("mem_addr:m.wr0", "dead_state")]
+        self.assertEqual(self.oracle(rows), ([], []))
+        self.assertEqual(self.asserts(), ["always @* if (fvo_gate) assert (!((e)));",
+                                          "always @* if (fvo_gate) assert (!(e));"])
+        problems, _ = self.oracle(rows[:1], fails={"(e)": 3})
+        self.assertEqual(problems, ["counter_overflow:q: fvlint INFO (dead logic in an unreachable state), oracle "
+                                    "reached the check's condition"])
+
+    def test_dead_logic_mixed_with_proofs(self):
+        rows = [info("counter_overflow:q", "dead_state", "q + 1 never wraps past 15 (4 bits)"),
+                row("counter_overflow:q#1", "PROVEN", "q + 1 never wraps past 15 (4 bits)")]
+        problems, inconclusive = self.oracle(rows)
+        self.assertEqual(problems, [])
+        self.assertEqual(inconclusive, ["counter_overflow:q, counter_overflow:q#1: DEAD and PROVEN for constructs "
+                                        "the oracle watches together; only the absence of a violation is checked"])
+        self.assertEqual(self.asserts(), ["always @* if (fvo_gate) assert (!((e && q > 4'd14)));"])
+        rows[1] = row("counter_overflow:q#1", "VACUOUS", "q + 1 never wraps past 15 (4 bits)")
+        self.assertEqual(self.oracle(rows), ([], []))
+        self.assertEqual(self.asserts(), ["always @* if (fvo_gate) assert (!((e)));"])
+
+    def test_horizon(self):
+        # INFO "can't wrap within --horizon N": no wrap in the first N - 1
+        # cycles after the reset, checked by BMC to exactly that depth.
+        rows = [info("counter_overflow:q", "horizon", "q + 1 never wraps past 15 (4 bits)"),
+                row("counter_underflow:q", "PROVEN", "q - 1 never wraps below 0")]
+        self.assertEqual(self.oracle(rows, meta={"horizon": 12}), ([], []))
+        self.assertEqual(self.asserts(), ["always @* if (fvo_gate) assert (!((fvo_n < 8'd12) && (e && q > 4'd14)));",
+                                          "always @* if (fvo_gate) assert (!((!e && q < 4'd1)));"])
+        self.assertIn("depth 24\n", self.runs[0][0])
+        problems, _ = self.oracle(rows, meta={"horizon": 12}, fails={"q > 4'd14": 5})
+        self.assertEqual(problems, ["counter_overflow:q: fvlint INFO (can't wrap within --horizon 12 cycles), "
+                                    "oracle found a wrap at step 5"])
+        # Two synchronizer stages and a deep horizon: the reset is held 3 cycles; BMC goes deep enough.
+        d = design(monitors=self.d.monitors, stages=["s1", "s2"])
+        self.oracle(rows[:1], meta={"horizon": 40}, design=d)
+        self.assertEqual(self.asserts(), ["always @* if (fvo_gate) assert (!((fvo_n < 8'd42) && (e && q > 4'd14)));"])
+        self.assertIn("depth 42\n", self.runs[0][0])
+        # A horizon and a proof of the same construct are checked apart.
+        rows.append(row("counter_overflow:q#1", "PROVEN", "q + 1 never wraps past 15 (4 bits)"))
+        self.assertEqual(self.oracle(rows, meta={"horizon": 12}), ([], []))
+        self.assertEqual(len(self.asserts()), 3)
+        # Without a horizon in the results (an older run), nothing is claimed.
+        self.assertEqual(self.oracle(rows[:1]), ([], []))
+        self.assertEqual(self.runs, [])
+
+    def test_horizon_in_a_two_clock_job(self):
+        mon = {("counter_overflow", "q", 1): {"en": ["(e && p)"], "bad": ["(e && p && q > 4'd14)"]}}
+        d = design(monitors=mon, clock={"q": "posedge clk", "p": "posedge clk2"}, reads={"q": {"p"}})
+        self.oracle([info("counter_overflow:q", "horizon", "q + 1 never wraps past 15 (4 bits)")], design=d,
+                    meta={"horizon": 8})
+        self.assertEqual(self.asserts(), ["always @* if (fvo_gate) assert (!((fvo_n < 8'd16) && (e && p && "
+                                          "q > 4'd14)));"])                      # 2 + 2 * 7 global steps
+
+    def test_harmless_full_case(self):
+        # The oracle can't watch "set to 'x before the case"; the generator's record must agree.
+        d = design(monitors=self.d.monitors, x_defaults={"fx"})
+        rows = [info("full_case:fx#1", "full_case_x"), info("full_case:fv", "full_case_x"),
+                info("counter_overflow:q", "free_running", "q + 1 never wraps past 15 (4 bits)"),
+                info("fsm_summary:st", None)]
+        problems, inconclusive = self.oracle(rows, design=d)
+        self.assertEqual(problems, ["full_case:fv: fvlint INFO (the full_case pragma changes nothing), but the code "
+                                    "sets fv to a value before the case"])
+        self.assertEqual((inconclusive, self.runs), ([], []))             # free-running: nothing claimed
+
+    def test_required_checks(self):
+        d = design(monitors=self.d.monitors, required={self.OVF})
+        problems, _ = self.oracle([row("mem_addr:m.wr0", "FAIL", step=1)], design=d, fails={"q > 9": 1})
+        self.assertEqual(problems, ["counter_overflow/q/1: live logic (its guard's parameter is 1), but fvlint "
+                                    "reported no check for it"])
+        for status in ("UNKNOWN", "WAIVED", "PROVEN"):
+            with self.subTest(status=status):
+                rows = [row("counter_overflow:q", status, "q + 1 never wraps past 15 (4 bits)")]
+                self.assertEqual(self.oracle(rows, design=d)[0], [])
+
     def test_timeout_option(self):
         self.oracle([row("mem_addr:m.wr0", "FAIL", step=1)], fails={"q > 9": 1}, opts={"timeout": 7})
         self.assertIn("timeout 7\n", self.runs[0][0])
@@ -497,6 +667,8 @@ class Driver(TempDirCase):
         self.assertEqual((again["seeds"], again["problems"]), (1, []))
         d1 = os.path.join(self.tmp, "seed1")
         self.assertEqual(argvs[0], ["--top", "fz1", os.path.join(d1, "fz1.v"), "-o", d1, "-j", "1", "--engine", "pdr"])
+        self.assertEqual(argvs[1][-4:], ["--engine", "pdr", "--horizon", "12"])     # the design's own options
+        self.assertEqual(fuzz.generate(2).args, ["--horizon", "12"])
         self.assertTrue(0 <= s["seconds"] < 60)
         self.assertEqual(oracle_calls, [("seed1", "fz1", 12), ("seed3", "fz3", 12), ("seed1", "fz1", 12)])
         self.assertEqual(len(s["problems"]), 3)

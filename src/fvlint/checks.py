@@ -17,6 +17,12 @@ PROVEN = "PROVEN"
 WAIVED = "WAIVED"
 SEVERITY = [FAIL, ERROR, VACUOUS, UNKNOWN, WARN, INFO, PROVEN, WAIVED]
 
+# Why a check is INFO instead of proved (Check.reason, "reason" in results.json).
+FREE_RUNNING = "free_running"      # the counter's step doesn't depend on it: wrap-around intended
+HORIZON = "horizon"                # the counter can't wrap within --horizon cycles
+DEAD_STATE = "dead_state"          # applies only in an unreachable FSM state
+FULL_CASE_X = "full_case_x"        # full_case on a signal set to 'x before the case: the pragma changes nothing
+
 
 def src_key(src: str) -> tuple:
     """Sort key for 'file:line' locations: by file, then numerically by line."""
@@ -38,7 +44,11 @@ class Check:
     waive_attr: str | None = None       # value of an fvlint_waive attribute on the object
     preset: str | None = None           # status decided without a proof (graph checks, info)
     detail: str = ""
+    reason: str | None = None           # why a preset INFO needs no proof (FREE_RUNNING, ...), for tools
     depth_hint: int = 0                 # BMC depth that would expose a violation, if known
+    min_cycles: int | None = None       # a violation needs at least this many cycles (counters), if known
+    group: str | None = None            # id of the reported check this one is a part of (case statements)
+    part: str = ""                      # what this part covers (the signal a case statement assigns)
 
     @property
     def id(self) -> str:
@@ -92,4 +102,49 @@ class Result:
             "trace": self.trace, "cex_step": self.step, "engine": self.engine,
             "lemmas_used": self.lemmas_used, "refinements": self.refinements,
             "vacuity": self.vacuity, "history": self.history, "waiver": self.waiver,
+            "reason": self.check.reason if self.status == INFO else None,
         }
+
+
+# How a part's status counts towards its case statement: any failure,
+# error or open question decides; then any proof (the statement is live and
+# holds); a statement is vacuous or dead only if every part is.
+_MERGE_ORDER = [WAIVED, FAIL, ERROR, UNKNOWN, PROVEN, VACUOUS, WARN, INFO]
+
+
+def merge_parts(results: list) -> list:
+    """One result per case statement: the results of its part checks (one
+    per signal it assigns, see detect_case) merged.  Other results pass
+    through unchanged, in order."""
+    out, groups = [], {}
+    for r in results:
+        g = r.check.group
+        if g is None:
+            out.append(r)
+        else:
+            if g not in groups:
+                groups[g] = []
+                out.append(g)
+            groups[g].append(r)
+    merged = []
+    for item in out:
+        if not isinstance(item, str):
+            merged.append(item)
+            continue
+        parts = groups[item]
+        status = min((p.status for p in parts), key=_MERGE_ORDER.index)
+        lead = next(p for p in parts if p.status == status)
+        kind, _, target = item.partition(":")
+        reasons = {p.check.reason for p in parts if p.status == status}
+        chk = Check(kind=kind, target=target, src=lead.check.src, desc=lead.check.desc,
+                    waive_attr=lead.check.waive_attr, reason=reasons.pop() if len(reasons) == 1 else None)
+        signals = ", ".join(p.check.part for p in parts)
+        detail = lead.detail
+        if status not in (WAIVED, INFO, VACUOUS) or len({p.detail for p in parts}) > 1:
+            detail = f"{detail} (for {lead.check.part}; checked for each signal it assigns: {signals})"
+        res = Result(check=chk, status=status, detail=detail, level=lead.level, full=lead.full,
+                     trace=lead.trace, step=lead.step, engine=lead.engine, lemmas_used=lead.lemmas_used,
+                     refinements=sum(p.refinements for p in parts), vacuity=lead.vacuity,
+                     history=lead.history, waiver=lead.waiver, seconds=round(sum(p.seconds for p in parts), 2))
+        merged.append(res)
+    return merged

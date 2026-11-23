@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 from unittest import mock
 
 from fvlint import __version__, cli
-from fvlint.checks import FAIL, PROVEN, UNKNOWN, VACUOUS, Result
+from fvlint.checks import FAIL, PROVEN, UNKNOWN, VACUOUS, Check, Result
 from fvlint.tools import ToolError
 
 from .support import NB, TempDirCase, captured, snapshot
@@ -73,8 +73,10 @@ class CliCase(TempDirCase):
                      "src_base": None, "src_map": None, "assume_ports": None, "assume_file": None}
         self.elab_calls = []
         self.Engine = type("Engine", (FakeEngine,), {"last": None})     # fresh class state per test
+        self.nofc, self.nofc_calls = None, []
         for p in (mock.patch.object(cli.Toolchain, "discover", staticmethod(lambda solver=None: self.tools)),
                   mock.patch.object(cli, "elaborate", self.fake_elaborate),
+                  mock.patch.object(cli, "elaborate_without_full_case", self.fake_nofc),
                   mock.patch.object(cli, "Engine", self.Engine)):
             p.start()
             self.addCleanup(p.stop)
@@ -84,6 +86,10 @@ class CliCase(TempDirCase):
         if isinstance(self.elab, Exception):
             raise self.elab
         return self.elab
+
+    def fake_nofc(self, src, top, frontend, tools, out):
+        self.nofc_calls.append(top)
+        return self.nofc
 
     def run_cli(self, *args, top=None):
         argv = ["--top", top or self.top, self.rtl, "-o", self.out, *args]
@@ -153,6 +159,141 @@ class Arguments(CliCase):
                     self.assertEqual(getattr(got, f.name), getattr(want, f.name))
         self.assertEqual(got.jobs, max(1, (os.cpu_count() or 2) // 2))
         self.assertGreaterEqual(got.jobs, 1)
+
+
+class CaseStatementFlow(CliCase):
+    """A case statement assigning two signals (z and w in snap_mux): listed
+    and reported once, proven per signal, waived by its own id."""
+    top = "snap_mux"
+
+    def test_listed_once(self):
+        rc, out, _ = self.run_cli("--list")
+        ids = [ln.split()[0] for ln in out.splitlines()]
+        self.assertEqual(ids.count("parallel_case:w,z"), 1)
+        self.assertFalse(any("~" in i for i in ids))
+
+    def test_proven_per_part_reported_once(self):
+        self.Engine.status = staticmethod(lambda c: FAIL if c.part == "w" else PROVEN)
+        rc, out, err = self.run_cli()
+        self.assertIn("7 checks;", err)                                 # the statement counts once
+        self.assertEqual(rc, 1)
+        self.assertEqual(sorted(c.id for c in self.Engine.last.proved if c.group),
+                         ["parallel_case:w,z~0", "parallel_case:w,z~1"])
+        res = [r for r in self.results()["results"] if r["kind"] == "parallel_case"]
+        by_id = {r["id"]: r for r in res}
+        self.assertEqual(sorted(by_id), ["parallel_case:gnt", "parallel_case:w,z", "parallel_case:y"])
+        self.assertEqual(by_id["parallel_case:w,z"]["status"], "FAIL")
+        self.assertEqual(by_id["parallel_case:w,z"]["detail"], "fake (for w; checked for each signal it assigns: "
+                                                                "z, w)")
+
+    def test_harmless_full_case(self):
+        # snap_mux's `unique case` assigns y with no default and nothing before it.
+        rc, _, err = self.run_cli()
+        self.assertEqual(self.nofc_calls, ["snap_mux"])
+        self.assertIn("could not elaborate the design without its full_case pragmas", err)
+        self.assertIn("full_case:y", [c.id for c in self.Engine.last.proved])
+        # Without the pragma the default would be 'x as well (here: the same netlist): not checked.
+        self.nofc = (snapshot("snap_mux"), None, None)
+        self.run_cli()
+        res = {r["id"]: r for r in self.results()["results"]}
+        self.assertEqual(res["full_case:y"]["status"], "INFO")
+        self.assertIn("the full_case pragma changes nothing", res["full_case:y"]["detail"])
+        self.assertNotIn("full_case:y", [c.id for c in self.Engine.last.proved])
+        # The second netlist's locations are read relative to its own Yosys directory.
+        self.nofc = (snapshot("snap_mux"), os.path.join(self.tmp, "elsewhere"), None)
+        self.run_cli()
+        res = {r["id"]: r for r in self.results()["results"]}
+        self.assertNotEqual(res["full_case:y"]["status"], "INFO")      # sources elsewhere: nothing matches
+        # Not needed when there is no full_case check to decide.
+        self.nofc_calls.clear()
+        self.run_cli("--checks", "parallel_case")
+        self.assertEqual(self.nofc_calls, [])
+
+    def test_waived_by_statement_id(self):
+        w = self.write("w.txt", "parallel_case:w,z   # reviewed\n")
+        self.Engine.status = FAIL
+        self.run_cli("--waivers", w)
+        by_id = {r["id"]: r for r in self.results()["results"]}
+        self.assertEqual(by_id["parallel_case:w,z"]["status"], "WAIVED")
+        self.assertFalse([c for c in self.Engine.last.proved if c.group])
+
+
+class WaiverHygiene(CliCase):
+    def test_unused_waivers_are_reported(self):
+        w = self.write("w.txt", "counter_overflow:mod_q   # used\n"
+                                "counter_overflow:gone    # renamed since\n"
+                                "fsm_trap:*               # not run with --checks\n")
+        rc, _, err = self.run_cli("--waivers", w, "--checks", "counter_overflow")
+        self.assertEqual(rc, 0)
+        self.assertIn(f"{w}:2: waiver 'counter_overflow:gone' matches no check", err)
+        self.assertNotIn("fsm_trap", err)
+        self.assertEqual(self.results()["meta"]["unused_waivers"], [{"line": 2, "pattern": "counter_overflow:gone"}])
+
+    def test_missing_waiver_file(self):
+        rc, _, err = self.run_cli("--waivers", os.path.join(self.tmp, "nope.txt"))
+        self.assertEqual(rc, 2)
+        self.assertIn("--waivers:", err)
+
+    def test_recheck_waived(self):
+        w = self.write("w.txt", "counter_overflow:mod_q   # reviewed\ncounter_overflow:rel_q  # reviewed\n"
+                                "counter_overflow:free_q  # free-running anyway\n")
+        self.Engine.status = staticmethod(lambda c: FAIL if c.id == "counter_overflow:rel_q" else PROVEN)
+        rc, _, err = self.run_cli("--waivers", w, "--recheck-waived")
+        self.assertEqual(rc, 0)                                          # still waived: no failure
+        self.assertIn("counter_overflow:mod_q", [c.id for c in self.Engine.last.proved])
+        res = {r["id"]: r for r in self.results()["results"]}
+        waived = ("counter_overflow:mod_q", "counter_overflow:rel_q", "counter_overflow:free_q")
+        self.assertEqual({res[i]["status"] for i in waived}, {"WAIVED"})
+        self.assertEqual(res["counter_overflow:mod_q"]["detail"], "waiver file: counter_overflow:mod_q (reviewed); "
+                                                                   "recheck: PROVEN, waiver no longer needed: fake")
+        self.assertTrue(res["counter_overflow:rel_q"]["detail"].endswith("recheck: FAIL: fake"))
+        self.assertIn("recheck: INFO, waiver no longer needed: free-running", res["counter_overflow:free_q"]["detail"])
+        self.assertEqual(self.results()["meta"]["unneeded_waivers"], ["counter_overflow:free_q",
+                                                                      "counter_overflow:mod_q"])
+        self.assertIn("waiver for counter_overflow:mod_q no longer needed", err)
+
+
+class CiOutputs(CliCase):
+    def test_summary_markdown(self):
+        md = os.path.join(self.tmp, "summary.md")
+        self.write("summary.md", "# earlier\n")
+        self.Engine.status = FAIL
+        w = self.write("w.txt", "counter_overflow:gone\n")
+        self.run_cli("--summary-md", md, "--waivers", w)
+        with open(md) as f:
+            text = f.read()
+        self.assertTrue(text.startswith("# earlier\n### fvlint: snap_counters\n"))   # appended
+        self.assertIn("| FAIL | `counter_overflow:mod_q` |", text)
+        self.assertIn("- line 1: `counter_overflow:gone`", text)
+        self.assertNotIn("| PROVEN |", text)
+
+    def test_github(self):
+        self.Engine.status = FAIL
+        md = os.path.join(self.tmp, "step_summary.md")
+        w = self.write("w.txt", "counter_overflow:gone\n")
+        with mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": self.tmp, "GITHUB_STEP_SUMMARY": md}):
+            rc, out, _ = self.run_cli("--github", "--waivers", w)
+        self.assertEqual(rc, 1)
+        ann = [ln for ln in out.splitlines() if ln.startswith("::")]
+        self.assertIn("::error title=fvlint FAIL%3A counter_overflow%3Amod_q::", "\n".join(ann))
+        self.assertIn("::warning title=fvlint%3A unused waiver,file=w.txt,line=1::counter_overflow:gone matches no "
+                      "check", "\n".join(ann))
+        with open(md) as f:
+            self.assertIn("### fvlint: snap_counters", f.read())
+
+    def test_explicit_summary_file_wins_over_the_step_summary(self):
+        md, step = os.path.join(self.tmp, "mine.md"), os.path.join(self.tmp, "step.md")
+        with mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": step}):
+            self.run_cli("--github", "--summary-md", md)
+            self.run_cli("--summary-md", md)                            # without --github: not the step summary
+        self.assertTrue(os.path.exists(md))
+        self.assertFalse(os.path.exists(step))
+
+    def test_run_name_in_the_title(self):
+        md = os.path.join(self.tmp, "s.md")
+        self.run_cli("--summary-md", md, "--run-name", "default")
+        with open(md) as f:
+            self.assertTrue(f.read().startswith("### fvlint: default (snap_counters)"))
 
 
 class ToolProblems(CliCase):
@@ -255,12 +396,70 @@ class Flow(CliCase):
         self.assertEqual(res["counter_overflow:mod_q"]["status"], "WAIVED")
         self.assertEqual(res["counter_overflow:mod_q"]["waiver"], "waiver file: counter_overflow:mod_q (reviewed)")
         self.assertEqual(res["counter_overflow:free_q"]["status"], "INFO")       # preset: never proved
+        self.assertEqual(res["counter_overflow:free_q"]["reason"], "free_running")
+        self.assertIsNone(res["counter_overflow:mod_q"]["reason"])
         self.assertIn("free-running", res["counter_overflow:free_q"]["detail"])
         proved = sorted(c.id for c in self.Engine.last.proved)
         self.assertEqual(len(proved), 5)
         self.assertNotIn("counter_overflow:mod_q", proved)
         self.assertNotIn("counter_overflow:free_q", proved)
         self.assertIn("counter_overflow:mod_q", out)                    # -v shows waived checks
+
+    def test_horizon(self):
+        # Three counters of the snapshot can't wrap in fewer than 16 cycles.
+        bounded = ["counter_overflow:mod_q", "counter_overflow:rel_q", "counter_overflow:u_sub.q"]
+        for horizon, info in (("16", bounded), ("2^4", bounded), ("17", []), ("0", [])):
+            with self.subTest(horizon=horizon):
+                self.run_cli("--horizon", horizon)
+                res = {r["id"]: r for r in self.results()["results"]}
+                self.assertEqual(sorted(i for i in bounded if res[i]["status"] == "INFO"), info)
+                self.assertEqual(sorted(i for i in bounded if res[i]["reason"] == "horizon"), info)
+                for i in info:
+                    self.assertEqual(res[i]["detail"], "can't wrap in fewer than 16 cycles, beyond the --horizon "
+                                                       "of 16; not checked")
+                    self.assertNotIn(i, [c.id for c in self.Engine.last.proved])
+        self.run_cli()                                                   # default: 2^60
+        self.assertEqual(len(self.Engine.last.proved), 6)
+        self.assertEqual(self.results()["meta"]["horizon"], 1 << 60)
+
+    def test_unknown_counters_say_how_far_a_wrap_is(self):
+        self.Engine.status = UNKNOWN
+        self.run_cli()
+        res = {r["id"]: r["detail"] for r in self.results()["results"]}
+        self.assertEqual(res["counter_overflow:mod_q"], "fake; a wrap needs at least 16 cycles from reset, so "
+                                                        "`--horizon 16` or less would accept it")
+        self.assertEqual(res["counter_underflow:down_q"], "fake")       # no bound known
+
+    def test_horizon_suggestion_can_be_pasted_back(self):
+        for n in (16, 999_999, (1 << 20) - 1, 1 << 20, (1 << 32) + 1, 1 << 64):
+            with self.subTest(n=n):
+                c = Check("counter_overflow", "q", "", "", min_cycles=n)
+                r = Result(check=c, status=UNKNOWN, detail="d")
+                cli.explain_unknown([r], 1 << 60)
+                value = r.detail.split("`--horizon ")[1].split("`")[0]
+                horizon = cli.cycles_arg(value)
+                self.assertLessEqual(horizon, n)                         # it accepts this counter
+                self.assertGreater(2 * horizon, n)                       # and is not much below
+                c.preset = None
+                cli.apply_horizon([c], horizon)
+                self.assertEqual(c.preset, "INFO")
+        self.assertEqual(cli.horizon_value((1 << 20) - 1), "1048575")
+        self.assertEqual(cli.horizon_value((1 << 32) + 1), "2^32")
+
+    def test_horizon_value(self):
+        for n, want in ((16, "16"), ((1 << 20) - 1, "1048575"), (1 << 20, "2^20"), ((1 << 33) + 5, "2^33")):
+            self.assertEqual(cli.horizon_value(n), want)
+            self.assertLessEqual(cli.cycles_arg(want), n)                # pasted back: accepts the counter
+
+    def test_cycles_arg(self):
+        self.assertEqual(cli.cycles_arg("1000"), 1000)
+        self.assertEqual(cli.cycles_arg("1_000"), 1000)
+        self.assertEqual(cli.cycles_arg("2^48"), 1 << 48)
+        self.assertEqual(cli.cycles_arg("2 ** 10"), 1024)
+        for bad in ("-5", "lots", "2^x", ""):
+            with self.subTest(bad=bad), self.assertRaises(cli.argparse.ArgumentTypeError):
+                cli.cycles_arg(bad)
+        self.assertEqual(cli.build_parser().parse_args(["--top", "t"]).horizon, 1 << 60)
 
     def test_check_selection(self):
         self.run_cli("--checks", "counter_underflow, ")

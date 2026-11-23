@@ -138,8 +138,13 @@ class TempDirCase(unittest.TestCase):
 
     def setUp(self):
         super().setUp()
-        self.tmp = tempfile.mkdtemp(prefix="fvlint_unit_")
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="fvlint_unit_"))   # macOS: /var is a link to /private/var
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        # On a GitHub runner these point at the checkout and the job's summary:
+        # tests set them when they need them, and must not write to the real one.
+        for key in ("GITHUB_WORKSPACE", "GITHUB_STEP_SUMMARY"):
+            if key in os.environ:
+                self.addCleanup(os.environ.__setitem__, key, os.environ.pop(key))
 
     def write(self, rel: str, text: str) -> str:
         p = os.path.join(self.tmp, rel)

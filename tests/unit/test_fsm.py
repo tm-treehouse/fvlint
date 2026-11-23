@@ -8,8 +8,8 @@ import json
 import random
 import unittest
 
-from fvlint.checks import FAIL, INFO, WARN
-from fvlint.fsm import _bits_lsb, _Eval, _sccs, analyse_fsms, read_fsm_cells
+from fvlint.checks import FAIL, INFO, WARN, Check
+from fvlint.fsm import _bits_lsb, _Eval, _sccs, analyse_fsms, dead_in_unreachable_states, read_fsm_cells
 from fvlint.resets import discover
 
 from .support import NB, TempDirCase, load_snapshot, snapshot
@@ -381,6 +381,74 @@ class Analysis(TempDirCase):
         nl, p = self.build(["00", "01", "10"], [(0, "", 1), (1, "", 3), (3, "", 0)])
         self.assertEqual([c.id for c in analyse_fsms(nl, p)[0]],
                          ["fsm_unreachable:st=2'b10", "fsm_trap:st={2'b01}", "fsm_summary:st"])
+
+
+class DeadStates(TempDirCase):
+    """Checks that apply only in an unreachable state (PicoRV32's LD_RS2 with
+    the dual-port register file) are dead: INFO, pointing at the root finding."""
+
+    def setUp(self):
+        super().setUp()
+        b = NB()
+        clk = b.input("clk")[0]
+        arst = b.input("arst")[0]
+        self.st = st = b.net("st", b.new(2))
+        b.ff(b.input("nxt", 2), clk, q=st, name="st_ff", arst=arst)
+        k = lambda v, w=2: [("1" if (v >> i) & 1 else "0") for i in range(w)]   # noqa: E731
+        self.eq3 = b.op("$eq", w=1, A=st, B=k(3))[0]                    # st == 2'b11: never reached
+        self.eq1 = b.op("$eq", w=1, A=k(1), B=st)[0]                    # constant first, reachable state
+        self.ne3 = b.op("$ne", w=1, A=st + ["0", "0"], B=k(3, 4))[0]    # zero-extended state, st != 3
+        self.eq9 = b.op("$eq", w=1, A=st + ["0", "0"], B=k(9, 4))[0]    # a value st can't hold
+        self.other = b.op("$eq", w=1, A=b.input("x", 2), B=k(3))[0]     # not the state register
+        self.eqx3 = b.op("$eqx", w=1, A=st, B=k(3))[0]
+        self.nex3 = b.op("$nex", w=1, A=st, B=k(3))[0]
+        self.eqsig = b.op("$eq", w=1, A=st, B=b.input("y", 2))[0]       # compared with a signal
+        self.eq4 = b.op("$eq", w=1, A=st + ["0"], B=k(4, 3))[0]          # just too wide for st
+        self.nl = b.build()
+        p = self.write_json("fsm.json", {"modules": {"t": {
+            "ports": {}, "netnames": {"st": {"bits": st}},
+            "cells": {"$fsm": fsm_cell(["00", "01"], [(0, "", 1), (1, "", 0)], 0, arst=[arst])}}}})
+        self.fsms = {}
+        self.fsm_checks, _ = analyse_fsms(self.nl, p, reach_out=self.fsms)
+
+    def check(self, *conds):
+        return Check(kind="parallel_case", target="y", src="f.v:9", desc="", conds=list(conds))
+
+    def test_reachable_states_are_recorded(self):
+        self.assertEqual(self.fsms, {tuple(self.st): ("st", frozenset({"00", "01"}))})
+        self.assertIn("fsm_unreachable:st=2'b11", [c.id for c in self.fsm_checks])
+
+    def test_dead_checks(self):
+        dead = [self.check((self.eq3, 1)), self.check((5, 1), (self.ne3, 0)), self.check((self.eq9, 1))]
+        live = [self.check((self.eq1, 1)), self.check((self.eq3, 0)), self.check((self.ne3, 1)),
+                self.check((self.other, 1)), self.check()]
+        waived = self.check((self.eq3, 1))
+        waived.preset, waived.detail = INFO, "free-running"
+        self.assertEqual(dead_in_unreachable_states(self.nl, dead + live + [waived], self.fsms), 3)
+        self.assertEqual([(c.preset, c.reason) for c in dead], [(INFO, "dead_state")] * 3)
+        self.assertEqual(dead[0].detail, "dead logic: applies only in state st=2'b11, which is unreachable "
+                                         "(see fsm_unreachable:st=2'b11); not checked")
+        self.assertEqual(dead[1].detail, dead[0].detail)
+        self.assertEqual(dead[2].detail, "dead logic: applies only when st equals a value wider than the "
+                                         "register; not checked")
+        self.assertEqual([(c.preset, c.reason) for c in live], [(None, None)] * len(live))
+        self.assertEqual((waived.detail, waived.reason), ("free-running", None))   # a preset is left alone
+
+    def test_more_compare_shapes(self):
+        dead = [self.check((self.eqx3, 1)), self.check((self.nex3, 0)), self.check((self.eq4, 1))]
+        live = [self.check((self.eqsig, 1)), self.check((self.eqx3, 0)), self.check((self.nex3, 1))]
+        self.assertEqual(dead_in_unreachable_states(self.nl, dead + live, self.fsms), 3)
+        self.assertEqual([c.preset for c in live], [None] * 3)
+        self.assertIn("wider than the register", dead[2].detail)
+
+    def test_counted_once(self):
+        c = self.check((self.eq3, 1), (self.eqx3, 1))
+        self.assertEqual(dead_in_unreachable_states(self.nl, [c], self.fsms), 1)
+
+    def test_without_fsms(self):
+        c = self.check((self.eq3, 1))
+        self.assertEqual(dead_in_unreachable_states(self.nl, [c], {}), 0)
+        self.assertIsNone(c.preset)
 
 
 class RealNetlists(unittest.TestCase):

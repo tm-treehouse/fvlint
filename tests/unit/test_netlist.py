@@ -80,8 +80,24 @@ class SourceLocations(TempDirCase):
     def test_display_path(self):
         self.chdir(self.tmp)
         self.assertEqual(display_path(os.path.join(self.tmp, "a", "b.v")), os.path.join("a", "b.v"))
-        outside = os.path.dirname(self.tmp)
-        self.assertEqual(display_path(outside), outside)                     # above the CWD: absolute
+        up = os.path.join(os.path.dirname(self.tmp), "x.v")
+        self.assertEqual(display_path(up), os.path.join("..", "x.v"))        # just above the CWD: relative
+        far = os.path.join(os.path.sep, "fvlint_far", "a", "b.v")
+        os.makedirs(os.path.join(self.tmp, "d1", "d2", "d3"))
+        self.chdir(os.path.join(self.tmp, "d1", "d2", "d3"))
+        self.assertEqual(display_path(far), far)                             # far away: absolute
+        self.assertEqual(display_path(os.path.join(self.tmp, "d1", "y.v")), os.path.join("..", "..", "y.v"))
+        self.assertEqual(display_path(os.path.join(self.tmp, "z.v")), os.path.abspath(os.path.join(self.tmp, "z.v")))
+
+    def test_display_path_through_a_symlink(self):
+        # The CWD reached through a link (macOS: /var -> /private/var): still relative.
+        real = os.path.join(self.tmp, "real")
+        os.makedirs(os.path.join(real, "src"))
+        link = os.path.join(self.tmp, "link")
+        os.symlink(real, link)
+        self.chdir(link)
+        self.assertEqual(display_path(os.path.join(real, "src", "a.v")), os.path.join("src", "a.v"))
+        self.assertEqual(display_path(os.path.join(link, "src", "a.v")), os.path.join("src", "a.v"))
 
 
 class Indexing(TempDirCase):
@@ -234,6 +250,29 @@ class Naming(unittest.TestCase):
         self.assertIsNone(self.nl.net_attr([12345], "src"))
         self.assertEqual(self.nl.net_src(self.v), "d.v:4")
 
+    def test_instance_of_a_flattened_cell(self):
+        b = NB()
+        cells = {
+            "$procmux$3": ({}, ""),                                              # top module
+            "top_reg": ({}, ""),
+            "$flatten\\u_a.$procmux$8": ({}, "u_a"),                           # as Yosys 0.71 names them
+            "$flatten\\p0.\\u_a.$procmux$2": ({}, "p0.u_a"),                    # nested: escaped again
+            "$flatten\\u_a.$auto$proc_rom.cc:155$3": ({}, "u_a"),              # dots in the cell's own name
+            "$flatten\\gen[0].u$1.$procmux$4": ({}, "gen[0].u$1"),
+            "$flatten\\u_a.odd": ({}, "u_a"),
+            "u_b.named": ({}, "u_b"),                                            # public, no hdlname
+            "p2.u_d.named": ({}, "p2.u_d"),
+            "u_c.named": ({"hdlname": "p1 u_c named"}, "p1.u_c"),
+            "x": ({"hdlname": "x"}, ""),
+            "$y": ({"hdlname": " "}, ""),
+        }
+        for name, (attrs, _) in cells.items():
+            b.cell(name, "$and", {"A": b.new(), "B": b.new(), "Y": b.new()}, attrs=attrs)
+        nl = b.build()
+        for name, (_, want) in cells.items():
+            with self.subTest(name=name):
+                self.assertEqual(nl.instance(name), want)
+
 
 class Structure(unittest.TestCase):
     def test_whole_driver(self):
@@ -261,6 +300,29 @@ class Structure(unittest.TestCase):
         nl = b.build()
         self.assertEqual(nl.compare_cells(q, {"$eq", "$lt"}), {"eq", "lt"})
         self.assertEqual(nl.compare_cells(q[1:], {"$eq", "$lt"}), {"eq"})
+
+    def test_equality(self):
+        b = NB()
+        st, x = b.input("st", 2), b.input("x", 2)
+        cases = [
+            (b.op("$eq", w=1, A=st, B=const(1, 2)), 1, (st, 1)),
+            (b.op("$eqx", w=1, A=const(3, 2), B=st), 1, (st, 3)),                   # constant first
+            (b.op("$ne", w=1, A=st + ["0", "0"], B=const(9, 4)), 0, (st, 9)),      # zero-extended
+            (b.op("$nex", w=1, A=st, B=const(2, 2)), 0, (st, 2)),
+            (b.op("$eq", w=1, A=st, B=const(1, 2)), 0, None),                      # st != 1: no value
+            (b.op("$ne", w=1, A=st, B=const(1, 2)), 1, None),
+            (b.op("$eq", w=1, A=st, B=x), 1, None),                                # no constant
+            (b.op("$eq", w=1, A=const(1, 2), B=const(1, 2)), 1, None),             # no signal
+            (b.op("$eq", w=1, A=[st[0], "1", st[1]], B=const(1, 3)), 1, None),     # not one signal
+            (b.op("$lt", w=1, A=st, B=const(1, 2)), 1, None),
+            (b.op("$eq", w=2, A=st, B=const(1, 2))[1:], 1, None),                  # not the result bit
+            (x[:1], 1, None),                                                      # no driver
+        ]
+        nl = b.build()
+        for i, (y, value, want) in enumerate(cases):
+            with self.subTest(i=i):
+                got = nl.equality(y[0], value)
+                self.assertEqual(got, None if want is None else (list(want[0]), want[1]))
 
     def test_depends_on_counts_register_stages(self):
         b = NB()

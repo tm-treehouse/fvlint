@@ -48,8 +48,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with: {python-version: "3.12"}
-      # Pinned to a build from just after the Yosys 0.71 release (2026-11-12),
-      # the version fvlint is tested with; move it together with TESTED_YOSYS.
+      # Pinned to the build of 2026-11-14: Yosys 0.71+34, a development build
+      # from just after the 0.71 release (2026-11-12), which fvlint is tested
+      # with (its netlists differ slightly from the 0.71 release, so the snapshot
+      # check below only warns).  Move it together with TESTED_YOSYS and the
+      # default in action.yml.
       - uses: YosysHQ/setup-oss-cad-suite@v4
         with:
           version: "2026-11-14"
@@ -61,3 +64,46 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with: {name: regress-oss-cad-suite, path: "regress.xml\nregress_out/summary.json"}
+
+  # The GitHub Action of this repository (action.yml), run from the checkout
+  # on a small project file: one configuration is clean, one has a known FAIL.
+  action:
+    runs-on: ubuntu-latest
+    needs: unit
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./
+        id: all
+        continue-on-error: true            # the action exits with fvlint's status: 1 (findings) here
+        with:
+          config: tests/regress/action_smoke.toml
+          output: action_out
+          artifact-name: action-smoke
+      - uses: ./
+        id: clean
+        with:
+          config: tests/regress/action_smoke.toml
+          configs: clean
+          output: action_out_clean
+          upload: "false"
+      - name: Check the action's outputs and results
+        env:
+          RC_ALL: ${{ steps.all.outputs.exit-code }}
+          OUTCOME_ALL: ${{ steps.all.outcome }}
+          RC_CLEAN: ${{ steps.clean.outputs.exit-code }}
+        run: |
+          set -eu
+          [ "$RC_ALL" = 1 ] || { echo "::error::exit-code with a FAIL: '$RC_ALL', expected 1"; exit 1; }
+          [ "$OUTCOME_ALL" = failure ] || { echo "::error::the step with a FAIL ended '$OUTCOME_ALL'"; exit 1; }
+          [ "$RC_CLEAN" = 0 ] || { echo "::error::exit-code of the clean run: '$RC_CLEAN', expected 0"; exit 1; }
+          python3 - <<'PY'
+          import json
+          def statuses(path):
+              with open(path) as f:
+                  return {r["id"]: r["status"] for r in json.load(f)["results"]}
+          assert statuses("action_out/clean/results.json") == {"counter_overflow:q": "PROVEN"}
+          assert statuses("action_out/bug/results.json") == {"counter_overflow:q": "FAIL"}
+          assert statuses("action_out_clean/clean/results.json") == {"counter_overflow:q": "PROVEN"}
+          PY
+          [ ! -e action_out_clean/bug ] || { echo "::error::configs: clean also ran bug"; exit 1; }

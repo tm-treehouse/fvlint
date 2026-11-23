@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import tempfile
 import unittest
 
 from . import mutation
@@ -113,6 +114,42 @@ class Baseline(TempDirCase):
         with open(path) as f:
             for e in json.load(f)["accepted"]:
                 self.assertRegex(e["reason"], r"^(equivalent|accepted): ")
+
+
+class Workers(TempDirCase):
+    # A suite that writes a file to a relative path and fails if it finds one
+    # there already, and that checks where temporary files go.
+    PROBE = """\
+import os
+import tempfile
+import unittest
+
+
+class Probe(unittest.TestCase):
+    def test_relative_files_are_private(self):
+        self.assertFalse(os.path.exists("probe.txt"), os.getcwd())
+        with open("probe.txt", "w") as f:
+            f.write("x")
+        self.assertEqual(os.path.realpath(tempfile.gettempdir()), os.path.realpath(os.getcwd()))
+"""
+
+    def worker(self, name):
+        d = os.path.join(self.tmp, name)
+        os.makedirs(os.path.join(d, "src", "fvlint"))
+        tests = os.path.join(self.tmp, f"{name}_tests")
+        self.write(f"{name}_tests/unit/__init__.py", "")
+        self.write(f"{name}_tests/unit/test_probe.py", self.PROBE)
+        os.symlink(tests, os.path.join(d, "tests"))                 # as main() links the checkout's tests
+        return d
+
+    def test_runs_do_not_share_a_working_directory(self):
+        # Two workers, and one worker twice: every run starts without the
+        # others' relative files (parallel workers once shared the checkout).
+        ws = [self.worker("w0"), self.worker("w1")]
+        for w in ws + ws[:1]:
+            run = tempfile.mkdtemp(dir=w, prefix="tmp")
+            self.assertEqual(mutation._run_tests(w, 60, run)[0], "survived", w)
+        self.assertFalse(os.path.exists(os.path.join(mutation.ROOT, "probe.txt")))
 
 
 if __name__ == "__main__":

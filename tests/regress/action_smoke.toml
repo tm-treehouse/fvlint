@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 The fvlint Authors
+# SPDX-License-Identifier: ISC
+#
+# Project file for the CI job that runs the GitHub Action from the checkout
+# (.github/workflows/ci.yml, job `action`): one clean configuration and one
+# with a known FAIL.  Also runs locally:
+#   fvlint --config tests/regress/action_smoke.toml -o OUT          # exit status 1
+#   fvlint --config tests/regress/action_smoke.toml clean -o OUT    # exit status 0
+out = "fvlint_out"
+
+[defaults]
+jobs = 2
+
+[config.clean]
+top = "cnt_mod100"
+files = ["../fixtures/counters.sv"]
+
+[config.bug]
+top = "cnt_badlimit"
+files = ["../fixtures/counters.sv"]

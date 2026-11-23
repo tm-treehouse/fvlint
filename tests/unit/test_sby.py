@@ -361,6 +361,22 @@ class LogParsing(TempDirCase):
         os.remove(os.path.join(d, "run", "FAIL"))
         self.assertEqual(set(parse_job(d, self.tmp, 2, PDR, "prove", names).props), set(names[:5]))
 
+    def test_cut_short_property_list_of_one_trace(self):
+        # SymbiYosys also lists at most five properties per trace ("  and 2
+        # further assertions"), without the "further traces" line.
+        names = [f"fvl_t{i}" for i in range(7)]
+        failed = [f"failed assertion top._witness_.check_flatten_{n}__x at x.v:1.2-1.3 step 4" for n in names]
+        log = line("summary: counterexample trace: run/engine_0/trace_0.vcd")
+        log += "".join(line(f"summary:   {a}") for a in failed[:5])
+        log += line("summary:   and 2 further assertions") + line("DONE (FAIL, rc=2)")
+        d = self.run_dir(log, names)
+        with open(os.path.join(d, "run", "FAIL"), "w") as f:
+            f.write("counterexample trace: engine_0/trace_0.vcd\n" + "".join(f"  {a}\n" for a in failed))
+        r = parse_job(d, self.tmp, 2, PDR, "prove", names)
+        self.assertEqual(sorted(r.props), names)
+        self.assertEqual({(p.status, p.step) for p in r.props.values()}, {("fail", 4)})
+        self.assertTrue(all(p.trace for p in r.props.values()))
+
     def test_cut_short_kinduction_summary(self):
         # k-induction: the steps of traces past the fifth come from the status file too.
         log = eng("Checking assertions in step 9..")

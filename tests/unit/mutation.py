@@ -214,15 +214,20 @@ def mutate(text: str, index: int) -> str:
     raise IndexError(index)
 
 
-def _run_tests(src_root: str, timeout: float, tmpdir: str) -> tuple[str, float]:
-    """Run the unit suite against src_root.  Temporary files go to tmpdir,
-    which the caller removes, so a suite killed by the timeout leaks nothing."""
-    env = dict(os.environ, FVLINT_SRC=src_root, FVLINT_MUTATION_RUN="1", PYTHONDONTWRITEBYTECODE="1",
-               TMPDIR=tmpdir)
+def _run_tests(worker: str, timeout: float, rundir: str) -> tuple[str, float]:
+    """Run the unit suite of a worker directory (its own copy of src/ and a
+    `tests` link) against that copy.  The suite runs in `rundir`, a fresh
+    directory the caller removes: temporary files and anything a test writes
+    to a relative path stay there, so parallel workers, and successive runs
+    of one worker, never see each other's files, and a suite killed by the
+    timeout leaks nothing."""
+    env = dict(os.environ, FVLINT_SRC=os.path.join(worker, "src"), FVLINT_MUTATION_RUN="1",
+               PYTHONDONTWRITEBYTECODE="1", TMPDIR=rundir)
     t0 = time.time()
     try:
-        p = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests/unit", "-t", ".", "-f", "-q"],
-                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", os.path.join(worker, "tests", "unit"),
+                            "-t", worker, "-f", "-q"],
+                           cwd=rundir, env=env, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return "timeout", time.time() - t0
     return ("survived" if p.returncode == 0 else "killed"), time.time() - t0
@@ -329,7 +334,7 @@ def main(argv=None) -> int:
     def run_suite(d, timeout):
         t = tempfile.mkdtemp(dir=d, prefix="tmp")
         try:
-            return _run_tests(os.path.join(d, "src"), timeout, t)
+            return _run_tests(d, timeout, t)
         finally:
             shutil.rmtree(t, ignore_errors=True)
 

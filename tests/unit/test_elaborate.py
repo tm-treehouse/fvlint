@@ -10,7 +10,7 @@ import os
 import unittest
 
 from fvlint.elaborate import (HDL_EXT, MAX_FSM_RETRIES, Sources, _fsm_commands, _slang_arg, _stage, elaborate,
-                              failed_fsm, read_commands)
+                              elaborate_without_full_case, failed_fsm, read_commands, without_full_case)
 from fvlint.tools import ToolError
 
 from .support import TempDirCase
@@ -205,6 +205,68 @@ class Staging(TempDirCase):
     def test_hdl_extensions(self):
         self.assertTrue({".v", ".sv", ".svh", ".vh"} <= HDL_EXT)
         self.assertNotIn(".txt", HDL_EXT)
+
+
+class WithoutFullCase(TempDirCase):
+    def test_every_spelling_is_neutralised_in_place(self):
+        src = ("(* parallel_case, full_case *) case (s)\n"
+               "case (s) // synopsys full_case parallel_case\n"
+               "unique case (s)\n"
+               "unique  casez (s)\n"
+               "priority casex (s)\n"
+               "unique0 case (s) unique if (a) priority_case_q <= full_case_seen;\n")
+        got = without_full_case(src)
+        self.assertEqual(got, "(* parallel_case, fvlint_fc *) case (s)\n"
+                              "case (s) // synopsys fvlint_fc parallel_case\n"
+                              "unique0 case (s)\n"
+                              "unique0  casez (s)\n"
+                              "         casex (s)\n"
+                              "unique0 case (s) unique if (a) priority_case_q <= full_case_seen;\n")
+        self.assertEqual(got.count("\n"), src.count("\n"))                 # lines stay where they were
+        self.assertEqual(without_full_case("full_case"), "fvlint_fc")
+
+    def test_staged_with_neighbours_and_transformed(self):
+        a = self.write("ip/rtl/a.sv", "`include \"defs.vh\"\n(* full_case *) case\n")
+        self.write("ip/rtl/defs.vh", "unique case\n")                    # next to a.sv, not in an -I dir
+        self.write("ip/rtl/sub/deep.vh", "x")                            # not copied: not next to a source
+        self.write("ip/rtl/b.bin", b"\xff".decode("latin-1"))           # not HDL
+        edir = os.path.join(self.tmp, "nofc")
+        staged, _, (root, orig) = _stage(Sources(files=[a]), None, edir, transform=without_full_case,
+                                         subdir="s")
+        self.assertEqual(root, os.path.join(edir, "s"))
+        self.assertEqual(sorted(os.listdir(os.path.join(root))), ["a.sv", "defs.vh"])
+        with open(staged.files[0]) as f:
+            self.assertEqual(f.read(), "`include \"defs.vh\"\n(* fvlint_fc *) case\n")
+        with open(os.path.join(root, "defs.vh")) as f:
+            self.assertEqual(f.read(), "unique0 case\n")
+
+    def test_bytes_that_are_not_utf8_survive(self):
+        a = os.path.join(self.tmp, "a.v")
+        with open(a, "wb") as f:
+            f.write(b"// caf\xe9\nfull_case\n")
+        staged, _, _ = _stage(Sources(files=[a]), None, os.path.join(self.tmp, "e"), transform=without_full_case)
+        with open(staged.files[0], "rb") as f:
+            self.assertEqual(f.read(), b"// caf\xe9\nfvlint_fc\n")
+
+    def test_elaboration(self):
+        a = self.write("rtl/a.sv", "module top; endmodule\n")
+        out = os.path.join(self.tmp, "out")
+        tools = FakeTools(outputs=("nofc.json",))
+        json_path, edir, (root, orig) = elaborate_without_full_case(Sources(files=[a]), "top", "yosys", tools, out)
+        self.assertEqual((json_path, edir), (os.path.join(out, "elab_nofc", "nofc.json"), os.path.join(out,
+                                                                                                    "elab_nofc")))
+        (name, script, cwd, allow_fail), = tools.runs
+        self.assertEqual((name, cwd, allow_fail), ("nofc", edir, True))
+        self.assertIn(f"read_verilog -sv {os.path.join(root, 'a.sv')}\n", script)
+        self.assertNotIn("attrmap", script)
+        self.assertIn("proc -noopt\nflatten\nmemory_collect\nopt_clean\nwrite_json nofc.json\n", script)
+        # With the WebAssembly build: paths relative to the Yosys directory.
+        tools = FakeTools(is_yowasp=True, outputs=("nofc.json",))
+        elaborate_without_full_case(Sources(files=[a]), "top", "yosys", tools, out)
+        self.assertIn("read_verilog -sv src/a.sv\n", tools.runs[0][1])
+        # Yosys failed: None, and no stale netlist is used.
+        tools = FakeTools(outputs=(), rc=1)
+        self.assertIsNone(elaborate_without_full_case(Sources(files=[a]), "top", "yosys", tools, out))
 
 
 class Elaboration(TempDirCase):
