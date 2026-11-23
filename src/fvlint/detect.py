@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 
 from .checks import INFO, Check, Lemma, src_key
 from .fsm import _Eval
@@ -521,16 +522,25 @@ def _statement_name(names: list, src: str) -> str:
     return ",".join(names[:3]) + f",+{len(names) - 3}"
 
 
-def detect_case(nl: Netlist):
-    """parallel_case and full_case checks, one per case statement.
+@dataclass
+class _Part:
+    """One $pmux of a case statement: Yosys makes one per signal assigned."""
+    cell: str
+    conds: list                   # path conditions from forward()
+    signal: str | None            # the signal it assigns, None if it has no name
 
-    Yosys turns a case statement into one $pmux per signal it assigns, so
-    the property is proven for each of them; a statement with several gets
-    one part check per signal, all with the statement's id in `group` (the
-    report merges them).  A statement is named after the signals it assigns;
-    statements that would share a name are told apart by the FSM state they
-    sit in (`@cpu_state=8'b00010000`), then by number in source order."""
-    stmts = {}                                           # src attribute -> [(cell, conds, name)]
+
+@dataclass
+class _Statement:
+    target: str                   # the check id's target
+    src: str
+    parts: list                   # [_Part]
+
+
+def _case_statements(nl: Netlist) -> list:
+    """The parallel_case statements of the netlist, unnamed: their $pmux
+    cells grouped by source location."""
+    stmts = {}                                           # src attribute -> [_Part]
     for cell, c in nl.cells.items():
         if c["type"] != "$pmux":
             continue
@@ -546,65 +556,85 @@ def detect_case(nl: Netlist):
             continue   # the case result is never used (constant-disabled logic)
         src = nl.cell_src(cell)
         name = _dest_name(nl, dest, y, src)
-        stmts.setdefault(attrs.get("src") or cell, []).append((cell, conds, None if name == os.path.basename(src)
-                                                               else name))
+        stmts.setdefault(attrs.get("src") or cell, []).append(
+            _Part(cell, conds, None if name == os.path.basename(src) else name))
+    return [_Statement("", nl.cell_src(parts[0].cell), parts) for parts in stmts.values()]
 
-    named = []                                           # [statement target, src, parts]
-    for key, parts in stmts.items():
-        src = nl.cell_src(parts[0][0])
-        named.append([_statement_name(sorted({p[2] for p in parts if p[2]}), src), src, parts])
+
+def _name_statements(nl: Netlist, stmts: list):
+    """Set each statement's target: the signals it assigns; statements that
+    would share a name are told apart by the FSM state they sit in, then by
+    number in source order."""
+    for st in stmts:
+        st.target = _statement_name(sorted({p.signal for p in st.parts if p.signal}), st.src)
     by_name = {}
-    for st in named:
-        by_name.setdefault(st[0], []).append(st)
+    for st in stmts:
+        by_name.setdefault(st.target, []).append(st)
     for group in by_name.values():
         if len(group) < 2:
             continue
         for st in group:
             # The parts sit in the same place in the source; take the guard
             # most of them see (ties: the first by name).
-            guards = [g for g in (_guard(nl, p[1]) for p in st[2]) if g]
+            guards = [g for g in (_guard(nl, p.conds) for p in st.parts) if g]
             if guards:
-                st[0] += min(set(guards), key=lambda g: (-guards.count(g), g))
+                st.target += min(set(guards), key=lambda g: (-guards.count(g), g))
     by_name = {}
-    for st in named:
-        by_name.setdefault(st[0], []).append(st)
+    for st in stmts:
+        by_name.setdefault(st.target, []).append(st)
     for group in by_name.values():
-        for n, st in enumerate(sorted(group, key=lambda st: src_key(st[1]))):
+        for n, st in enumerate(sorted(group, key=lambda st: src_key(st.src))):
             if n:
-                st[0] = f"{st[0]}#{n}"
+                st.target = f"{st.target}#{n}"
 
+
+def _statement_checks(nl: Netlist, st: _Statement, kind: str) -> list:
+    """The part checks of one statement: one per $pmux, grouped under the
+    statement's id when there are several."""
+    mine = []
+    for part in st.parts:
+        sel = nl.conn(part.cell, "S")
+        if kind == "parallel_case":
+            chk = Check(kind=kind, target=st.target, src=st.src,
+                        desc="at most one item of a unique/parallel_case statement matches",
+                        checker="fvl_onehot0", params={"W": len(sel)}, ports={"s": sel}, conds=part.conds)
+        else:
+            # full_case from the source (renamed at elaboration; proc_rmdead
+            # also marks every case that has a default item).  Yosys
+            # implements it as an 'x default: when no item that assigns the
+            # signal matches, the synthesized value is arbitrary, while
+            # simulation keeps the value the code assigned before the case.
+            a = nl.conn(part.cell, "A")
+            attrs = nl.cells[part.cell].get("attributes", {})
+            if not (attr_true(attrs.get("fvlint_full_case")) and a and all(b == "x" for b in a)):
+                continue
+            chk = Check(kind=kind, target=st.target, src=st.src,
+                        desc="an item of a full_case/unique case statement (no default) assigns the signal",
+                        checker="fvl_nonzero", params={"W": len(sel)}, ports={"s": sel}, conds=part.conds)
+        chk.part = part.signal or part.cell
+        mine.append(chk)
+    if len(mine) > 1:
+        for i, chk in enumerate(mine):
+            chk.group = chk.id
+            chk.target = f"{st.target}~{i}"
+    return mine
+
+
+def detect_case(nl: Netlist):
+    """parallel_case and full_case checks, one per case statement.
+
+    Yosys turns a case statement into one $pmux per signal it assigns, so
+    the property is proven for each of them; a statement with several gets
+    one part check per signal, all with the statement's id in `group` (the
+    report merges them).  A statement is named after the signals it assigns;
+    statements that would share a name are told apart by the FSM state they
+    sit in (`@cpu_state=8'b00010000`), then by number in source order."""
+    stmts = _case_statements(nl)
+    _name_statements(nl, stmts)
     checks = []
-    for target, src, parts in sorted(named, key=lambda st: src_key(st[1])):
+    for st in sorted(stmts, key=lambda st: src_key(st.src)):
         for kind in ("parallel_case", "full_case"):
-            mine = []
-            for cell, conds, name in parts:
-                sel = nl.conn(cell, "S")
-                if kind == "parallel_case":
-                    chk = Check(kind=kind, target=target, src=src,
-                                desc="at most one item of a unique/parallel_case statement matches",
-                                checker="fvl_onehot0", params={"W": len(sel)}, ports={"s": sel}, conds=conds)
-                else:
-                    # full_case from the source (renamed at elaboration; proc_rmdead
-                    # also marks every case that has a default item).  Yosys
-                    # implements it as an 'x default: when no item that assigns
-                    # the signal matches, the synthesized value is arbitrary,
-                    # while simulation keeps the value the code assigned before
-                    # the case.
-                    a = nl.conn(cell, "A")
-                    attrs = nl.cells[cell].get("attributes", {})
-                    if not (attr_true(attrs.get("fvlint_full_case")) and a and all(b == "x" for b in a)):
-                        continue
-                    chk = Check(kind=kind, target=target, src=src,
-                                desc="an item of a full_case/unique case statement (no default) assigns "
-                                     "the signal",
-                                checker="fvl_nonzero", params={"W": len(sel)}, ports={"s": sel}, conds=conds)
-                chk.part = name or cell
-                mine.append(chk)
-            if len(mine) > 1:
-                for i, chk in enumerate(mine):
-                    chk.group = chk.id
-                    chk.target = f"{target}~{i}"
-            checks += mine
+            checks += _statement_checks(nl, st, kind)
     return checks
 
 
