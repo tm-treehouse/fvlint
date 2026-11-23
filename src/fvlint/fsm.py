@@ -375,24 +375,18 @@ def analyse_fsms(nl: Netlist, fsm_json: str, reset_names: dict | None = None, re
 
 def _state_compare(nl: Netlist, bit, value: int, fsms: dict):
     """(name, code, reachable codes) if the condition `bit == value` means
-    `state == code` for the state register of an FSM in `fsms`: an
-    $eq/$eqx that must hold, or a $ne/$nex that must not.  code is None for
-    a constant the register is too narrow to hold.  Otherwise None."""
-    d = nl.driver.get(bit)
-    if d is None or d.port != "Y" or d.offset != 0:
+    `state == code` for the state register of an FSM in `fsms` (see
+    Netlist.equality, which detect's statement names use too).  code is
+    None for a constant the register is too narrow to hold.  Otherwise
+    None."""
+    hit = nl.equality(bit, value)
+    if hit is None:
         return None
-    t = nl.ctype(d.cell)
-    if not ((t in ("$eq", "$eqx") and value == 1) or (t in ("$ne", "$nex") and value == 0)):
-        return None
-    a, b = nl.conn(d.cell, "A"), nl.conn(d.cell, "B")
-    for x, y in ((a, b), (b, a)):
-        k = const_value(y)
-        if k is None:
-            continue
-        for bits, (sig, reach) in fsms.items():
-            n = len(bits)
-            if list(x[:n]) == list(bits) and all(v == "0" for v in x[n:]):
-                return sig, (format(k, f"0{n}b") if k < (1 << n) else None), reach
+    x, k = hit
+    for bits, (sig, reach) in fsms.items():
+        n = len(bits)
+        if x == list(bits):
+            return sig, (format(k, f"0{n}b") if k < (1 << n) else None), reach
     return None
 
 

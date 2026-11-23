@@ -1055,6 +1055,25 @@ class CaseStatementNames(unittest.TestCase):
         got = sorted((c.src, c.id) for c in detect_case(b.build()))
         self.assertEqual(got, [("c.v:10", "parallel_case:x@st=2'b10"), ("c.v:20", "parallel_case:x@st=2'b01")])
 
+    def test_zero_extended_state_compares_name_the_state(self):
+        # Yosys zero-extends the state register to the constant's width:
+        # {2'b0, st} == 4'd1.  The same reading as the dead-state marking.
+        b = NB()
+        st = b.net("st", b.new(2))
+        sel = b.input("s", 2)
+        g1 = b.op("$eq", w=1, A=st + ["0", "0"], B=const(1, 4))[0]
+        self.statement(b, ["x"], sel, 10, guard=g1)
+        g2 = b.op("$ne", w=1, A=st + ["0", "0"], B=const(2, 4))[0]       # st != 2 must not hold
+        q = b.netnames["x"]["bits"]
+        y = b.pmux(b.input("x_dflt"), [b.input("x_20_0"), b.input("x_20_1")], sel,
+                   attrs={"parallel_case": PAR, "src": "c.v:20.1-20.2"})
+        b.ff(b.mux(y, b.input("x_other"), g2), b.input("clk_x")[0], q=q)
+        g9 = b.op("$eqx", w=1, A=st + ["0", "0"], B=const(9, 4))[0]      # a value st can't hold: no name
+        self.statement(b, ["x"], sel, 30, guard=g9)
+        got = sorted((c.src, c.id) for c in detect_case(b.build()))
+        self.assertEqual(got, [("c.v:10", "parallel_case:x@st=2'b01"), ("c.v:20", "parallel_case:x@st=2'b10"),
+                               ("c.v:30", "parallel_case:x")])
+
     def test_statements_told_apart_by_fsm_state(self):
         # PicoRV32: several states of cpu_state hold a case statement assigning the same signals.
         b = NB()

@@ -327,6 +327,31 @@ class Netlist:
                     out.add(cell)
         return out
 
+    def equality(self, bit, value: int):
+        """(signal bits, constant) if the condition `bit == value` means
+        `signal == constant`: bit is the output of an $eq/$eqx that must
+        hold, or of a $ne/$nex that must not, between a signal and a
+        constant.  Yosys zero-extends the narrower operand (`{2'b0, st} ==
+        4'd9`); the signal is returned without that extension, so the
+        constant may not fit it.  Otherwise None."""
+        d = self.driver.get(bit)
+        if d is None or d.port != "Y" or d.offset != 0:
+            return None
+        t = self.ctype(d.cell)
+        if not ((t in ("$eq", "$eqx") and value == 1) or (t in ("$ne", "$nex") and value == 0)):
+            return None
+        a, b = self.conn(d.cell, "A"), self.conn(d.cell, "B")
+        for x, y in ((a, b), (b, a)):
+            k = const_value(y)
+            if k is None:
+                continue
+            x = list(x)
+            while x and x[-1] == "0":
+                x.pop()
+            if x and not any(is_const(v) for v in x):
+                return x, k
+        return None
+
     def depends_on(self, bits, targets: set, max_seq: int) -> bool:
         """True if any of `bits` depends on any bit in `targets`, crossing at
         most `max_seq` state elements."""

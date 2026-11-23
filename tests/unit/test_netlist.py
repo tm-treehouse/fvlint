@@ -300,6 +300,29 @@ class Structure(unittest.TestCase):
         self.assertEqual(nl.compare_cells(q, {"$eq", "$lt"}), {"eq", "lt"})
         self.assertEqual(nl.compare_cells(q[1:], {"$eq", "$lt"}), {"eq"})
 
+    def test_equality(self):
+        b = NB()
+        st, x = b.input("st", 2), b.input("x", 2)
+        cases = [
+            (b.op("$eq", w=1, A=st, B=const(1, 2)), 1, (st, 1)),
+            (b.op("$eqx", w=1, A=const(3, 2), B=st), 1, (st, 3)),                   # constant first
+            (b.op("$ne", w=1, A=st + ["0", "0"], B=const(9, 4)), 0, (st, 9)),      # zero-extended
+            (b.op("$nex", w=1, A=st, B=const(2, 2)), 0, (st, 2)),
+            (b.op("$eq", w=1, A=st, B=const(1, 2)), 0, None),                      # st != 1: no value
+            (b.op("$ne", w=1, A=st, B=const(1, 2)), 1, None),
+            (b.op("$eq", w=1, A=st, B=x), 1, None),                                # no constant
+            (b.op("$eq", w=1, A=const(1, 2), B=const(1, 2)), 1, None),             # no signal
+            (b.op("$eq", w=1, A=[st[0], "1", st[1]], B=const(1, 3)), 1, None),     # not one signal
+            (b.op("$lt", w=1, A=st, B=const(1, 2)), 1, None),
+            (b.op("$eq", w=2, A=st, B=const(1, 2))[1:], 1, None),                  # not the result bit
+            (x[:1], 1, None),                                                      # no driver
+        ]
+        nl = b.build()
+        for i, (y, value, want) in enumerate(cases):
+            with self.subTest(i=i):
+                got = nl.equality(y[0], value)
+                self.assertEqual(got, None if want is None else (list(want[0]), want[1]))
+
     def test_depends_on_counts_register_stages(self):
         b = NB()
         clk = b.input("clk")

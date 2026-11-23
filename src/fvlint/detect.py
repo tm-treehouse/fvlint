@@ -505,17 +505,17 @@ def detect_counters(nl: Netlist, max_level: int, uninit: str = "zero"):
 # ------------------------------------------------------------ case / pmux
 def _guard(nl: Netlist, conds) -> str | None:
     """The innermost `signal == constant` among path conditions, as
-    `@signal=W'bCODE`: where a case statement sits inside an FSM's case."""
+    `@signal=W'bCODE`: where a case statement sits inside an FSM's case.
+    The same reading of a condition as fsm.dead_in_unreachable_states
+    (Netlist.equality), so a name and a dead state can't disagree."""
     for bit, value in conds:
-        d = nl.driver.get(bit)
-        if d is None or d.port != "Y" or nl.ctype(d.cell) not in ("$eq", "$eqx") or value != 1:
+        hit = nl.equality(bit, value)
+        if hit is None:
             continue
-        a, b = nl.conn(d.cell, "A"), nl.conn(d.cell, "B")
-        for x, y in ((a, b), (b, a)):
-            k = const_value(y)
-            name = nl.visible_name(x) if k is not None else None
-            if name:
-                return f"@{name}={len(x)}'b{format(k, f'0{len(x)}b')}"
+        x, k = hit
+        name = nl.visible_name(x)
+        if name and k < (1 << len(x)):
+            return f"@{name}={len(x)}'b{format(k, f'0{len(x)}b')}"
     return None
 
 
