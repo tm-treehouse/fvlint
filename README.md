@@ -176,7 +176,9 @@ fvlint --config fvlint.toml [NAME...] [options for every configuration]
 * `--summary-md FILE` appends a Markdown summary (the results that aren't
   `PROVEN`, and unused waivers). `--github` prints GitHub Actions
   annotations, so findings show on their source lines in a pull request,
-  and appends the summary to `$GITHUB_STEP_SUMMARY`.
+  and appends the summary to `$GITHUB_STEP_SUMMARY`. GitHub shows at most
+  10 error and 10 warning annotations per step; the job summary has every
+  finding.
 * File lists follow the simulator convention: relative paths in a list given
   with `-f` are relative to the current directory, with `-F` relative to the
   list file. Inside a list, `+incdir+`, `+define+`, `-I`, `-D`, nested
@@ -220,10 +222,11 @@ The keys are the long option names with `_` for `-`: `top`, `files`,
 `recheck_waived`, `engine`, `solver`, `max_level`, `depth`, `timeout`,
 `pdr_timeout`, `horizon`, `checks`, `fail_on`, `jobs`, and `args` for any
 other options. Options on the command line apply to every configuration and
-win over the file. The exit status is the worst one: 2 if a configuration
-couldn't run, else 1 if any has a finding. A configuration's name is its
-output directory, so it may use letters, digits, `_`, `.` and `-`, and
-starts with a letter or digit.
+win over the file, except the ones that can be given several times (`-I`,
+`-D`, `-P`, `--lib`, `-f`, `-F`): those are added to the file's. The exit
+status is the worst one: 2 if a configuration couldn't run, else 1 if any
+has a finding. A configuration's name is its output directory, so it may use
+letters, digits, `_`, `.` and `-`, and starts with a letter or digit.
 
 ### In CI (GitHub Actions)
 
