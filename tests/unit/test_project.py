@@ -246,6 +246,26 @@ class Projects(CliCase):
         self.assertEqual(rc, 0)
         self.assertNotIn("matches no check", err + out)
 
+    def test_configuration_names_are_directory_names(self):
+        # A name is the configuration's output directory under OUT.
+        for name in ("../x", "a/b", ".hidden", "-x", "", "a b", "x\\\\y"):
+            with self.subTest(name=name):
+                key = name.replace("\\", "\\\\")
+                rc, _, err = self.run_project(self.project(f'[config."{key}"]\ntop = "snap_counters"\n'
+                                                           'files = ["../rtl/top.sv"]\n'))
+                self.assertEqual(rc, 2)
+                self.assertIn("a configuration name is its output directory", err)
+                self.assertEqual(self.elab_calls, [])                    # nothing ran
+        rc, _, err = self.run_project(self.project('[config."../x"]\ntop = "t"\n'))
+        self.assertIn('[config."../x"]: a configuration name', err)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "x")))
+        p = self.project(f'out = "{self.out}"\n[config."v1.2_rc-3"]\ntop = "snap_counters"\n'
+                         'files = ["../rtl/top.sv"]\n')
+        self.assertEqual(self.run_project(p)[0], 0)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "v1.2_rc-3", "results.json")))
+        with self.assertRaisesRegex(ConfigError, r'^\[config."a\+b"\]: '):
+            load(self.project('[config.a]\ntop = "t"\n[config."a+b"]\ntop = "t"\n'))
+
     def test_load(self):
         p = self.project(self.TWO.format(out="o"))
         self.assertEqual(sorted(load(p)["config"]), ["counters", "mux"])

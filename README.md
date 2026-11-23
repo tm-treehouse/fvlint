@@ -221,7 +221,9 @@ The keys are the long option names with `_` for `-`: `top`, `files`,
 `pdr_timeout`, `horizon`, `checks`, `fail_on`, `jobs`, and `args` for any
 other options. Options on the command line apply to every configuration and
 win over the file. The exit status is the worst one: 2 if a configuration
-couldn't run, else 1 if any has a finding.
+couldn't run, else 1 if any has a finding. A configuration's name is its
+output directory, so it may use letters, digits, `_`, `.` and `-`, and
+starts with a letter or digit.
 
 ### In CI (GitHub Actions)
 

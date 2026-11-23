@@ -29,7 +29,9 @@ configuration and win over the file.  Example:
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 import tomllib
 
@@ -65,6 +67,8 @@ KEYS = {
     "args": (None, "raw"),
 }
 TOP_KEYS = {"out", "defaults", "config"}
+# A configuration's name is its output directory under OUT: no separators, no `..`.
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 
 class ConfigError(Exception):
@@ -201,7 +205,16 @@ def load(path: str) -> dict:
         raise ConfigError("no configurations: add at least one [config.NAME] table")
     if not isinstance(data.get("defaults", {}), dict):
         raise ConfigError("defaults: expected a table")
+    for name in configs:
+        if not NAME.fullmatch(name):
+            raise ConfigError(f"[config.{_toml_key(name)}]: a configuration name is its output directory: "
+                              "letters, digits, '_', '.' and '-', starting with a letter or digit")
     return data
+
+
+def _toml_key(name: str) -> str:
+    """A table key as it would be written in the file (quoted unless bare)."""
+    return name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else json.dumps(name)
 
 
 def run_config(argv: list) -> int:
