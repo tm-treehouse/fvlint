@@ -69,6 +69,10 @@ class Waivers:
                 return f"fvlint_waive attribute ({check.waive_attr})"
         return None
 
+    def used_lines(self) -> list:
+        """Line numbers of the rules that matched a check."""
+        return sorted(self.rules[i][2] for i in self.used)
+
     def unused(self, kinds=None) -> list:
         """(line number, pattern) of rules that matched no check: stale after a
         design change or a renamed check.  With `kinds` (the check kinds that

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -162,7 +163,7 @@ class Projects(CliCase):
         from fvlint import project
         p = self.project(self.TWO.format(out=self.out))
         for code, want in ((0, 0), (1, 1), ("boom", 2), (None, 2)):
-            def run(argv, code=code):
+            def run(argv, code=code, project=None):
                 raise SystemExit(code)
             with self.subTest(code=code), mock.patch.object(cli, "main", run), captured():
                 self.assertEqual(project.run_config(["--config", p]), want)
@@ -198,6 +199,52 @@ class Projects(CliCase):
         with captured() as (out, err):
             rc = cli.main(argv)
         return rc, out.getvalue(), err.getvalue()
+
+    def test_a_shared_waiver_file_is_judged_over_every_configuration(self):
+        # waivers.txt: line 1 matches only in `counters`, line 2 only in
+        # `mux`, line 3 nowhere.  own.txt is `own`'s alone, and its line 3 is
+        # for a kind that configuration doesn't run.
+        self.write("proj/waivers.txt", "counter_overflow:mod_q\nparallel_case:gnt\nmem_addr:gone.rd0\n")
+        self.write("proj/own.txt", "index_range:lane\nindex_range:old\nmem_addr:x.rd0\n")
+        md = os.path.join(self.tmp, "summary.md")
+        p = self.project(f'out = "{self.out}"\n[defaults]\nwaivers = "waivers.txt"\n'
+                         '[config.counters]\ntop = "snap_counters"\nfiles = ["../rtl/top.sv"]\n'
+                         '[config.mux]\ntop = "snap_mux"\nfiles = ["../rtl/top.sv"]\n'
+                         '[config.own]\ntop = "snap_mux"\nfiles = ["../rtl/top.sv"]\nwaivers = "own.txt"\n'
+                         'checks = ["index_range"]\n')
+        rc, out, err = self.run_project(p, "--github", "--summary-md", md)
+        self.assertEqual(rc, 0)
+        warnings = [ln for ln in err.splitlines() if "matches no check" in ln]
+        self.assertEqual(warnings, [
+            "fvlint: warning: proj/waivers.txt:3: waiver 'mem_addr:gone.rd0' matches no check in any configuration "
+            "(renamed, fixed or no longer present?)",
+            "fvlint: warning: proj/own.txt:2: waiver 'index_range:old' matches no check in any configuration "
+            "(renamed, fixed or no longer present?)"])
+        notes = [ln for ln in out.splitlines() if "unused waiver" in ln]
+        self.assertEqual(notes, ["::warning title=fvlint%3A unused waiver,file=proj/waivers.txt,line=3::"
+                                 "mem_addr:gone.rd0 matches no check (renamed, fixed or no longer present?)",
+                                 "::warning title=fvlint%3A unused waiver,file=proj/own.txt,line=2::"
+                                 "index_range:old matches no check (renamed, fixed or no longer present?)"])
+        with open(md) as f:
+            text = f.read()
+        self.assertEqual(text.count("that match no check"), 2)                  # only the project's section
+        self.assertTrue(text.endswith("### fvlint: waivers\n\n"
+                                      "Waivers in `proj/waivers.txt` that match no check in any configuration:\n\n"
+                                      "- line 3: `mem_addr:gone.rd0`\n\n"
+                                      "Waivers in `proj/own.txt` that match no check in any configuration:\n\n"
+                                      "- line 2: `index_range:old`\n\n"), text)
+        # Each run still records its own view in results.json.
+        for name, lines in (("counters", [2, 3]), ("mux", [1, 3]), ("own", [2])):
+            with open(os.path.join(self.out, name, "results.json")) as f:
+                self.assertEqual([w["line"] for w in json.load(f)["meta"]["unused_waivers"]], lines, name)
+
+    def test_no_unused_waivers_no_report(self):
+        self.write("proj/waivers.txt", "counter_overflow:mod_q\n")
+        p = self.project(f'out = "{self.out}"\n[config.c]\ntop = "snap_counters"\nfiles = ["../rtl/top.sv"]\n'
+                         'waivers = "waivers.txt"\n[config.n]\ntop = "snap_mux"\nfiles = ["../rtl/top.sv"]\n')
+        rc, out, err = self.run_project(p, "--github")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("matches no check", err + out)
 
     def test_load(self):
         p = self.project(self.TWO.format(out="o"))

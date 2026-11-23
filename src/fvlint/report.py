@@ -81,10 +81,24 @@ def markdown(results, meta: dict, title: str, unused_waivers=(), waiver_file=Non
         lines += [f"| {r.status} | `{_md_cell(r.check.id)}` | {_md_cell(r.check.src)} | {_md_cell(r.detail)} |"
                   for r in shown]
         lines.append("")
-    if unused_waivers:
-        lines += [f"Waivers in `{_md_cell(waiver_file)}` that match no check:", ""]
-        lines += [f"- line {n}: `{_md_cell(pat)}`" for n, pat in unused_waivers]
-        lines.append("")
+    lines += _md_waivers(unused_waivers, waiver_file)
+    return "\n".join(lines) + "\n"
+
+
+def _md_waivers(unused_waivers, waiver_file, where="") -> list:
+    if not unused_waivers:
+        return []
+    return ([f"Waivers in `{_md_cell(waiver_file)}` that match no check{where}:", ""]
+            + [f"- line {n}: `{_md_cell(pat)}`" for n, pat in unused_waivers] + [""])
+
+
+def markdown_project_waivers(files) -> str:
+    """The Markdown section for a project file's runs: waiver lines that
+    matched no check in any configuration that loaded their file.  `files`:
+    [(waiver file, [(line, pattern)])]."""
+    lines = ["### fvlint: waivers", ""]
+    for path, unused in files:
+        lines += _md_waivers(unused, path, " in any configuration")
     return "\n".join(lines) + "\n"
 
 

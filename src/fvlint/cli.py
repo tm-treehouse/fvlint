@@ -168,7 +168,12 @@ def _warn(msg: str):
     print(f"fvlint: warning: {msg}", file=sys.stderr)
 
 
-def main(argv=None) -> int:
+def main(argv=None, project: dict | None = None) -> int:
+    """Run fvlint.  With `project` (a dict; set by --config for each of its
+    configurations), waiver lines that match no check are not reported here
+    but recorded in it, with the lines that did match, the waiver file and
+    where reports go: a file shared by several configurations is judged
+    over all of them (see project.run_config)."""
     argv = list(sys.argv[1:] if argv is None else argv)
     if any(a == "--config" or a.startswith("--config=") for a in argv):
         from .project import run_config
@@ -294,7 +299,8 @@ def main(argv=None) -> int:
     explain_unknown(results, args.horizon)
     unneeded = recheck_waived(results, waived) if args.recheck_waived else []
     unused = waivers.unused(want or set(KINDS))
-    for n, pat in unused:
+    shown_unused = unused if project is None else []
+    for n, pat in shown_unused:
         _warn(f"{args.waivers}:{n}: waiver {pat!r} matches no check (renamed, fixed or no longer present?)")
     for cid in unneeded:
         _warn(f"waiver for {cid} no longer needed: it passes now")
@@ -311,15 +317,19 @@ def main(argv=None) -> int:
     print(console(results, args.verbose))
     title = f"{args.run_name} ({args.top})" if args.run_name else args.top
     md_files = [args.summary_md] if args.summary_md else []
+    root = os.environ.get("GITHUB_WORKSPACE") or os.getcwd()
     if args.github:
-        root = os.environ.get("GITHUB_WORKSPACE") or os.getcwd()
-        for line in github_annotations(results, root, unused, args.waivers, unneeded):
+        for line in github_annotations(results, root, shown_unused, args.waivers, unneeded):
             print(line)
         if not md_files and os.environ.get("GITHUB_STEP_SUMMARY"):
             md_files.append(os.environ["GITHUB_STEP_SUMMARY"])
     for path in md_files:
         with open(path, "a") as f:
-            f.write(markdown(results, meta, title, unused, args.waivers))
+            f.write(markdown(results, meta, title, shown_unused, args.waivers))
+    if project is not None:
+        project.update(waivers=os.path.realpath(args.waivers) if args.waivers else None,
+                       used=waivers.used_lines(), unused=unused, github=args.github, md_files=md_files,
+                       root=root)
     print(f"\n{meta['elapsed_s']}s, {engine.stats['jobs']} solver jobs, engine {opts.engine}; "
           f"results in {display_path(out)}/", file=sys.stderr)
 

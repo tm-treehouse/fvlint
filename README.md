@@ -301,7 +301,10 @@ fvlint: 11 checks: 1 info, 8 proven, 2 waived
 Waivers go stale as the design changes. fvlint warns about every line of a
 waiver file that matches no check (with `--github`, on that line), and
 `--recheck-waived` proves the waived checks anyway and names the waivers that
-are no longer needed, while still treating them as waived.
+are no longer needed, while still treating them as waived. With `--config`,
+a waiver file that several configurations share is judged over all of them:
+after the last run, fvlint reports the lines that matched no check in any
+configuration that loaded the file.
 
 ## Regression testing
 

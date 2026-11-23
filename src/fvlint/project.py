@@ -223,7 +223,7 @@ def run_config(argv: list) -> int:
               file=sys.stderr)
         return 2
     base = os.path.dirname(os.path.abspath(path))
-    rc = 0
+    rc, runs = 0, []
     for name in names or list(configs):
         try:
             run_argv = entry_argv({**data.get("defaults", {}), **configs[name]}, base)
@@ -233,9 +233,52 @@ def run_config(argv: list) -> int:
             continue
         print(f"=== fvlint: {name}", file=sys.stderr)
         sys.stderr.flush()
+        info = {}
         try:
-            r = cli.main(run_argv + ["-o", os.path.join(root, name), "--run-name", name] + extra)
+            r = cli.main(run_argv + ["-o", os.path.join(root, name), "--run-name", name] + extra, project=info)
         except SystemExit as e:                                 # an argument error in this configuration
             r = e.code if isinstance(e.code, int) else 2
         rc = max(rc, r)                                         # 2 (couldn't run) > 1 (findings) > 0
+        if info:
+            runs.append(info)
+    report_unused_waivers(runs)
     return rc
+
+
+def unused_waivers(runs: list) -> list:
+    """[(waiver file, [(line, pattern)])]: the lines of each waiver file that
+    matched no check in any configuration that loaded it (files are told
+    apart by real path), and that some configuration judged (a rule for a
+    check kind no configuration ran is not reported, as in a single run).
+    A file shared by several configurations usually has lines for each."""
+    files = {}
+    for info in runs:
+        if info.get("waivers"):
+            used, unused = files.setdefault(info["waivers"], (set(), {}))
+            used.update(info["used"])
+            unused.update(dict(info["unused"]))
+    return [(f, sorted((n, pat) for n, pat in unused.items() if n not in used))
+            for f, (used, unused) in files.items() if set(unused) - used]
+
+
+def report_unused_waivers(runs: list):
+    """Warn about the waiver lines no configuration used, after all of them
+    ran; with --github also as annotations and in the job summary."""
+    from .cli import _warn
+    from .netlist import display_path
+    from .report import github_annotations, markdown_project_waivers
+    files = unused_waivers(runs)
+    for f, unused in files:
+        for n, pat in unused:
+            _warn(f"{display_path(f)}:{n}: waiver {pat!r} matches no check in any configuration "
+                  "(renamed, fixed or no longer present?)")
+    if not files:
+        return
+    if any(info["github"] for info in runs):
+        root = runs[0]["root"]
+        for f, unused in files:
+            for line in github_annotations([], root, unused, f):
+                print(line)
+    for md in dict.fromkeys(p for info in runs for p in info["md_files"]):
+        with open(md, "a") as out:
+            out.write(markdown_project_waivers([(display_path(f), unused) for f, unused in files]))
