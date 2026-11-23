@@ -263,10 +263,19 @@ class Running(TempDirCase):
     def test_run_sby_backstop_kills_the_process_group(self):
         tc = self.sby_stub("sleep 60 &\necho $! > child.pid\nsleep 60\n")
         tc.SBY_GRACE = 0.0
-        t0 = time.time()
-        self.assertEqual(tc.run_sby("run.sby", self.tmp, 0.5), -1)
-        self.assertLess(time.time() - t0, 20)
-        with open(os.path.join(self.tmp, "child.pid")) as f:
+        pidfile = os.path.join(self.tmp, "child.pid")
+        # Under load (parallel mutation runs) the stub may not reach the line
+        # that starts the grandchild before the timeout: then nothing is left
+        # to check, so try again with more time.
+        for timeout in (0.5, 1, 2, 4, 8):
+            t0 = time.time()
+            self.assertEqual(tc.run_sby("run.sby", self.tmp, timeout), -1)
+            self.assertLess(time.time() - t0, 20 + timeout)
+            if os.path.exists(pidfile) and os.path.getsize(pidfile):
+                break
+        else:
+            self.fail("the stub never started its child")
+        with open(pidfile) as f:
             pid = int(f.read())
         for _ in range(50):                                             # the grandchild goes too
             if not _alive(pid):
