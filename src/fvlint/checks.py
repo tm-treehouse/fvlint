@@ -17,6 +17,12 @@ PROVEN = "PROVEN"
 WAIVED = "WAIVED"
 SEVERITY = [FAIL, ERROR, VACUOUS, UNKNOWN, WARN, INFO, PROVEN, WAIVED]
 
+# Why a check is INFO instead of proved (Check.reason, "reason" in results.json).
+FREE_RUNNING = "free_running"      # the counter's step doesn't depend on it: wrap-around intended
+HORIZON = "horizon"                # the counter can't wrap within --horizon cycles
+DEAD_STATE = "dead_state"          # applies only in an unreachable FSM state
+FULL_CASE_X = "full_case_x"        # full_case on a signal set to 'x before the case: the pragma changes nothing
+
 
 def src_key(src: str) -> tuple:
     """Sort key for 'file:line' locations: by file, then numerically by line."""
@@ -38,6 +44,7 @@ class Check:
     waive_attr: str | None = None       # value of an fvlint_waive attribute on the object
     preset: str | None = None           # status decided without a proof (graph checks, info)
     detail: str = ""
+    reason: str | None = None           # why a preset INFO needs no proof (FREE_RUNNING, ...), for tools
     depth_hint: int = 0                 # BMC depth that would expose a violation, if known
     min_cycles: int | None = None       # a violation needs at least this many cycles (counters), if known
     group: str | None = None            # id of the reported check this one is a part of (case statements)
@@ -95,6 +102,7 @@ class Result:
             "trace": self.trace, "cex_step": self.step, "engine": self.engine,
             "lemmas_used": self.lemmas_used, "refinements": self.refinements,
             "vacuity": self.vacuity, "history": self.history, "waiver": self.waiver,
+            "reason": self.check.reason if self.status == INFO else None,
         }
 
 
@@ -127,8 +135,9 @@ def merge_parts(results: list) -> list:
         status = min((p.status for p in parts), key=_MERGE_ORDER.index)
         lead = next(p for p in parts if p.status == status)
         kind, _, target = item.partition(":")
+        reasons = {p.check.reason for p in parts if p.status == status}
         chk = Check(kind=kind, target=target, src=lead.check.src, desc=lead.check.desc,
-                    waive_attr=lead.check.waive_attr)
+                    waive_attr=lead.check.waive_attr, reason=reasons.pop() if len(reasons) == 1 else None)
         signals = ", ".join(p.check.part for p in parts)
         detail = lead.detail
         if status not in (WAIVED, INFO, VACUOUS) or len({p.detail for p in parts}) > 1:

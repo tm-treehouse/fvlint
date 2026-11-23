@@ -13,7 +13,7 @@ import os
 import re
 from dataclasses import dataclass
 
-from .checks import INFO, Check, Lemma, src_key
+from .checks import FREE_RUNNING, FULL_CASE_X, INFO, Check, Lemma, src_key
 from .fsm import _Eval
 from .netlist import FF_TYPES, Netlist, attr_true, const_value, is_const, param_int
 
@@ -478,7 +478,7 @@ def detect_counters(nl: Netlist, max_level: int, uninit: str = "zero"):
                         min_cycles=None if signed else min_cycles_to_wrap(
                             nl, cell, q, paths, direction == "up", step, uninit))
             if not bounded:
-                chk.preset = INFO
+                chk.preset, chk.reason = INFO, FREE_RUNNING
                 chk.detail = ("free-running: the increment condition does not depend on the "
                               "counter, so wrap-around looks intentional; not checked")
             checks.append(chk)
@@ -686,7 +686,7 @@ def harmless_full_case(checks: list, nl_nofc: Netlist) -> int:
             continue
         found = defaults.get((c.src, c.part, c.params.get("W")))
         if found == [True]:
-            c.preset = INFO
+            c.preset, c.reason = INFO, FULL_CASE_X
             c.detail = (f"the code sets {c.part} to 'x before the case, so when no item matches simulation "
                         "gives 'x just as synthesis may: the full_case pragma changes nothing; not checked")
             n += 1

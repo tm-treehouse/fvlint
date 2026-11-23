@@ -167,7 +167,9 @@ fvlint --config fvlint.toml [NAME...] [options for every configuration]
 * The exit status is 1 on any `FAIL`, `ERROR` or `VACUOUS` result (adjust
   with `--fail-on fail|vacuous|unknown`) and 2 if fvlint couldn't run.
   `OUTDIR/results.json` and `OUTDIR/junit.xml` are written every run, and
-  counterexamples come with a VCD trace.
+  counterexamples come with a VCD trace. In `results.json`, an `INFO`
+  result's `reason` says why it needed no proof: `free_running`,
+  `horizon`, `dead_state` or `full_case_x` (`null` for summaries).
 * `--list` shows the detected checks without proving anything.
 * `--horizon CYCLES` (an integer or `2^N`; default `2^60`, `0` to check
   every counter): see *What it checks*.

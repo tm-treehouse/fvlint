@@ -425,14 +425,14 @@ class DeadStates(TempDirCase):
         waived = self.check((self.eq3, 1))
         waived.preset, waived.detail = INFO, "free-running"
         self.assertEqual(dead_in_unreachable_states(self.nl, dead + live + [waived], self.fsms), 3)
-        self.assertEqual([c.preset for c in dead], [INFO] * 3)
+        self.assertEqual([(c.preset, c.reason) for c in dead], [(INFO, "dead_state")] * 3)
         self.assertEqual(dead[0].detail, "dead logic: applies only in state st=2'b11, which is unreachable "
                                          "(see fsm_unreachable:st=2'b11); not checked")
         self.assertEqual(dead[1].detail, dead[0].detail)
         self.assertEqual(dead[2].detail, "dead logic: applies only when st equals a value wider than the "
                                          "register; not checked")
-        self.assertEqual([c.preset for c in live], [None] * len(live))
-        self.assertEqual(waived.detail, "free-running")                  # a preset is left alone
+        self.assertEqual([(c.preset, c.reason) for c in live], [(None, None)] * len(live))
+        self.assertEqual((waived.detail, waived.reason), ("free-running", None))   # a preset is left alone
 
     def test_more_compare_shapes(self):
         dead = [self.check((self.eqx3, 1)), self.check((self.nex3, 0)), self.check((self.eq4, 1))]

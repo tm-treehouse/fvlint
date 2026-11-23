@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 
 from fvlint.checks import ERROR, FAIL, INFO, PROVEN, SEVERITY, UNKNOWN, VACUOUS, WAIVED, WARN, Check, Result
 from fvlint import report
-from fvlint.checks import merge_parts, src_key
+from fvlint.checks import DEAD_STATE, FREE_RUNNING, FULL_CASE_X, HORIZON, merge_parts, src_key
 from fvlint.report import _gh_location, console, github_annotations, markdown, write_json, write_junit
 from fvlint.waivers import Waivers, _glob_match
 
@@ -58,8 +58,16 @@ class Model(unittest.TestCase):
             "id": "counter_overflow:q", "kind": "counter_overflow", "target": "q", "src": "a.v:1",
             "property": "counter_overflow holds", "status": FAIL, "detail": "cex", "cone": "full",
             "full_design": True, "trace": "t.vcd", "cex_step": 4, "engine": "PDR", "lemmas_used": 2,
-            "refinements": 1, "vacuity": "ok", "history": [("0", "fail")], "waiver": None})
+            "refinements": 1, "vacuity": "ok", "history": [("0", "fail")], "waiver": None, "reason": None})
         json.dumps(d)                                                   # serialisable
+
+    def test_reason_of_info_results(self):
+        c = Check("counter_overflow", "q", "a.v:1", "p", reason=HORIZON)
+        self.assertEqual(Result(check=c, status=INFO).to_dict()["reason"], "horizon")
+        self.assertIsNone(Result(check=c, status=WAIVED).to_dict()["reason"])      # waived: no INFO to explain
+        self.assertIsNone(Result(check=Check("k", "t", "", ""), status=INFO).to_dict()["reason"])
+        self.assertEqual((FREE_RUNNING, HORIZON, DEAD_STATE, FULL_CASE_X),
+                         ("free_running", "horizon", "dead_state", "full_case_x"))
 
 
 class WaiverRules(TempDirCase):
@@ -248,6 +256,18 @@ class MergeParts(unittest.TestCase):
         self.assertEqual(self.merged(INFO, INFO).detail, "d")              # dead: the same reason for every part
         self.assertEqual(self.merged(VACUOUS, VACUOUS, details={1: "e"}).detail,
                          "d (for s0; checked for each signal it assigns: s0, s1)")
+
+    def test_reason(self):
+        def merged(*parts):
+            rs = [self.part("parallel_case:a,b", f"s{i}", st) for i, (st, _) in enumerate(parts)]
+            for r, (_, why) in zip(rs, parts):
+                r.check.reason = why
+            (r,) = merge_parts(rs)
+            return r.to_dict()["reason"]
+        self.assertEqual(merged((INFO, DEAD_STATE), (INFO, DEAD_STATE)), "dead_state")
+        self.assertIsNone(merged((INFO, DEAD_STATE), (INFO, FULL_CASE_X)))        # mixed: no one reason
+        self.assertIsNone(merged((INFO, FULL_CASE_X), (VACUOUS, None)))           # VACUOUS decides
+        self.assertEqual(merged((INFO, FULL_CASE_X), (VACUOUS, None), (INFO, FULL_CASE_X)), None)
 
     def test_order_and_other_results(self):
         lone = Result(check=Check(kind="mem_addr", target="m.wr0", src="m.v:1", desc="x"), status=PROVEN)

@@ -479,7 +479,7 @@ class Counters(unittest.TestCase):
         b = NB()
         _counter(b, en=b.input("en")[0])
         (c,), _ = self.detect(b)
-        self.assertEqual(c.preset, INFO)
+        self.assertEqual((c.preset, c.reason), (INFO, "free_running"))
         self.assertIn("free-running", c.detail)
 
     def test_dependence_is_limited_to_max_level(self):
@@ -999,11 +999,11 @@ class HarmlessFullCase(unittest.TestCase):
         nofc = self.design({"a": ["x"], "b": lambda b: b.input("b_prev")}, pragma=False)
         self.assertEqual(harmless_full_case(checks, nofc), 1)
         by_part = {c.part: c for c in checks}
-        self.assertEqual(by_part["a"].preset, INFO)
+        self.assertEqual((by_part["a"].preset, by_part["a"].reason), (INFO, "full_case_x"))
         self.assertEqual(by_part["a"].detail, "the code sets a to 'x before the case, so when no item matches "
                                               "simulation gives 'x just as synthesis may: the full_case pragma "
                                               "changes nothing; not checked")
-        self.assertIsNone(by_part["b"].preset)                           # the real hazard stays checked
+        self.assertEqual((by_part["b"].preset, by_part["b"].reason), (None, None))   # the real hazard stays checked
 
     def test_only_parallel_case_muxes_count(self):
         checks = [c for c in detect_case(self.design({"a": ["x"]})) if c.kind == "full_case"]

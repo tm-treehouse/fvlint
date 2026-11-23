@@ -11,7 +11,7 @@ import sys
 import time
 
 from . import __version__
-from .checks import ERROR, FAIL, INFO, PROVEN, UNKNOWN, VACUOUS, WAIVED, Result, merge_parts
+from .checks import ERROR, FAIL, HORIZON, INFO, PROVEN, UNKNOWN, VACUOUS, WAIVED, Result, merge_parts
 from .detect import detect_all, fmt_cycles, harmless_full_case
 from .elaborate import Sources, elaborate, elaborate_without_full_case
 from .engine import Engine, Options
@@ -48,7 +48,7 @@ def apply_horizon(checks, horizon: int):
         return
     for c in checks:
         if c.preset is None and c.min_cycles is not None and c.min_cycles >= horizon:
-            c.preset = INFO
+            c.preset, c.reason = INFO, HORIZON
             c.detail = (f"can't wrap in fewer than {fmt_cycles(c.min_cycles)} cycles, beyond the "
                         f"--horizon of {fmt_cycles(horizon)}; not checked")
 

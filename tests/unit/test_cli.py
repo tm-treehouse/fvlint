@@ -396,6 +396,8 @@ class Flow(CliCase):
         self.assertEqual(res["counter_overflow:mod_q"]["status"], "WAIVED")
         self.assertEqual(res["counter_overflow:mod_q"]["waiver"], "waiver file: counter_overflow:mod_q (reviewed)")
         self.assertEqual(res["counter_overflow:free_q"]["status"], "INFO")       # preset: never proved
+        self.assertEqual(res["counter_overflow:free_q"]["reason"], "free_running")
+        self.assertIsNone(res["counter_overflow:mod_q"]["reason"])
         self.assertIn("free-running", res["counter_overflow:free_q"]["detail"])
         proved = sorted(c.id for c in self.Engine.last.proved)
         self.assertEqual(len(proved), 5)
@@ -411,6 +413,7 @@ class Flow(CliCase):
                 self.run_cli("--horizon", horizon)
                 res = {r["id"]: r for r in self.results()["results"]}
                 self.assertEqual(sorted(i for i in bounded if res[i]["status"] == "INFO"), info)
+                self.assertEqual(sorted(i for i in bounded if res[i]["reason"] == "horizon"), info)
                 for i in info:
                     self.assertEqual(res[i]["detail"], "can't wrap in fewer than 16 cycles, beyond the --horizon "
                                                        "of 16; not checked")

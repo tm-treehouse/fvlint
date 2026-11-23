@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 
-from .checks import FAIL, INFO, WARN, Check, Lemma
+from .checks import DEAD_STATE, FAIL, INFO, WARN, Check, Lemma
 from .netlist import Netlist, const_value, param_int
 
 
@@ -411,7 +411,7 @@ def dead_in_unreachable_states(nl: Netlist, checks: list, fsms: dict) -> int:
                        f"(see fsm_unreachable:{sig}={_fmt(code)})")
             else:
                 continue
-            c.preset, c.detail = INFO, f"dead logic: {why}; not checked"
+            c.preset, c.reason, c.detail = INFO, DEAD_STATE, f"dead logic: {why}; not checked"
             n += 1
             break
     return n
