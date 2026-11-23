@@ -60,10 +60,33 @@ runs:
     - uses: actions/setup-python@v7
       with:
         python-version: ${{ inputs.python-version }}
+    # The action can run several times in a job; setup-oss-cad-suite can't
+    # (its download is in the way), and the tools from the first run are
+    # still on PATH.
+    - name: OSS CAD Suite already installed?
+      id: ocs
+      shell: bash
+      env:
+        WANT: ${{ inputs.oss-cad-suite-version }}
+      run: |
+        have="${FVLINT_OSS_CAD_SUITE:-}"
+        if [ -z "$have" ]; then
+          echo "install=true" >> "$GITHUB_OUTPUT"
+        elif [ "$have" != "$WANT" ]; then
+          echo "::error title=fvlint::OSS CAD Suite $have is installed in this job by an earlier fvlint step; this step asks for $WANT (use one version per job)"
+          exit 2
+        fi
     - uses: YosysHQ/setup-oss-cad-suite@v4
+      if: steps.ocs.outputs.install == 'true'
       with:
         version: ${{ inputs.oss-cad-suite-version }}
         github-token: ${{ inputs.github-token }}
+    - name: Remember the OSS CAD Suite version
+      if: steps.ocs.outputs.install == 'true'
+      shell: bash
+      env:
+        WANT: ${{ inputs.oss-cad-suite-version }}
+      run: echo "FVLINT_OSS_CAD_SUITE=$WANT" >> "$GITHUB_ENV"
     - name: Install fvlint
       shell: bash
       env:

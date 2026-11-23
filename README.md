@@ -251,7 +251,8 @@ jobs:
 
 Other inputs: `args` (more options), `output`, `upload`, `artifact-name`,
 `python-version` and `oss-cad-suite-version` (default: the build fvlint's own
-CI uses).
+CI uses). The action can run several times in one job (the OSS CAD Suite is
+installed once), with one `oss-cad-suite-version` per job.
 
 ### Results
 
