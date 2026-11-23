@@ -4,7 +4,10 @@
 
 Generates small random designs (counters, cross-register conditions, case
 statements, part-selects, non-power-of-two memories, state machines,
-occasionally a second clock or a falling-edge register), runs fvlint on each,
+occasionally a second clock or a falling-edge register, and constructs
+fvlint settles without a proof: case statements in FSM states, up/down
+counters under a small --horizon, full_case on 'x or valued signals,
+parameter guards), runs fvlint on each,
 and then checks every verdict with an independent oracle.  The generator
 knows what it built, so for each construct it also writes down, as plain
 Verilog expressions, when the construct is active and when it goes wrong (an
@@ -21,6 +24,14 @@ are inactive (a flop that data can set is not a reset).
                        enabling condition, for VACUOUS) within the bound.
 * FAIL              -> the oracle must find the violation.
 * fsm_unreachable   -> the oracle must not reach the state.
+* INFO, by its results.json reason:
+  dead_state        -> as VACUOUS: the enabling condition is never reached.
+  horizon           -> no wrap within the --horizon N (the first N - 1 cycles
+                       after the reset); a BMC that deep checks it completely.
+  full_case_x       -> the generator must have set the signal to 'x before
+                       the case (not expressible as a monitor).
+  free_running      -> nothing claimed.
+* A construct behind a parameter guard that is 1 must have a check.
 
 The oracle is bounded, so a disagreement beyond its depth goes unnoticed;
 designs are kept small (registers of 2-5 bits) so the bound covers them.
@@ -58,6 +69,13 @@ class Design:
     monitors: dict = field(default_factory=dict)
     clock: dict = field(default_factory=dict)          # register or memory -> its clock edge
     reads: dict = field(default_factory=dict)          # register, memory or wire -> names it reads
+    args: list = field(default_factory=list)           # extra fvlint options for this design (--horizon N)
+    # Signals of full_case statements that the code sets to 'x before the
+    # case, where the pragma changes nothing (fvlint may skip their check).
+    x_defaults: set = field(default_factory=set)
+    # Monitors of constructs the generator knows are live (a parameter guard
+    # that is 1): fvlint must report a check for each.
+    required: set = field(default_factory=set)
 
     def monitor(self, key, en, bad):
         m = self.monitors.setdefault(key, {"en": [], "bad": []})
@@ -273,12 +291,105 @@ def generate(seed: int) -> Design:
         d.monitor(("mem_addr", "mem.wr0"), "in3", f"(in3 && ({addr}) > {depth - 1})")
         d.monitor(("mem_addr", "mem.rd0"), "1'b1", f"(({addr}) > {depth - 1})")
         extra.append("rd")
+    extra2 = _settling_constructs(d, random.Random(seed * 104729 + 31), lines, widths, ins)
     outs = ", ".join([f"r{i}" for i in range(n)] + extra)
     lines.append(f"  assign o = {{{outs}}};")
+    if extra2:
+        lines[0] = lines[0].replace("output [63:0] o);", "output [63:0] o, output [31:0] o2);")
+        lines.append(f"  assign o2 = {{{', '.join(extra2)}}};")
     lines.append("endmodule")
     d.text = "\n".join(lines) + "\n"
     d.record()
     return d
+
+
+def _settling_constructs(d: Design, g: random.Random, lines: list, widths: list, ins: list) -> list:
+    """Constructs fvlint can settle without a proof, so that the oracle
+    checks those verdicts too: a parallel_case statement inside a state of
+    the FSM (dead when the state is unreachable), a counter that steps both
+    ways from a constant start (the wrap horizon), full_case on a signal set
+    to 'x or to a value before the case, and a counter behind a parameter
+    guard `PE && x`.  Drawn from their own random stream `g`, appended to
+    `lines`, with every decision drawn whether or not it is used, so that
+    adding them left the rest of every design as it was.  Returns the
+    signals to drive the o2 output with."""
+    out = []
+    n = len(widths)
+    horizon = g.choice([6, 8, 12, 16]) if g.random() < 0.5 else None
+    if horizon:
+        d.args = ["--horizon", str(horizon)]
+
+    def items():
+        k = g.randrange(n)
+        return g.choice([(ins[0], ins[1]), (ins[2], f"!{ins[2]}"), (f"r{k}[0]", f"r{k}[1]")])
+
+    # (a) A case statement in state K of the FSM: dead if K is unreachable.
+    nested, k_state, (a, b) = g.random() < 0.7, g.randrange(4), items()
+    if nested and any(name == "st" for name, _ in d.regs):
+        lines.append("  reg [1:0] pv;")
+        lines.append(f"  always @(posedge clk) if (rst) pv <= 2'd0; else case (st) 2'd{k_state}: begin "
+                     f"(* parallel_case *) case (1'b1) {a}: pv <= 2'd1; {b}: pv <= 2'd2; endcase end endcase")
+        d.regs.append(("pv", 2))
+        d.monitor(("parallel_case", "pv"), f"(st == 2'd{k_state})", f"(st == 2'd{k_state} && ({a}) && ({b}))")
+        out.append("pv")
+
+    # (b) Up and down from a constant start: either wrap can come first.
+    w = g.randint(3, 5)
+    mx = (1 << w) - 1
+    updown, start, lim, up_in, down_in, initial = g.random() < 0.5, g.randrange(mx + 1), g.randrange(mx + 1), \
+        g.choice(ins), g.choice(ins), g.random() < 0.5
+    if updown:
+        up_c, down_c = f"{up_in} && ud != {w}'d{lim}", down_in
+        lines.append(f"  reg [{w - 1}:0] ud;")
+        if initial:
+            # Its own power-up value (the oracle leaves it alone): without it
+            # fvlint counts on 0 at power-up, and 0 is next to a wrap.
+            lines.append(f"  initial ud = {w}'d{start};")
+        else:
+            d.regs.append(("ud", w))
+        lines.append(f"  always @(posedge clk) if (rst) ud <= {w}'d{start}; else if ({up_c}) ud <= ud + {w}'d1; "
+                     f"else if ({down_c}) ud <= ud - {w}'d1;")
+        up = f"!(rst) && ({up_c})"
+        down = f"!(rst) && !({up_c}) && ({down_c})"
+        d.monitor(("counter_overflow", "ud", 1), f"({up})", f"({up} && (ud > {w}'d{mx - 1}))")
+        d.monitor(("counter_underflow", "ud", 1), f"({down})", f"({down} && (ud < {w}'d1))")
+        out.append("ud")
+
+    # (c) full_case on a signal set to 'x before the case (the pragma changes
+    # nothing) and on one set to a value (simulation keeps it, synthesis may not).
+    for sig, first in (("fx", "2'bx"), ("fv", "2'd3")):
+        use, (a, b) = g.random() < 0.4, items()
+        if use:
+            lines.append(f"  reg [1:0] {sig};")
+            lines.append(f"  always @* begin {sig} = {first}; (* parallel_case, full_case *) case (1'b1) "
+                         f"{a}: {sig} = 2'd1; {b}: {sig} = 2'd2; endcase end")
+            d.monitor(("parallel_case", sig), "1'b1", f"(({a}) && ({b}))")
+            d.monitor(("full_case", sig), "1'b1", f"(!({a}) && !({b}))")
+            if first.endswith("x"):
+                d.x_defaults.add(sig)
+            out.append(sig)
+
+    # (d) A counter behind `PE && x`: dead with PE = 0, live and checked with 1.
+    w = g.randint(3, 4)
+    mx = (1 << w) - 1
+    guarded, pe, down, load, lim, step, ld_in = g.random() < 0.4, g.randrange(2), g.random() < 0.5, \
+        g.randrange(mx + 1), g.randrange(mx + 1), g.randint(1, 2), g.choice(ins)
+    if guarded:
+        lines.append(f"  localparam PE = {pe};")
+        lines.append(f"  reg [{w - 1}:0] pq;")
+        c = "PE && pq" if down else f"PE && pq != {w}'d{lim}"
+        rhs = f"pq - {w}'d{step}" if down else f"pq + {w}'d{step}"
+        lines.append(f"  always @(posedge clk) if (rst) pq <= {w}'d0; else if ({ld_in}) pq <= {w}'d{load}; "
+                     f"else if ({c}) pq <= {rhs};")
+        d.regs.append(("pq", w))
+        taken = f"!(rst) && !({ld_in}) && ({c})"
+        key = ("counter_underflow" if down else "counter_overflow", "pq", step)
+        wraps = f"(pq < {w}'d{step})" if down else f"(pq > {w}'d{mx - step})"
+        d.monitor(key, f"({taken})", f"({taken} && {wraps})")
+        if pe:
+            d.required.add(key)
+        out.append("pq")
+    return out
 
 
 # -------------------------------------------------------------------- oracle
@@ -360,6 +471,25 @@ def read_oracle_log(log: str, source: str = "oracle.sv", summary: str = "") -> t
     return status, fails
 
 
+def _settled(res: dict, design: Design, horizon, problems: list):
+    """The oracle's reading of an INFO result: a status to check like a
+    proof's ("DEAD": the check's condition never holds, like VACUOUS;
+    "HORIZON": no wrap within the --horizon), or None when there is nothing
+    to check with BMC.  A harmless full_case is checked against what the
+    generator wrote: the signal must be one it set to 'x before the case."""
+    reason = res.get("reason")
+    if reason == "dead_state":
+        return "DEAD"
+    if reason == "horizon" and horizon:
+        return "HORIZON"
+    if reason == "full_case_x":
+        target = re.sub(r"#\d+$", "", res["target"])
+        if target not in design.x_defaults:
+            problems.append(f"{res['id']}: fvlint INFO (the full_case pragma changes nothing), but the code sets "
+                            f"{target} to a value before the case")
+    return None                    # free-running (an intended wrap: nothing claimed), summaries
+
+
 def oracle(out: str, design: Design, depth: int, engine_opts, max_depth: int = 80) -> tuple[list, list]:
     """Re-check fvlint's verdicts in `out` against the generator's monitors,
     with plain BMC on the oracle's own copy of the design (see the module
@@ -367,7 +497,9 @@ def oracle(out: str, design: Design, depth: int, engine_opts, max_depth: int = 8
     from .tools import Toolchain
 
     with open(os.path.join(out, "results.json")) as f:
-        results = json.load(f)["results"]
+        data = json.load(f)
+    results = data["results"]
+    horizon = (data.get("meta") or {}).get("horizon")
     monitors = dict(design.monitors)
     groups, problems, inconclusive = {}, [], []
     for res in results:
@@ -380,35 +512,48 @@ def oracle(out: str, design: Design, depth: int, engine_opts, max_depth: int = 8
                 groups.setdefault(("state", res["target"]), []).append(("UNREACHABLE", res))
                 monitors[("state", res["target"])] = {"bad": [f"({sig} == {code})"]}
             continue
-        if st not in ("PROVEN", "VACUOUS", "FAIL"):
+        if st == "INFO":
+            st = _settled(res, design, horizon, problems)
+        if st not in ("PROVEN", "VACUOUS", "FAIL", "DEAD", "HORIZON"):
             continue
         key = result_key(res)
         if key not in monitors:
             inconclusive.append(f"{res['id']}: {st}, but the generator has no monitor for it")
             continue
-        groups.setdefault(key, []).append((st, res))
+        # A horizon claim is weaker than a proof (bounded): checked on its own.
+        groups.setdefault(("horizon",) + key if st == "HORIZON" else key, []).append((st, res))
+    reported = {result_key(res) for res in results}
+    for key in sorted(design.required - reported):
+        problems.append(f"{'/'.join(map(str, key))}: live logic (its guard's parameter is 1), but fvlint reported "
+                        "no check for it")
 
+    # asserts: (condition that must never hold, or within N cycles of reset)
     asserts, expect = [], []
     for key, verdicts in groups.items():
-        m = monitors[key]
+        m = monitors[key[1:] if key[0] == "horizon" else key]
         statuses = {st for st, _ in verdicts}
         ids = ", ".join(sorted(res["id"] for _, res in verdicts))
+        if statuses == {"HORIZON"}:
+            asserts.append((_any(m["bad"]), horizon))
+            expect.append((ids, "HORIZON", None))
+            continue
         if "FAIL" in statuses:
             if statuses != {"FAIL"}:
                 inconclusive.append(f"{ids}: FAIL and {'/'.join(sorted(statuses - {'FAIL'}))} for constructs "
                                     "the oracle watches together; only the FAIL is checked")
             step = min(res.get("cex_step") or 0 for st, res in verdicts if st == "FAIL")
-            asserts.append(_any(m["bad"]))
+            asserts.append((_any(m["bad"]), None))
             expect.append((ids, "FAIL", step))
             continue
-        if statuses == {"VACUOUS"}:                # never even active
-            asserts.append(_any(m["en"]))
-            expect.append((ids, "VACUOUS", None))
+        never = statuses & {"VACUOUS", "DEAD"}
+        if never and statuses == never:          # never even active
+            asserts.append((_any(m["en"]), None))
+            expect.append((ids, "DEAD" if never == {"DEAD"} else "VACUOUS", None))
             continue
-        if "VACUOUS" in statuses:
-            inconclusive.append(f"{ids}: VACUOUS and PROVEN for constructs the oracle watches together; "
-                                "only the absence of a violation is checked")
-        asserts.append(_any(m["bad"]))                # never goes wrong
+        if never:
+            inconclusive.append(f"{ids}: {'/'.join(sorted(never))} and PROVEN for constructs the oracle watches "
+                                "together; only the absence of a violation is checked")
+        asserts.append((_any(m["bad"]), None))                # never goes wrong
         expect.append((ids, "UNREACHABLE" if statuses == {"UNREACHABLE"} else "PROVEN", None))
     if not asserts:
         return problems, inconclusive
@@ -421,7 +566,7 @@ def oracle(out: str, design: Design, depth: int, engine_opts, max_depth: int = 8
     # per cycle, as fvlint models such a cone; one that spans clocks or edges
     # needs two global steps per cycle.  The generator knows which is which.
     jobs = {}
-    for i, a in enumerate(asserts):
+    for i, (a, _) in enumerate(asserts):
         edges = design.clocks_of(f"{a} {design.gate}")
         jobs.setdefault(None if len(edges) > 1 else min(edges, default="posedge clk"), []).append(i)
     for edge, idx in sorted(jobs.items(), key=lambda kv: (kv[0] is None, kv[0] or "")):
@@ -430,9 +575,21 @@ def oracle(out: str, design: Design, depth: int, engine_opts, max_depth: int = 8
         hold = (1 + len(design.stages)) * scale
         steps = [expect[i][2] for i in idx if expect[i][1] == "FAIL"]
         bound = min(max([depth] + [s + 4 for s in steps]), max_depth) * scale
+        # A horizon claim: no wrap in the first N - 1 cycles after the reset
+        # (the earliest wrapping step is cycle N - 1, counting from 0); BMC
+        # to that depth checks it completely.
+        exprs = []
+        for i in idx:
+            a, within = asserts[i]
+            if within is None:
+                exprs.append(a)
+            else:
+                last = hold + scale * (within - 1)
+                exprs.append(f"(fvo_n < 8'd{min(last, 255)}) && {a}")
+                bound = max(bound, last)
         name = ("oracle_mc" if mc else "oracle" if edge == "posedge clk"
                 else "oracle_" + edge.replace(" ", "_"))
-        text, first = oracle_text(design, [asserts[i] for i in idx], hold, edge)
+        text, first = oracle_text(design, exprs, hold, edge)
         with open(os.path.join(d, f"{name}.sv"), "w") as f:
             f.write(text)
         with open(os.path.join(d, f"{name}.sby"), "w") as f:
@@ -465,6 +622,12 @@ def oracle(out: str, design: Design, depth: int, engine_opts, max_depth: int = 8
                 problems.append(f"{ids}: fvlint PROVEN, oracle found a violation at step {fails[first + n]}")
             elif st == "VACUOUS" and failed:
                 problems.append(f"{ids}: fvlint VACUOUS, oracle reached the check's condition")
+            elif st == "DEAD" and failed:
+                problems.append(f"{ids}: fvlint INFO (dead logic in an unreachable state), oracle reached the "
+                                "check's condition")
+            elif st == "HORIZON" and failed:
+                problems.append(f"{ids}: fvlint INFO (can't wrap within --horizon {asserts[i][1]} cycles), oracle "
+                                f"found a wrap at step {fails[first + n]}")
             elif st == "UNREACHABLE" and failed:
                 problems.append(f"{ids}: fvlint says unreachable, oracle reached it")
             elif st == "FAIL" and not failed:
@@ -493,7 +656,7 @@ def run(seeds, outroot: str, depth: int = 24, extra_args=(), verbose=False) -> d
         src = os.path.join(d, f"{design.top}.v")
         with open(src, "w") as f:
             f.write(design.text)
-        rc = _quiet(cli.main, ["--top", design.top, src, "-o", d, "-j", "1", *extra_args])
+        rc = _quiet(cli.main, ["--top", design.top, src, "-o", d, "-j", "1", *extra_args, *design.args])
         summary["seeds"] += 1
         if rc == 2 or not os.path.exists(os.path.join(d, "results.json")):
             summary["problems"].append(f"seed {seed}: fvlint did not complete (rc={rc}), see {d}")
