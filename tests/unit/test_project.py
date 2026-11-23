@@ -246,6 +246,13 @@ class Projects(CliCase):
         self.assertIn("proj/waivers.txt:1: waiver 'counter_overflow:gone' matches no check in any configuration", err)
         self.assertNotIn("::", out)
 
+    def test_unused_waivers_of_one_configuration_with_github(self):
+        self.write("proj/waivers.txt", "counter_overflow:gone\n")
+        p = self.project(f'out = "{self.out}"\n[config.c]\ntop = "snap_counters"\nfiles = ["../rtl/top.sv"]\n'
+                         'waivers = "waivers.txt"\n')
+        rc, out, err = self.run_project(p, "--github")
+        self.assertIn("::warning title=fvlint%3A unused waiver", out)
+
     def test_no_unused_waivers_no_report(self):
         self.write("proj/waivers.txt", "counter_overflow:mod_q\n")
         p = self.project(f'out = "{self.out}"\n[config.c]\ntop = "snap_counters"\nfiles = ["../rtl/top.sv"]\n'
@@ -266,6 +273,8 @@ class Projects(CliCase):
                 self.assertEqual(self.elab_calls, [])                    # nothing ran
         rc, _, err = self.run_project(self.project('[config."../x"]\ntop = "t"\n'))
         self.assertIn('[config."../x"]: a configuration name', err)
+        rc, _, err = self.run_project(self.project('[config.-x]\ntop = "t"\n'))
+        self.assertIn('[config.-x]: a configuration name', err)               # a bare key, written bare
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "x")))
         p = self.project(f'out = "{self.out}"\n[config."v1.2_rc-3"]\ntop = "snap_counters"\n'
                          'files = ["../rtl/top.sv"]\n')

@@ -281,6 +281,9 @@
   {"module": "project", "scope": "<module>", "code": "\"args\": (None, \"raw\"),", "desc": "'raw' -> '\\x01'+'raw'", "nth": 0, "reason": "equivalent: 'raw' is the last kind, handled by the final else"},
   {"module": "project", "scope": "_split", "code": "needs_next = takes_value.get(a.split(\"=\", 1)[0], False) and \"=\" not in a", "desc": "1 -> 2", "nth": 0, "reason": "equivalent: the first field of split('=') is the same whatever the split limit"},
   {"module": "project", "scope": "_out_root", "code": "elif a.startswith(\"-o\") and len(a) > 2:", "desc": "Gt -> GtE", "nth": 0, "reason": "equivalent: a bare -o is handled by the branch before"},
-  {"module": "waivers", "scope": "Waivers.unused", "code": "kind = pat.split(\":\", 1)[0]", "desc": "1 -> 2", "nth": 0, "reason": "equivalent: the first field of split(':') is the same whatever the split limit"}
+  {"module": "waivers", "scope": "Waivers.unused", "code": "kind = pat.split(\":\", 1)[0]", "desc": "1 -> 2", "nth": 0, "reason": "equivalent: the first field of split(':') is the same whatever the split limit"},
+  {"module": "netlist", "scope": "Netlist.instance", "code": "return path.replace(\".\\\\\", \".\").lstrip(\"\\\\\")", "desc": "'\\\\' -> '\\x01'+'\\\\'", "nth": 0, "reason": "equivalent: lstrip takes a character set, so a prepended character still strips the same prefix"},
+  {"module": "waivers", "scope": "Waivers.unused", "code": "if kinds is not None and not any(c in kind for c in \"*?\") and kind not in kinds:", "desc": "'*?' -> '\\x01'+'*?'", "nth": 0, "reason": "equivalent: the string is used as a character set, so a prepended character changes nothing for real input"},
+  {"module": "project", "scope": "_split", "code": "needs_next = takes_value.get(a.split(\"=\", 1)[0], False) and \"=\" not in a", "desc": "'=' -> '\\x01'+'='", "nth": 0, "reason": "equivalent: with an '=' in the argument the other operand is already False; without one, the split changes nothing"}
 ]
 }

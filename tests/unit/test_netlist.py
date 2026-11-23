@@ -261,6 +261,7 @@ class Naming(unittest.TestCase):
             "$flatten\\gen[0].u$1.$procmux$4": ({}, "gen[0].u$1"),
             "$flatten\\u_a.odd": ({}, "u_a"),
             "u_b.named": ({}, "u_b"),                                            # public, no hdlname
+            "p2.u_d.named": ({}, "p2.u_d"),
             "u_c.named": ({"hdlname": "p1 u_c named"}, "p1.u_c"),
             "x": ({"hdlname": "x"}, ""),
             "$y": ({"hdlname": " "}, ""),
