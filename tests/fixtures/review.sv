@@ -147,3 +147,20 @@ module two_lanes (input [1:0] r, input t, output [1:0] ga, output [1:0] gb);
   lane_pc u_a (.req(r), .gnt(ga));
   lane_pc u_b (.req({t, ~t}), .gnt(gb));
 endmodule
+
+// A 64-bit counter that steps both ways (wide_count with a decrement): 0 - 1
+// wraps to all ones, and the next increment overflows.  Three cycles, not
+// 2^64: no horizon INFO.
+module updown_wide (input clk, input rst, input up, input down, input set, input [63:0] v, output [63:0] n);
+  reg [63:0] c, limit;
+  always @(posedge clk)
+    if (rst) begin
+      c <= 64'd0;
+      limit <= 64'd0;
+    end else begin
+      if (set) limit <= v;
+      if (up && c != limit) c <= c + 64'd1;
+      else if (down) c <= c - 64'd1;
+    end
+  assign n = c;
+endmodule

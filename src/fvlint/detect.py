@@ -317,7 +317,15 @@ def min_cycles_to_wrap(nl: Netlist, cell: str, q: list, paths, up: bool, step: i
     and its start value is known: then it moves at most the largest step per
     cycle away from the extreme load or start value.  A 64-bit instruction
     counter that only resets to 0 and adds 1 can't wrap in fewer than
-    2^64 - 1 cycles.  Unsigned counters only; anything else gives None."""
+    2^64 - 1 cycles.  Unsigned counters only; anything else gives None.
+
+    A register that steps both ways can wrap the other way first (0 - 1 is
+    all ones, one increment from overflowing), so then the bound is the
+    cycles before the first wrap of any kind: until then the value stays
+    within [lowest start - n * largest down step, highest start + n *
+    largest up step].  None when that first wrap can come at once.  With
+    steps in one direction only, wraps never help (an overflow only lowers
+    the value), and the bound is for `q op step` itself."""
     t = nl.ctype(cell)
     if t not in _PLAIN_FF:
         return None
@@ -365,17 +373,20 @@ def min_cycles_to_wrap(nl: Netlist, cell: str, q: list, paths, up: bool, step: i
             k_up = max(k_up, k)
         else:
             k_down = max(k_down, k)
-    if up:
-        # q + step wraps when q > mask - step; q grows by at most k_up a cycle.
-        gap = (mask - step + 1) - max(values)
-        speed = k_up
-    else:
-        # q - step wraps when q < step; q shrinks by at most k_down a cycle.
-        gap = min(values) - (step - 1)
-        speed = k_down
-    if gap <= 0 or speed <= 0:
+    if (k_up if up else k_down) <= 0:
         return None
-    return -(-gap // speed) + 1                          # cycles to get there, then the wrapping step
+
+    def cycles(gap, speed):                              # to get there, then the wrapping step
+        return -(-gap // speed) + 1 if gap > 0 else None
+
+    # q + k wraps when q > mask - k, and q grows by at most k_up a cycle;
+    # q - k wraps when q < k, and q shrinks by at most k_down a cycle.
+    if not k_down:
+        return cycles((mask - step + 1) - max(values), k_up)
+    if not k_up:
+        return cycles(min(values) - (step - 1), k_down)
+    bounds = [cycles((mask - k_up + 1) - max(values), k_up), cycles(min(values) - (k_down - 1), k_down)]
+    return None if None in bounds else min(bounds)
 
 
 def fmt_cycles(n: int) -> str:

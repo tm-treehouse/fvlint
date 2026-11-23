@@ -798,12 +798,44 @@ class WrapBound(unittest.TestCase):
         self.assertEqual(self.bound(up_steps=(1, 4), step=1), 5)    # +4 a cycle: 15 / 4 rounded up, + 1
         self.assertEqual(self.bound(up_steps=(1, 4), step=4), 4)    # +4 wraps from 12: 12 / 4, + 1
         self.assertIsNone(self.bound(loads=(15,)))                  # starts where it wraps
-        self.assertEqual(self.bound(down_steps=(1,)), 16)           # counting down never helps it wrap up
+        self.assertIsNone(self.bound(down_steps=(1,)))              # 0 - 1 is 15: one step from wrapping up
 
     def test_down_counter(self):
         self.assertEqual(self.bound(up=False, up_steps=(), down_steps=(1,), loads=(15,), ff={"arst": 0,
                                     "arst_val": 15}, init="1111"), 16)
         self.assertIsNone(self.bound(up=False, up_steps=(), down_steps=(1,)))   # starts at 0: wraps at once
+
+    def test_up_down_counter(self):
+        # q <= up ? q + 1 : down ? q - 1 : q, reset 0: 0 - 1 wraps to all
+        # ones, and the next increment overflows; no bound either way.
+        for up in (True, False):
+            self.assertIsNone(self.bound(w=8, up=up, down_steps=(1,)), up)
+            self.assertIsNone(self.bound(w=64, up=up, down_steps=(1,)), up)
+        # Starting at 100: either wrap needs the first wrap of any kind, the
+        # underflow after 100 decrements (the overflow needs 155 increments).
+        kw = {"w": 8, "down_steps": (1,), "ff": {"arst": 0, "arst_val": 100}, "init": "01100100"}
+        self.assertEqual(self.bound(up=True, **kw), 101)
+        self.assertEqual(self.bound(up=False, **kw), 101)
+        kw["ff"]["arst_val"], kw["init"] = 200, "11001000"
+        self.assertEqual(self.bound(up=True, **kw), 56)                # now the overflow comes first
+        self.assertEqual(self.bound(up=False, **kw), 56)
+        # Largest steps either way: q + 4 can wrap from 252, q - 3 from 2.
+        kw = {"w": 8, "up_steps": (1, 4), "down_steps": (1, 3), "ff": {"arst": 0, "arst_val": 100},
+              "init": "01100100"}
+        self.assertEqual(self.bound(up=True, step=1, **kw), 34)        # 98 / 3 rounded up, + 1
+        self.assertEqual(self.bound(up=False, step=1, **kw), 34)
+
+    def test_guarded_decrement_is_not_seen(self):
+        # `else if (down && q != 0) q <= q - 1` can't underflow, but the guard
+        # is no part of this analysis: the conservative answer stands.
+        def guarded(b):
+            q = b.netnames["q"]["bits"]
+            dec = b.op("$sub", A=q, B=const(1, 4))
+            nz = b.op("$ne", w=1, A=q, B=const(0, 4))[0]
+            return b.mux(q, dec, nz)
+        self.assertIsNone(self.bound(other=guarded))
+        nl, q, paths = self.counter(other=guarded, ff={"arst": 0, "arst_val": 5}, init="0101")
+        self.assertEqual(min_cycles_to_wrap(nl, "ff", q, paths, True, 1), 6)   # the underflow bound, 5 + 1
 
     def test_start_value(self):
         self.assertEqual(self.bound(ff={"arst": 0, "arst_val": 12}), 4)          # asynchronous reset value

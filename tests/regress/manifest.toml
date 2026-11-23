@@ -461,3 +461,11 @@ top = "two_lanes"
 expect = { "parallel_case:u_a.gnt" = "FAIL", "parallel_case:u_b.gnt" = "PROVEN" }
 strict = true
 tags = ["case", "hierarchy", "review"]
+
+[[case]]
+name = "review/updown_wide"
+files = ["../fixtures/review.sv"]
+top = "updown_wide"
+expect = { "counter_overflow:c" = "FAIL", "counter_underflow:c" = "FAIL" }
+strict = true
+tags = ["counter", "review"]
