@@ -238,6 +238,14 @@ class Projects(CliCase):
             with open(os.path.join(self.out, name, "results.json")) as f:
                 self.assertEqual([w["line"] for w in json.load(f)["meta"]["unused_waivers"]], lines, name)
 
+    def test_unused_waivers_without_github(self):
+        self.write("proj/waivers.txt", "counter_overflow:gone\n")
+        p = self.project(f'out = "{self.out}"\n[config.c]\ntop = "snap_counters"\nfiles = ["../rtl/top.sv"]\n'
+                         'waivers = "waivers.txt"\n')
+        rc, out, err = self.run_project(p)
+        self.assertIn("proj/waivers.txt:1: waiver 'counter_overflow:gone' matches no check in any configuration", err)
+        self.assertNotIn("::", out)
+
     def test_no_unused_waivers_no_report(self):
         self.write("proj/waivers.txt", "counter_overflow:mod_q\n")
         p = self.project(f'out = "{self.out}"\n[config.c]\ntop = "snap_counters"\nfiles = ["../rtl/top.sv"]\n'
