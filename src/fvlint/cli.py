@@ -53,13 +53,20 @@ def apply_horizon(checks, horizon: int):
                         f"--horizon of {fmt_cycles(horizon)}; not checked")
 
 
+def horizon_value(n: int) -> str:
+    """A cycle count as --horizon takes it (see cycles_arg), at most n: the
+    exact number when small, else the power of two below it.  fmt_cycles'
+    thousands separators are for prose only."""
+    return str(n) if n < 1 << 20 else f"2^{n.bit_length() - 1}"
+
+
 def explain_unknown(results, horizon: int):
     """Say how far away a wrap is for counters that ended UNKNOWN."""
     for r in results:
         n = r.check.min_cycles
         if r.status == UNKNOWN and n is not None:
             r.detail = (f"{r.detail}; a wrap needs at least {fmt_cycles(n)} cycles from reset, so "
-                        f"`--horizon {fmt_cycles(n).replace('more than ', '')}` or less would accept it")
+                        f"`--horizon {horizon_value(n)}` or less would accept it")
 
 
 def recheck_waived(results, waived: dict) -> list:

@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 from unittest import mock
 
 from fvlint import __version__, cli
-from fvlint.checks import FAIL, PROVEN, UNKNOWN, VACUOUS, Result
+from fvlint.checks import FAIL, PROVEN, UNKNOWN, VACUOUS, Check, Result
 from fvlint.tools import ToolError
 
 from .support import NB, TempDirCase, captured, snapshot
@@ -429,6 +429,22 @@ class Flow(CliCase):
         self.assertEqual(res["counter_overflow:mod_q"], "fake; a wrap needs at least 16 cycles from reset, so "
                                                         "`--horizon 16` or less would accept it")
         self.assertEqual(res["counter_underflow:down_q"], "fake")       # no bound known
+
+    def test_horizon_suggestion_can_be_pasted_back(self):
+        for n in (16, 999_999, (1 << 20) - 1, 1 << 20, (1 << 32) + 1, 1 << 64):
+            with self.subTest(n=n):
+                c = Check("counter_overflow", "q", "", "", min_cycles=n)
+                r = Result(check=c, status=UNKNOWN, detail="d")
+                cli.explain_unknown([r], 1 << 60)
+                value = r.detail.split("`--horizon ")[1].split("`")[0]
+                horizon = cli.cycles_arg(value)
+                self.assertLessEqual(horizon, n)                         # it accepts this counter
+                self.assertGreater(2 * horizon, n)                       # and is not much below
+                c.preset = None
+                cli.apply_horizon([c], horizon)
+                self.assertEqual(c.preset, "INFO")
+        self.assertEqual(cli.horizon_value((1 << 20) - 1), "1048575")
+        self.assertEqual(cli.horizon_value((1 << 32) + 1), "2^32")
 
     def test_cycles_arg(self):
         self.assertEqual(cli.cycles_arg("1000"), 1000)
