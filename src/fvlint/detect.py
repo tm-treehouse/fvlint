@@ -512,11 +512,12 @@ def _guard(nl: Netlist, conds) -> str | None:
     return None
 
 
-def _statement_name(names: list, src: str) -> str:
+def _statement_name(names: list, src: str, instance: str = "") -> str:
     """Name of a case statement from the signals it assigns (sorted; past
-    four, the first three and a count)."""
+    four, the first three and a count).  One that assigns no named signal
+    is named after its source line, in its instance."""
     if not names:
-        return os.path.basename(src)
+        return f"{instance}.{os.path.basename(src)}" if instance else os.path.basename(src)
     if len(names) <= 4:
         return ",".join(names)
     return ",".join(names[:3]) + f",+{len(names) - 3}"
@@ -534,13 +535,15 @@ class _Part:
 class _Statement:
     target: str                   # the check id's target
     src: str
+    instance: str                 # hierarchy path of the instance it is in ('' at the top)
     parts: list                   # [_Part]
 
 
 def _case_statements(nl: Netlist) -> list:
     """The parallel_case statements of the netlist, unnamed: their $pmux
-    cells grouped by source location."""
-    stmts = {}                                           # src attribute -> [_Part]
+    cells grouped by source location and instance (after flatten, every
+    instance of a module has the same `src`)."""
+    stmts = {}                                           # (src attribute, instance) -> [_Part]
     for cell, c in nl.cells.items():
         if c["type"] != "$pmux":
             continue
@@ -556,9 +559,9 @@ def _case_statements(nl: Netlist) -> list:
             continue   # the case result is never used (constant-disabled logic)
         src = nl.cell_src(cell)
         name = _dest_name(nl, dest, y, src)
-        stmts.setdefault(attrs.get("src") or cell, []).append(
+        stmts.setdefault((attrs.get("src") or cell, nl.instance(cell)), []).append(
             _Part(cell, conds, None if name == os.path.basename(src) else name))
-    return [_Statement("", nl.cell_src(parts[0].cell), parts) for parts in stmts.values()]
+    return [_Statement("", nl.cell_src(parts[0].cell), inst, parts) for (_, inst), parts in stmts.items()]
 
 
 def _name_statements(nl: Netlist, stmts: list):
@@ -566,7 +569,7 @@ def _name_statements(nl: Netlist, stmts: list):
     would share a name are told apart by the FSM state they sit in, then by
     number in source order."""
     for st in stmts:
-        st.target = _statement_name(sorted({p.signal for p in st.parts if p.signal}), st.src)
+        st.target = _statement_name(sorted({p.signal for p in st.parts if p.signal}), st.src, st.instance)
     by_name = {}
     for st in stmts:
         by_name.setdefault(st.target, []).append(st)
@@ -583,7 +586,7 @@ def _name_statements(nl: Netlist, stmts: list):
     for st in stmts:
         by_name.setdefault(st.target, []).append(st)
     for group in by_name.values():
-        for n, st in enumerate(sorted(group, key=lambda st: src_key(st.src))):
+        for n, st in enumerate(sorted(group, key=lambda st: (src_key(st.src), st.instance))):
             if n:
                 st.target = f"{st.target}#{n}"
 
@@ -632,7 +635,7 @@ def detect_case(nl: Netlist):
     stmts = _case_statements(nl)
     _name_statements(nl, stmts)
     checks = []
-    for st in sorted(stmts, key=lambda st: src_key(st.src)):
+    for st in sorted(stmts, key=lambda st: (src_key(st.src), st.instance)):
         for kind in ("parallel_case", "full_case"):
             checks += _statement_checks(nl, st, kind)
     return checks

@@ -453,3 +453,11 @@ top = "guard_names"
 expect = { "parallel_case:a,b@st=2'b00" = "FAIL", "parallel_case:a,b@st=2'b01" = "FAIL", "fsm_summary:st" = "INFO" }
 strict = true
 tags = ["case", "fsm", "review"]
+
+[[case]]
+name = "review/two_instances"
+files = ["../fixtures/review.sv"]
+top = "two_lanes"
+expect = { "parallel_case:u_a.gnt" = "FAIL", "parallel_case:u_b.gnt" = "PROVEN" }
+strict = true
+tags = ["case", "hierarchy", "review"]

@@ -250,6 +250,28 @@ class Naming(unittest.TestCase):
         self.assertIsNone(self.nl.net_attr([12345], "src"))
         self.assertEqual(self.nl.net_src(self.v), "d.v:4")
 
+    def test_instance_of_a_flattened_cell(self):
+        b = NB()
+        cells = {
+            "$procmux$3": ({}, ""),                                              # top module
+            "top_reg": ({}, ""),
+            "$flatten\\u_a.$procmux$8": ({}, "u_a"),                           # as Yosys 0.71 names them
+            "$flatten\\p0.\\u_a.$procmux$2": ({}, "p0.u_a"),                    # nested: escaped again
+            "$flatten\\u_a.$auto$proc_rom.cc:155$3": ({}, "u_a"),              # dots in the cell's own name
+            "$flatten\\gen[0].u$1.$procmux$4": ({}, "gen[0].u$1"),
+            "$flatten\\u_a.odd": ({}, "u_a"),
+            "u_b.named": ({}, "u_b"),                                            # public, no hdlname
+            "u_c.named": ({"hdlname": "p1 u_c named"}, "p1.u_c"),
+            "x": ({"hdlname": "x"}, ""),
+            "$y": ({"hdlname": " "}, ""),
+        }
+        for name, (attrs, _) in cells.items():
+            b.cell(name, "$and", {"A": b.new(), "B": b.new(), "Y": b.new()}, attrs=attrs)
+        nl = b.build()
+        for name, (_, want) in cells.items():
+            with self.subTest(name=name):
+                self.assertEqual(nl.instance(name), want)
+
 
 class Structure(unittest.TestCase):
     def test_whole_driver(self):

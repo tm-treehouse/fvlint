@@ -66,7 +66,9 @@ destination signal, e.g. `parallel_case:u_arb.gnt` or
 `counter_overflow:u_fifo.count`. Waivers therefore survive edits elsewhere in
 the file. A case statement is one check, named after the signals it assigns
 (`parallel_case:alu_wait,alu_wait_2,cpu_state,mem_do_rinst`, with the first
-three and a count past four). Statements that would share a name get the FSM
+three and a count past four). Each instance of a module has its own
+checks, named after that instance's signals (`parallel_case:u_a.gnt`,
+`parallel_case:u_b.gnt`). Statements that would share a name get the FSM
 state they sit in (`@cpu_state=8'b00010000`), then a number in source
 order (`#1`). Behind one check, the property is proven for each signal the
 statement assigns (Yosys builds one multiplexer per signal); the result

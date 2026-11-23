@@ -1080,6 +1080,37 @@ class CaseStatementNames(unittest.TestCase):
         (c,) = detect_case(b.build())
         self.assertEqual(c.id, "parallel_case:c.v:7")
 
+    def test_instances_of_one_module_are_separate_statements(self):
+        # After flatten every instance's $pmux has the same src; the cell
+        # names (as flatten writes them) tell the instances apart.
+        b = NB()
+        for inst in ("u_a", "u_b"):
+            sel = b.input(f"{inst}_req", 2)
+            for n, sig in enumerate(("gnt", "busy")):
+                y = b.pmux(b.input(f"{inst}_{sig}_d"), [b.input(f"{inst}_{sig}_{i}") for i in range(2)], sel,
+                           name=f"$flatten\\{inst}.$procmux${8 + n}",
+                           attrs={"parallel_case": PAR, "src": "lane.v:7.29-7.29|lane.v:6.7-9.14"})
+                b.ff(y, b.input(f"{inst}_clk_{sig}")[0], q=b.net(f"{inst}.{sig}", b.new(1)))
+            y = b.pmux(b.input(f"{inst}_x_d"), [b.input(f"{inst}_x_{i}") for i in range(2)], sel,
+                       name=f"$flatten\\{inst}.$procmux$20", attrs={"parallel_case": PAR, "src": "lane.v:12.1-12.2"})
+        got = sorted({(c.group or c.id, c.part) for c in detect_case(b.build())})
+        self.assertEqual(got, [("parallel_case:u_a.busy,u_a.gnt", "u_a.busy"),
+                               ("parallel_case:u_a.busy,u_a.gnt", "u_a.gnt"),
+                               ("parallel_case:u_a.lane.v:12", "$flatten\\u_a.$procmux$20"),   # no destination
+                               ("parallel_case:u_b.busy,u_b.gnt", "u_b.busy"),
+                               ("parallel_case:u_b.busy,u_b.gnt", "u_b.gnt"),
+                               ("parallel_case:u_b.lane.v:12", "$flatten\\u_b.$procmux$20")])
+
+    def test_one_instance_per_statement(self):
+        b = NB()
+        for inst in ("u_b", "u_a"):
+            y = b.pmux(b.input(f"{inst}_d"), [b.input(f"{inst}_{i}") for i in range(2)], b.input(f"{inst}_s", 2),
+                       name=f"$flatten\\{inst}.$procmux$8", attrs={"parallel_case": PAR, "src": "lane.v:7.1-7.2"})
+            b.ff(y, b.input(f"{inst}_clk")[0], q=b.net(f"{inst}.gnt", b.new(1)))
+        checks = detect_case(b.build())
+        self.assertEqual([c.id for c in checks], ["parallel_case:u_a.gnt", "parallel_case:u_b.gnt"])
+        self.assertEqual([c.group for c in checks], [None, None])
+
 
 class PartSelects(unittest.TestCase):
     def build(self, aw, yw, bw, signed=0, const_b=False, dead=False):

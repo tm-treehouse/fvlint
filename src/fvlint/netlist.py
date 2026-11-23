@@ -235,6 +235,24 @@ class Netlist:
     def cell_src(self, cell: str) -> str:
         return self.src(self.attrs(cell).get("src"))
 
+    def instance(self, cell: str) -> str:
+        """The hierarchy path of the instance a flattened cell came from
+        ('u_a', 'p0.u_a'), '' for a cell of the top module.  flatten keeps
+        `hdlname` ("p0 u_a name") on cells with a public name and names the
+        others `$flatten\\p0.\\u_a.$procmux$7`; all instances of a module share
+        the cell's `src`, so this is what tells them apart."""
+        hdl = self.attrs(cell).get("hdlname")
+        if isinstance(hdl, str) and hdl.split():
+            return ".".join(hdl.split()[:-1])
+        if cell.startswith("$flatten\\"):
+            rest = cell[len("$flatten\\"):]
+            path, sep, _ = rest.partition(".$")
+            path = path if sep else rest.rpartition(".")[0]
+            return path.replace(".\\", ".").lstrip("\\")
+        if not cell.startswith("$") and "." in cell:
+            return cell.rsplit(".", 1)[0]
+        return ""
+
     def is_stateful(self, cell: str) -> bool:
         return self._kind[cell] == "state"
 

@@ -128,3 +128,22 @@ module guard_names (input clk, input rst, input go, input [1:0] sel, output reg 
         end
       endcase
 endmodule
+
+// One module instantiated twice: each instance's case statement is a check of
+// its own, named after that instance's signal.  u_b's selects are one-hot by
+// construction, so only u_a's statement fails.
+module lane_pc (input [1:0] req, output reg [1:0] gnt);
+  always @* begin
+    gnt = 2'd0;
+    (* parallel_case *)
+    case (1'b1)
+      req[0]: gnt = 2'd1;
+      req[1]: gnt = 2'd2;
+    endcase
+  end
+endmodule
+
+module two_lanes (input [1:0] r, input t, output [1:0] ga, output [1:0] gb);
+  lane_pc u_a (.req(r), .gnt(ga));
+  lane_pc u_b (.req({t, ~t}), .gnt(gb));
+endmodule
