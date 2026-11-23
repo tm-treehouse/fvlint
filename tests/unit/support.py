@@ -138,7 +138,7 @@ class TempDirCase(unittest.TestCase):
 
     def setUp(self):
         super().setUp()
-        self.tmp = tempfile.mkdtemp(prefix="fvlint_unit_")
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="fvlint_unit_"))   # macOS: /var is a link to /private/var
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def write(self, rel: str, text: str) -> str:

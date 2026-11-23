@@ -206,12 +206,13 @@ def parse_job(d: str, outdir: str, rc: int, engine: str, mode: str, names) -> Jo
 
 
 def _complete_summary(wd: str, log: str, status: str) -> str:
-    """The log's summary lists at most a few traces ("and 3 further traces,
-    see run/FAIL for a complete summary").  Return the rest from that file,
-    as summary lines with log-style paths, so nothing is lost; a repeat of a
-    listed trace changes nothing."""
+    """The log's summary is cut short: at most five traces ("and 3 further
+    traces, see run/FAIL for a complete summary"), five properties per trace
+    ("  and 2 further assertions") and five steps per property.  Return the
+    full summary from that file, as summary lines with log-style paths, so
+    nothing is lost; a repeat of a listed trace changes nothing."""
     path = os.path.join(wd, status)
-    if not re.search(r"summary: and \d+ further traces?", log) or not os.path.isfile(path):
+    if not re.search(r"summary:\s+and \d+ further ", log) or not os.path.isfile(path):
         return ""
     base = os.path.basename(wd)
     out = []
@@ -254,7 +255,7 @@ def _parse_pdr(wd: str, log: str, res: JobResult, rel):
                 path = os.path.join(os.path.dirname(wd), trace)
                 res.props[k] = PropResult("fail", trace=rel(os.path.relpath(path, wd)),
                                           step=int(sm.group(2) or 0), phase="basecase")
-            trace = None
+            # Several assertions can fail in one trace: keep it for the next line.
     # A failure ABC reported but whose trace could not be produced.
     for m in _PDR_FAILED_RE.finditer(log):
         i = int(m.group(1))

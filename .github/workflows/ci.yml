@@ -48,8 +48,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with: {python-version: "3.12"}
-      # Pinned to a build from just after the Yosys 0.71 release (2026-11-12),
-      # the version fvlint is tested with; move it together with TESTED_YOSYS.
+      # Pinned to the build of 2026-11-14: Yosys 0.71+34, a development build
+      # from just after the 0.71 release (2026-11-12), which fvlint is tested
+      # with (its netlists differ slightly from the 0.71 release, so the snapshot
+      # check below only warns).  Move it together with TESTED_YOSYS and the
+      # default in action.yml.
       - uses: YosysHQ/setup-oss-cad-suite@v4
         with:
           version: "2026-11-14"

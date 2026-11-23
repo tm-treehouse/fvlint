@@ -116,14 +116,17 @@ def read_commands(src: Sources, top: str, frontend: str, tools: Toolchain, path)
 HDL_EXT = {".v", ".sv", ".vh", ".svh", ".vinc", ".inc", ".h", ".pkg", ".sva", ".svi"}
 
 
-def _stage(src: Sources, assume_file, edir: str):
-    """Copy the inputs under edir/src, mirroring their layout relative to the
-    deepest common directory.  Used with the WebAssembly Yosys build, which
-    only resolves plain relative paths below its working directory."""
+def _stage(src: Sources, assume_file, edir: str, transform=None, subdir: str = "src"):
+    """Copy the inputs under edir/<subdir>, mirroring their layout relative
+    to the deepest common directory.  Used with the WebAssembly Yosys build,
+    which only resolves plain relative paths below its working directory,
+    and, with `transform` (source text -> source text), for the elaboration
+    without full_case pragmas; then the HDL files next to each source are
+    copied too, so that relative `include`s find their (transformed) files."""
     paths = src.files + src.libs + ([assume_file] if assume_file else [])
     dirs = [os.path.dirname(os.path.abspath(p)) for p in paths] + [os.path.abspath(d) for d in src.incdirs]
     orig_root = os.path.commonpath(dirs)
-    stage_root = os.path.join(edir, "src")
+    stage_root = os.path.join(edir, subdir)
     if os.path.isdir(stage_root):
         shutil.rmtree(stage_root)
 
@@ -131,15 +134,27 @@ def _stage(src: Sources, assume_file, edir: str):
         rel = os.path.relpath(os.path.abspath(p), orig_root)
         dst = os.path.join(stage_root, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(p, dst)
+        if transform is None:
+            shutil.copy2(p, dst)
+        else:
+            with open(p, encoding="utf-8", errors="surrogateescape") as f:
+                text = transform(f.read())
+            with open(dst, "w", encoding="utf-8", errors="surrogateescape") as f:
+                f.write(text)
         return dst
 
-    for d in src.incdirs:
+    def put_dir(d, recursive):
         for dp, dns, fns in os.walk(d):
-            dns[:] = [x for x in dns if not x.startswith(".")]
+            dns[:] = [x for x in dns if not x.startswith(".")] if recursive else []
             for fn in fns:
                 if os.path.splitext(fn)[1].lower() in HDL_EXT:
                     put(os.path.join(dp, fn))
+
+    for d in src.incdirs:
+        put_dir(d, True)
+    if transform is not None:
+        for d in {os.path.dirname(os.path.abspath(p)) for p in src.files + src.libs}:
+            put_dir(d, False)
     staged = Sources(files=[put(f) for f in src.files], libs=[put(f) for f in src.libs],
                      incdirs=[os.path.join(stage_root, os.path.relpath(os.path.abspath(d), orig_root))
                               for d in src.incdirs],
@@ -244,3 +259,40 @@ def elaborate(src: Sources, top: str, frontend: str, tools: Toolchain, outdir: s
     return {"main": main, "fsm": fsm_json if os.path.exists(fsm_json) else None,
             "fsm_warning": fsm_warning, "src_base": edir, "src_map": src_map,
             "assume_ports": assume_ports, "assume_file": assume_file}
+
+
+# Spellings of a full_case pragma, rewritten without changing line numbers:
+# the attribute or `synopsys` comment word (same length), `unique case`
+# (full and parallel) -> `unique0 case` (parallel only), `priority case`
+# (full) -> `case`.
+_FULL_CASE_WORD = re.compile(r"\bfull_case\b")
+_UNIQUE_CASE = re.compile(r"\bunique(\s+case[zx]?)\b")
+_PRIORITY_CASE = re.compile(r"\bpriority(\s+case[zx]?)\b")
+
+
+def without_full_case(text: str) -> str:
+    """Source text with every full_case pragma neutralised."""
+    text = _FULL_CASE_WORD.sub("fvlint_fc", text)
+    text = _UNIQUE_CASE.sub(r"unique0\1", text)
+    return _PRIORITY_CASE.sub(lambda m: " " * len("priority") + m.group(1), text)
+
+
+def elaborate_without_full_case(src: Sources, top: str, frontend: str, tools: Toolchain,
+                                outdir: str) -> tuple[str, str, tuple] | None:
+    """Elaborate the design once more with its full_case pragmas removed, for
+    telling harmless pragmas apart (see detect.harmless_full_case): Yosys'
+    frontend replaces the value a blocking assignment gave a signal before a
+    full_case statement with 'x, so the main netlist can't show it.  Returns (netlist JSON,
+    Yosys directory, (staged root, original root)), or None if Yosys
+    failed."""
+    edir = os.path.join(outdir, "elab_nofc")
+    os.makedirs(edir, exist_ok=True)
+    out = os.path.join(edir, "nofc.json")
+    if os.path.exists(out):
+        os.remove(out)
+    staged, _, src_map = _stage(src, None, edir, transform=without_full_case)
+    path = (lambda p: _rel(p, edir)) if tools.is_yowasp else os.path.abspath
+    script = (read_commands(staged, top, frontend, tools, path) +
+              "proc -noopt\nflatten\nmemory_collect\nopt_clean\nwrite_json nofc.json\n")
+    tools.run_yosys(script, edir, "nofc", allow_fail=True)
+    return (out, edir, src_map) if os.path.exists(out) else None

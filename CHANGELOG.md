@@ -5,6 +5,79 @@ SPDX-License-Identifier: ISC
 
 # Changelog
 
+## Unreleased
+
+Fewer findings that need a waiver, and the integration work a project had
+to do by hand, both from the PicoRV32 integration example: 12 of its 15
+findings on the default configuration were patterns fvlint can settle
+itself.
+
+### Fewer false or redundant findings
+
+* **Parameter-disabled logic behind an expression.** `if (ENABLE_IRQ &&
+  timer) timer <= timer - 1` with the parameter at 0 is a `$logic_and` with
+  a constant input (elaboration runs no `opt_expr`), not a constant select,
+  so fvlint checked the decrement (twice) and reported it `VACUOUS`. Path
+  conditions are now evaluated through constant logic.
+* **Checks in an unreachable FSM state** are `INFO` ("dead logic: applies
+  only in state cpu_state=8'b00010000, which is unreachable"), pointing at
+  the `fsm_unreachable` finding, instead of being proved `VACUOUS` one by
+  one.
+* **`full_case` on a signal first set to `'x`** is `INFO`: simulation and
+  synthesis agree. Yosys' frontend replaces the value a blocking assignment
+  gave the signal before a full_case statement with `'x`, so fvlint elaborates the design once more with its
+  pragmas neutralised (attribute, `synopsys` comment, `unique`, `priority`)
+  to see it. Before, both this harmless style and the real hazard were
+  reported alike.
+* **Counters that can't wrap within `--horizon`** (default 2^60 cycles) are
+  `INFO`: a counter that only resets or loads constants and steps by
+  constants needs at least its distance to the end divided by its step. A
+  counter that ends `UNKNOWN` says how many cycles a wrap needs.
+* **Path conditions through fan-out.** Where a value fans out into several
+  mux trees (nested if/else inside a case item), every branch is followed
+  and the conditions all of them need are kept; before, the walk stopped
+  there, with fewer conditions and no destination name.
+
+### Check ids and case statements
+
+* **One check per case statement**, named after the signals it assigns
+  (`parallel_case:alu_wait,alu_wait_2,cpu_state,mem_do_rinst`), with the FSM
+  state it sits in where two would share a name (`@cpu_state=8'b00010000`).
+  The property is still proven for each signal; the result names the one
+  that failed. PicoRV32's 53 per-signal checks become 20.
+* **Names instead of line numbers**: a case result that reaches its register
+  through fan-out, or through Yosys' intermediate nets (`$0\cpu_state`,
+  `$0$memwr$\cpuregs`), is named after that register; the `file:line`
+  fallback, which broke waivers when lines moved, is now rare.
+
+### Ease of use
+
+* **Project files**: `fvlint --config fvlint.toml [NAME...]` runs several
+  configurations (tops, parameters, assumptions, waivers) into OUT/NAME and
+  exits with the worst status.
+* **CI**: `--summary-md FILE` (Markdown summary) and `--github` (annotations
+  on the source lines, and the summary in `$GITHUB_STEP_SUMMARY`), and a
+  GitHub Action (`uses: tm-treehouse/fvlint@...`) that installs the OSS CAD
+  Suite and fvlint, runs a project file and uploads the results.
+* **Waivers**: lines that match no check are reported (stale after a rename
+  or a fix), and `--recheck-waived` proves waived checks and names the
+  waivers no longer needed. A waiver on a case statement's id covers it.
+* Paths up to two directories above the current one are shown relative, and
+  a current directory reached through a symbolic link (macOS's `/tmp`) no
+  longer makes every path absolute.
+
+### Result parsing
+
+* SymbiYosys's log summary also stops after five properties per trace
+  ("and 2 further assertions"); those are now read from the status file
+  too. When several assertions failed in one PDR trace, only the first got
+  its trace and step.
+
+### Tests
+
+* The unit tests pass on macOS (temporary directories through `/private`).
+* Regression fixtures for each pattern above (`tests/fixtures/review.sv`).
+
 ## 0.3.2
 
 Fixes for false findings and a lost FSM pass, found by running fvlint on

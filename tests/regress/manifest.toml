@@ -379,3 +379,77 @@ args = ["--checks", "counter_overflow"]
 expect = { "counter_overflow:c0" = "PROVEN", "counter_overflow:c199" = "PROVEN" }
 budget_s = 240
 tags = ["perf"]
+
+# ------------------------------------------- patterns found on PicoRV32
+[[case]]
+name = "review/dead_state"
+files = ["../fixtures/review.sv"]
+top = "dead_state"
+expect = { "fsm_unreachable:st=2'b10" = "FAIL", "parallel_case:a,b" = "INFO", "fsm_summary:st" = "INFO" }
+expect_detail = { "parallel_case:a,b" = "applies only in state st=2'b10, which is unreachable" }
+strict = true
+tags = ["fsm", "case", "review"]
+
+[[case]]
+name = "review/param_timer_off"
+files = ["../fixtures/review.sv"]
+top = "param_timer"
+expect = {}
+strict = true
+exit = 0
+tags = ["counter", "params", "review"]
+
+[[case]]
+name = "review/param_timer_on"
+files = ["../fixtures/review.sv"]
+top = "param_timer"
+args = ["-P", "EN=1"]
+expect = { "counter_underflow:q" = "PROVEN" }      # t drives the port q: named after the port
+strict = true
+tags = ["counter", "params", "review"]
+
+[[case]]
+name = "review/fc_mixed"
+files = ["../fixtures/review.sv"]
+top = "fc_mixed"
+expect = { "full_case:y,z" = "FAIL", "parallel_case:y,z" = "FAIL" }
+expect_detail = { "full_case:y,z" = "(for z; checked for each signal it assigns" }
+strict = true
+tags = ["case", "review"]
+
+[[case]]
+name = "review/fc_unique_x"
+files = ["../fixtures/review.sv"]
+top = "fc_unique_x"
+expect = { "parallel_case:y" = "FAIL", "full_case:y" = "INFO" }
+expect_detail = { "full_case:y" = "the full_case pragma changes nothing" }
+strict = true
+tags = ["case", "review"]
+
+[[case]]
+name = "review/wide_count"
+files = ["../fixtures/review.sv"]
+top = "wide_count"
+expect = { "counter_overflow:c" = "INFO" }
+expect_detail = { "counter_overflow:c" = "can't wrap in fewer than 2^64 cycles, beyond the --horizon of 2^60" }
+strict = true
+exit = 0
+tags = ["counter", "review"]
+
+[[case]]
+name = "review/uart_count"
+files = ["../fixtures/review.sv"]
+top = "uart_count"
+args = ["--horizon", "2^32"]
+expect = { "counter_overflow:cnt" = "INFO" }
+strict = true
+exit = 0
+tags = ["counter", "review"]
+
+[[case]]
+name = "review/guard_names"
+files = ["../fixtures/review.sv"]
+top = "guard_names"
+expect = { "parallel_case:a,b@st=2'b00" = "FAIL", "parallel_case:a,b@st=2'b01" = "FAIL", "fsm_summary:st" = "INFO" }
+strict = true
+tags = ["case", "fsm", "review"]

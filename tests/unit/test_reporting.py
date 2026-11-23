@@ -5,13 +5,14 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 import xml.etree.ElementTree as ET
 
 from fvlint.checks import ERROR, FAIL, INFO, PROVEN, SEVERITY, UNKNOWN, VACUOUS, WAIVED, WARN, Check, Result
 from fvlint import report
-from fvlint.checks import src_key
-from fvlint.report import console, write_json, write_junit
+from fvlint.checks import merge_parts, src_key
+from fvlint.report import _gh_location, console, github_annotations, markdown, write_json, write_junit
 from fvlint.waivers import Waivers, _glob_match
 
 from .support import TempDirCase
@@ -66,8 +67,8 @@ class WaiverRules(TempDirCase):
         p = self.write("w.txt", "# header comment\n\ncounter_overflow:u_timer.*   # wrap is intended\n"
                                 "fsm_trap:*\n   parallel_case:gnt#2  #  \n#tight\nk:t\t#tab\n")
         w = Waivers.load(p)
-        self.assertEqual(w.rules, [("counter_overflow:u_timer.*", "wrap is intended"), ("fsm_trap:*", "waived"),
-                                   ("parallel_case:gnt#2", "waived"), ("k:t", "tab")])
+        self.assertEqual(w.rules, [("counter_overflow:u_timer.*", "wrap is intended", 3), ("fsm_trap:*", "waived", 4),
+                                   ("parallel_case:gnt#2", "waived", 5), ("k:t", "tab", 7)])
         self.assertEqual(Waivers.load(None).rules, [])
 
     def test_reported_ids_waive_themselves(self):
@@ -84,7 +85,7 @@ class WaiverRules(TempDirCase):
 
     def test_globs_are_case_sensitive_and_anchored(self):
         w = Waivers()
-        w.rules = [("counter_overflow:u_timer.*", "r")]
+        w.rules = [("counter_overflow:u_timer.*", "r", 1)]
         self.assertEqual(w.match(Check("counter_overflow", "u_timer.ticks", "", "")),
                          "waiver file: counter_overflow:u_timer.* (r)")
         for kind, target in (("counter_overflow", "U_TIMER.ticks"), ("counter_overflow", "x.u_timer.q"),
@@ -109,8 +110,24 @@ class WaiverRules(TempDirCase):
 
     def test_file_rule_reported_before_attribute(self):
         w = Waivers()
-        w.rules = [("k:*", "file")]
+        w.rules = [("k:*", "file", 1)]
         self.assertTrue(w.match(Check("k", "t", "", "", waive_attr="k")).startswith("waiver file"))
+
+
+class UnusedWaivers(TempDirCase):
+    def test_unused(self):
+        p = self.write("w.txt", "counter_overflow:a   # used\n"
+                                "counter_overflow:*   # also matches a: used too\n"
+                                "parallel_case:gnt#2  # renamed since\n"
+                                "fsm_trap:*           # kind not run\n"
+                                "*:old                # any kind\n"
+                                "parallel_case:a,b    # a statement, by its id\n")
+        w = Waivers.load(p)
+        w.match(Check("counter_overflow", "a", "", ""))
+        w.match(Check("parallel_case", "a,b~0", "", "", group="parallel_case:a,b"))
+        self.assertEqual(w.unused(), [(3, "parallel_case:gnt#2"), (4, "fsm_trap:*"), (5, "*:old")])
+        self.assertEqual(w.unused({"counter_overflow", "parallel_case"}), [(3, "parallel_case:gnt#2"), (5, "*:old")])
+        self.assertEqual(Waivers.load(None).unused(), [])
 
 
 class Reports(TempDirCase):
@@ -191,6 +208,90 @@ class Reports(TempDirCase):
         self.assertEqual(cases["counter_overflow:a"].find("system-out").text, "PROVEN: b.v:9: counter_overflow holds: ")
         self.assertEqual(cases["counter_overflow:a"].get("classname"), "counter_overflow")
 
+
+
+
+class MergeParts(unittest.TestCase):
+    """merge_parts: one result per case statement from its per-signal parts."""
+
+    @staticmethod
+    def part(group, part, status, detail="d", **kw):
+        kind, _, target = group.partition(":")
+        c = Check(kind=kind, target=f"{target}~{part}", src="c.v:9", desc="p", group=group, part=part)
+        return Result(check=c, status=status, detail=detail, **kw)
+
+    def merged(self, *statuses, details=None):
+        parts = [self.part("parallel_case:a,b", f"s{i}", st, (details or {}).get(i, "d"))
+                 for i, st in enumerate(statuses)]
+        (r,) = merge_parts(parts)
+        return r
+
+    def test_status(self):
+        cases = [((PROVEN, FAIL, VACUOUS), FAIL), ((PROVEN, ERROR), ERROR), ((PROVEN, UNKNOWN), UNKNOWN),
+                 ((PROVEN, VACUOUS), PROVEN), ((VACUOUS, VACUOUS), VACUOUS), ((INFO, VACUOUS), VACUOUS),
+                 ((INFO, INFO), INFO), ((INFO, PROVEN), PROVEN), ((WAIVED, WAIVED), WAIVED)]
+        for statuses, want in cases:
+            with self.subTest(statuses=statuses):
+                self.assertEqual(self.merged(*statuses).status, want)
+
+    def test_the_deciding_part_is_reported(self):
+        parts = [self.part("parallel_case:a,b", "a", PROVEN, "proven by PDR"),
+                 self.part("parallel_case:a,b", "b", FAIL, "counterexample at step 3", trace="t.vcd", step=3,
+                           refinements=1, seconds=1.5)]
+        (r,) = merge_parts(parts)
+        self.assertEqual((r.check.id, r.check.kind, r.check.target, r.check.group), ("parallel_case:a,b",
+                                                                                   "parallel_case", "a,b", None))
+        self.assertEqual((r.trace, r.step, r.refinements, r.seconds), ("t.vcd", 3, 1, 1.5))
+        self.assertEqual(r.detail, "counterexample at step 3 (for b; checked for each signal it assigns: a, b)")
+
+    def test_detail_of_agreeing_parts(self):
+        self.assertEqual(self.merged(INFO, INFO).detail, "d")              # dead: the same reason for every part
+        self.assertEqual(self.merged(VACUOUS, VACUOUS, details={1: "e"}).detail,
+                         "d (for s0; checked for each signal it assigns: s0, s1)")
+
+    def test_order_and_other_results(self):
+        lone = Result(check=Check(kind="mem_addr", target="m.wr0", src="m.v:1", desc="x"), status=PROVEN)
+        parts = [self.part("parallel_case:a,b", "a", PROVEN), lone, self.part("parallel_case:a,b", "b", PROVEN),
+                 self.part("full_case:a,b", "a", FAIL)]
+        self.assertEqual([r.check.id for r in merge_parts(parts)],
+                         ["parallel_case:a,b", "mem_addr:m.wr0", "full_case:a,b"])
+        self.assertEqual(merge_parts([]), [])
+
+
+class CiFormats(TempDirCase):
+    def test_markdown(self):
+        rs = [res("counter_overflow", "a|b", FAIL, src="r.v:3", detail="line1\nline2"),
+              res("mem_addr", "m.wr0", PROVEN, src="r.v:9")]
+        text = markdown(rs, {"elapsed_s": 1.5}, "top", [(4, "x:y")], "w.txt")
+        self.assertEqual(text, "### fvlint: top\n\n1 fail, 1 proven in 1.5 s\n\n"
+                               "| Status | Check | Location | Detail |\n|---|---|---|---|\n"
+                               "| FAIL | `counter_overflow:a\\|b` | r.v:3 | line1 line2 |\n\n"
+                               "Waivers in `w.txt` that match no check:\n\n- line 4: `x:y`\n\n")
+        self.assertEqual(markdown([], {}, "t"), "### fvlint: t\n\nno checks in ? s\n\n")
+
+    def test_annotations(self):
+        os.makedirs(os.path.join(self.tmp, "rtl"))
+        rtl = os.path.join(self.tmp, "rtl", "a.v")
+        rs = [res("counter_overflow", "q", FAIL, src=f"{rtl}:7", detail="50%\ndone"),
+              res("index_range", "x", UNKNOWN, src="?"), res("fsm_trap", "s", WARN, src=f"{rtl}:2"),
+              res("mem_addr", "m", PROVEN, src=f"{rtl}:1"), res("parallel_case", "p", VACUOUS, src="/elsewhere/b.v:3")]
+        got = github_annotations(rs, self.tmp, [(3, "k:t")], os.path.join(self.tmp, "w.txt"), ["mem_addr:m"])
+        self.assertEqual(got, [
+            "::error title=fvlint FAIL%3A counter_overflow%3Aq,file=rtl/a.v,line=7::counter_overflow holds: "
+            "50%25%0Adone",
+            "::error title=fvlint VACUOUS%3A parallel_case%3Ap::parallel_case holds: ",
+            "::warning title=fvlint UNKNOWN%3A index_range%3Ax::index_range holds: ",
+            "::warning title=fvlint WARN%3A fsm_trap%3As,file=rtl/a.v,line=2::fsm_trap holds: ",
+            "::warning title=fvlint%3A unused waiver,file=w.txt,line=3::k:t matches no check (renamed, fixed or no "
+            "longer present?)",
+            "::notice title=fvlint%3A waiver no longer needed::mem_addr:m passes now; its waiver can go"])
+        self.assertEqual(_gh_location("a,b.v:3", self.tmp), "")         # outside the checkout
+        self.assertEqual(_gh_location(os.path.join(self.tmp, "x.v:y"), self.tmp), "")     # no line number
+        self.assertEqual(_gh_location(":4", self.tmp), "")
+        odd = os.path.join(self.tmp, "a,b:c.v")
+        self.assertEqual(_gh_location(f"{odd}:4", self.tmp), ",file=a%2Cb%3Ac.v,line=4")
+        (err,) = github_annotations([res("mem_addr", "m", ERROR, src="?", detail="a\rb")], self.tmp)
+        self.assertEqual(err, "::error title=fvlint ERROR%3A mem_addr%3Am::mem_addr holds: a%0Db")
 
 if __name__ == "__main__":
     unittest.main()

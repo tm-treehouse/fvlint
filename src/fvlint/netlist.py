@@ -95,9 +95,27 @@ def src_short(src: str | None, base: str | None = None, src_map=None) -> str:
 
 
 def display_path(p: str) -> str:
-    """Relative to the CWD when below it, absolute otherwise."""
-    r = os.path.relpath(p)
-    return p if r.startswith("..") else r
+    """Relative to the CWD when below it or at most two levels up from it,
+    absolute otherwise.  Symbolic links are resolved for the comparison only,
+    so a CWD reached through a link (macOS's /tmp, /var) still gives short
+    paths."""
+    cwd = os.getcwd()
+    best = None
+    for path, base in ((p, cwd), (os.path.realpath(p), os.path.realpath(cwd))):
+        try:
+            r = os.path.relpath(path, base)
+        except ValueError:                      # another drive (Windows)
+            continue
+        if best is None or r.count("..") < best.count(".."):
+            best = r
+    if best is None:
+        return p
+    ups = 0
+    for part in best.split(os.sep):
+        if part != "..":
+            break
+        ups += 1
+    return best if ups <= 2 else os.path.abspath(p)
 
 
 @dataclass(frozen=True)

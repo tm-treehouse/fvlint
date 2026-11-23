@@ -80,8 +80,24 @@ class SourceLocations(TempDirCase):
     def test_display_path(self):
         self.chdir(self.tmp)
         self.assertEqual(display_path(os.path.join(self.tmp, "a", "b.v")), os.path.join("a", "b.v"))
-        outside = os.path.dirname(self.tmp)
-        self.assertEqual(display_path(outside), outside)                     # above the CWD: absolute
+        up = os.path.join(os.path.dirname(self.tmp), "x.v")
+        self.assertEqual(display_path(up), os.path.join("..", "x.v"))        # just above the CWD: relative
+        far = os.path.join(os.path.sep, "fvlint_far", "a", "b.v")
+        os.makedirs(os.path.join(self.tmp, "d1", "d2", "d3"))
+        self.chdir(os.path.join(self.tmp, "d1", "d2", "d3"))
+        self.assertEqual(display_path(far), far)                             # far away: absolute
+        self.assertEqual(display_path(os.path.join(self.tmp, "d1", "y.v")), os.path.join("..", "..", "y.v"))
+        self.assertEqual(display_path(os.path.join(self.tmp, "z.v")), os.path.abspath(os.path.join(self.tmp, "z.v")))
+
+    def test_display_path_through_a_symlink(self):
+        # The CWD reached through a link (macOS: /var -> /private/var): still relative.
+        real = os.path.join(self.tmp, "real")
+        os.makedirs(os.path.join(real, "src"))
+        link = os.path.join(self.tmp, "link")
+        os.symlink(real, link)
+        self.chdir(link)
+        self.assertEqual(display_path(os.path.join(real, "src", "a.v")), os.path.join("src", "a.v"))
+        self.assertEqual(display_path(os.path.join(link, "src", "a.v")), os.path.join("src", "a.v"))
 
 
 class Indexing(TempDirCase):

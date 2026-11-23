@@ -279,7 +279,9 @@ def _fmt_set(codes) -> str:
     return _fmt(codes[0]) if len(codes) == 1 else "{" + ", ".join(_fmt(c) for c in codes) + "}"
 
 
-def analyse_fsms(nl: Netlist, fsm_json: str, reset_names: dict | None = None):
+def analyse_fsms(nl: Netlist, fsm_json: str, reset_names: dict | None = None, reach_out: dict | None = None):
+    """FSM checks and lemmas.  With `reach_out`, also records for each FSM
+    the state register's bits -> (name, reachable state codes)."""
     checks, lemmas = [], {}
     q_to_ff = {}
     for cell, c in nl.cells.items():
@@ -333,6 +335,8 @@ def analyse_fsms(nl: Netlist, fsm_json: str, reset_names: dict | None = None):
                         if v is not None and v < (1 << width):
                             handled.add(format(v, f"0{width}b"))
 
+        if reach_out is not None and bits and width:
+            reach_out[tuple(bits)] = (sig, frozenset(reach))
         assigned = set(codes)
         for code in sorted((assigned | handled) - reach):
             why = ("assigned somewhere but no transition path from reset reaches it"
@@ -367,3 +371,53 @@ def analyse_fsms(nl: Netlist, fsm_json: str, reset_names: dict | None = None):
                 owner=ff, desc=f"{sig} holds a reachable state code", checker="fvl_member",
                 params={"W": len(bits), "N": len(vals), "SET": setv}, ports={"v": bits}))
     return checks, lemmas
+
+
+def _state_compare(nl: Netlist, bit, value: int, fsms: dict):
+    """(name, code, reachable codes) if the condition `bit == value` means
+    `state == code` for the state register of an FSM in `fsms`: an
+    $eq/$eqx that must hold, or a $ne/$nex that must not.  code is None for
+    a constant the register is too narrow to hold.  Otherwise None."""
+    d = nl.driver.get(bit)
+    if d is None or d.port != "Y" or d.offset != 0:
+        return None
+    t = nl.ctype(d.cell)
+    if not ((t in ("$eq", "$eqx") and value == 1) or (t in ("$ne", "$nex") and value == 0)):
+        return None
+    a, b = nl.conn(d.cell, "A"), nl.conn(d.cell, "B")
+    for x, y in ((a, b), (b, a)):
+        k = const_value(y)
+        if k is None:
+            continue
+        for bits, (sig, reach) in fsms.items():
+            n = len(bits)
+            if list(x[:n]) == list(bits) and all(v == "0" for v in x[n:]):
+                return sig, (format(k, f"0{n}b") if k < (1 << n) else None), reach
+    return None
+
+
+def dead_in_unreachable_states(nl: Netlist, checks: list, fsms: dict) -> int:
+    """Mark checks that apply only in an unreachable FSM state as INFO: one
+    of their path conditions is `state == code` for a code the FSM analysis
+    found unreachable (its fsm_unreachable result is the finding to look
+    at).  Their proofs would only come back VACUOUS.  Returns how many."""
+    n = 0
+    for c in checks:
+        if c.preset is not None:
+            continue
+        for bit, value in c.conds:
+            hit = _state_compare(nl, bit, value, fsms)
+            if hit is None:
+                continue
+            sig, code, reach = hit
+            if code is None:
+                why = f"applies only when {sig} equals a value wider than the register"
+            elif code not in reach:
+                why = (f"applies only in state {sig}={_fmt(code)}, which is unreachable "
+                       f"(see fsm_unreachable:{sig}={_fmt(code)})")
+            else:
+                continue
+            c.preset, c.detail = INFO, f"dead logic: {why}; not checked"
+            n += 1
+            break
+    return n

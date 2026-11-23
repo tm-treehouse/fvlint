@@ -7,9 +7,9 @@ from __future__ import annotations
 import unittest
 
 from fvlint.checks import INFO, Check
-from fvlint.detect import (MAX_PATHS, _compares, _dedupe, _dest_name, _fit, _operand_is, _signed_val,
-                           clean_conds, detect_all, detect_case, detect_counters, detect_index,
-                           detect_memory, forward, mux_sources)
+from fvlint.detect import (MAX_FORWARD, MAX_PATHS, _compares, _dedupe, _dest_name, _fit, _label, _operand_is,
+                           _signed_val, clean_conds, detect_all, detect_case, detect_counters, detect_index,
+                           detect_memory, fmt_cycles, forward, harmless_full_case, min_cycles_to_wrap, mux_sources)
 
 from .support import NB, const, load_snapshot
 
@@ -198,6 +198,93 @@ class Forward(unittest.TestCase):
         conds, dest = forward(b.build(), v)
         self.assertEqual((conds, dest), ([(s, 0)], y))                 # y has two readers
 
+    def test_fan_out_keeps_what_every_branch_needs(self):
+        # Inside a case item (st == 1), nested if/else write the value into the
+        # register along two paths that join again: both need st == 1.
+        b = NB()
+        clk, item, c1, c2 = b.input("clk")[0], b.input("item")[0], b.input("c1")[0], b.input("c2")[0]
+        v, o1, o2, hold = b.input("v", 2), b.input("o1", 2), b.input("o2", 2), b.input("hold", 2)
+        m1 = b.mux(v, o1, c1)                                            # v when !c1
+        m2 = b.mux(o2, v, c2)                                            # v when c2
+        inner = b.mux(m1, m2, b.input("pick")[0])
+        q = b.net("st_q", b.new(2))
+        b.ff(b.mux(hold, inner, item), clk, q=q)                        # the case item: item == 1
+        conds, dest = forward(b.build(), v)
+        self.assertEqual((conds, dest), ([(item, 1)], q))
+        # A branch into other logic uses the value with only what it needed so far.
+        b.op("$not", A=v)
+        conds, dest = forward(b.build(), v)
+        self.assertEqual((conds, dest), ([], v))
+
+    def test_fan_out_with_a_dead_branch(self):
+        b = NB()
+        v, s = b.input("v"), b.input("s")[0]
+        q = b.net("q", b.new(1))
+        b.ff(b.mux(b.input("o"), v, s), b.input("clk")[0], q=q)          # live: needs s
+        b.mux(b.input("o2"), v, "0")                                     # never selected
+        self.assertEqual(forward(b.build(), v), ([(s, 1)], q))
+        b2 = NB()
+        v = b2.input("v")
+        b2.mux(b2.input("o"), v, "0")
+        b2.mux(b2.input("o2"), v, "0")
+        self.assertEqual(forward(b2.build(), v), (None, v))              # every branch dead
+
+    def test_a_register_ends_the_walk(self):
+        # Into a register whose output feeds more muxes: the walk ends at its Q.
+        b = NB()
+        v, s, en = b.input("v"), b.input("s")[0], b.input("en")[0]
+        q = b.ff(v, b.input("clk")[0], en=en)
+        b.mux(b.input("o"), q, s)
+        self.assertEqual(forward(b.build(), v), ([(en, 1)], q))
+        # The same in branches: each ends at its register; their common condition stays.
+        b = NB()
+        v, en, s = b.input("v"), b.input("en")[0], b.input("s")[0]
+        q1 = b.ff(v, b.input("clk")[0], en=en)
+        q2 = b.ff(v, b.input("clk")[0], en=en)
+        for q in (q1, q2):
+            b.mux(b.input(f"o{q[0]}"), q, s)
+        self.assertEqual(forward(b.build(), v), ([(en, 1)], v))
+
+    def test_bits_into_different_muxes_fan_out(self):
+        b = NB()
+        v, s0, s1 = b.input("v", 2), b.input("s0")[0], b.input("s1")[0]
+        b.ff(b.mux(b.input("o0"), v[:1], s0), b.input("clk")[0], q=b.net("q0", b.new(1)))
+        b.ff(b.mux(b.input("o1"), v[1:], s1), b.input("clk")[0], q=b.net("q1", b.new(1)))
+        self.assertEqual(forward(b.build(), v), ([], v))                 # one bit each: nothing in common
+
+    def test_unused_bit_stops_the_walk(self):
+        b = NB()
+        v, s = b.input("v", 2), b.input("s")[0]
+        b.mux(b.input("o"), v[:1], s)                                  # v[1] is read by nothing
+        self.assertEqual(forward(b.build(), v), ([], v))
+
+    def test_depth_limit_is_exact(self):
+        b = NB()
+        cur = b.input("v")
+        sels = []
+        for i in range(5):
+            sels.append(b.input(f"s{i}")[0])
+            cur = b.mux(b.input(f"o{i}"), cur, sels[-1])
+        self.assertEqual(forward(b.build(), b.ports["v"]["bits"], max_depth=3)[0], [(x, 1) for x in sels[:3]])
+
+    def test_fan_out_budget_is_exact(self):
+        # Every branch needs c; the walk follows MAX_FORWARD - 1 of them.
+        for n, want in ((MAX_FORWARD - 1, True), (MAX_FORWARD, False)):
+            b = NB()
+            v, c = b.input("v"), b.input("c")[0]
+            for i in range(n):
+                b.mux(b.input(f"o{i}"), v, c)
+            conds, _ = forward(b.build(), v)
+            self.assertEqual(conds, [(c, 1)] if want else [], n)
+
+    def test_fan_out_budget(self):
+        b = NB()
+        v = b.input("v")
+        for i in range(MAX_FORWARD + 5):
+            b.ff(b.mux(b.input(f"o{i}"), v, b.input(f"s{i}")[0]), b.input("clk")[0], q=b.net(f"q{i}", b.new(1)))
+        conds, dest = forward(b.build(), v)
+        self.assertEqual((conds, dest), ([], v))                          # past the budget: no conditions
+
     def test_stops_at_other_logic(self):
         b = NB()
         v = b.input("v", 2)
@@ -352,6 +439,40 @@ class Counters(unittest.TestCase):
         self.assertEqual(c.depth_hint, 16 + 2)
         self.assertIn("never wraps past 15 (4 bits)", c.desc)
         self.assertEqual(lemmas, {})                                    # 15 is the maximum: no useful bound
+
+    def test_parameter_disabled_counter(self):
+        # if (ENABLE && |timer) timer <= timer - 1, with ENABLE = 0: no opt_expr runs at
+        # elaboration, so the guard is a $logic_and with a constant input (PicoRV32's IRQ timer).
+        for enable, expect in ((0, []), (1, ["counter_underflow:timer"])):
+            b = NB()
+            clk = b.input("clk")[0]
+            q = b.net("timer", b.new(4))
+            nz = b.op("$reduce_bool", w=1, A=q)
+            guard = b.op("$logic_and", w=1, A=[str(enable)], B=nz)
+            b.ff(b.mux(q, b.op("$sub", A=q, B=const(1, 4)), guard[0]), clk, q=q, name="ff_timer")
+            checks, _ = self.detect(b)
+            self.assertEqual([c.id for c in checks], expect)
+        # The same through a mux and a negation.
+        b = NB()
+        q = b.net("t", b.new(4))
+        off = b.op("$logic_not", w=1, A=["1"])                          # !1
+        sel = b.mux(["1"], off, b.input("m")[0])                        # m ? !1 : 1 -- not constant
+        b.ff(b.mux(q, b.op("$add", A=q, B=const(1, 4)), sel[0]), b.input("clk")[0], q=q)
+        self.assertEqual(len(self.detect(b)[0]), 1)
+        self.assertIsNone(clean_conds([(off[0], 1)], b.build()))        # !1 is constant 0: dead
+        self.assertEqual(clean_conds([(off[0], 0)], b.build()), [])     # ... and its negation always holds
+
+    def test_unreachable_limit_is_not_free_running(self):
+        # q == 200 for a 7-bit q never holds: the clear is dead, but the compare
+        # shows the counter was meant to be bounded, so it is checked.
+        b = NB()
+        q = b.net("q", b.new(7))
+        hit = b.op("$eq", w=1, A=q + ["0"], B=const(200, 8))[0]
+        nxt = b.mux(b.op("$add", A=q, B=const(1, 7)), const(0, 7), hit)
+        b.ff(nxt, b.input("clk")[0], q=q, name="ff_q")
+        (c,), _ = self.detect(b)
+        self.assertEqual((c.id, c.preset), ("counter_overflow:q", None))
+        self.assertEqual(c.conds, [])                                   # the dead clear is pruned
 
     def test_free_running_counter_is_informational(self):
         b = NB()
@@ -606,6 +727,132 @@ class Counters(unittest.TestCase):
         self.assertEqual((ks, others), ({2, 6}, [r]))
 
 
+class WrapBound(unittest.TestCase):
+    """min_cycles_to_wrap: how many cycles a counter needs before it can wrap."""
+
+    def counter(self, w=4, up_steps=(1,), down_steps=(), loads=(), other=None, ff=None, init=None):
+        """q <= sel0 ? q + up0 : sel1 ? q - down0 : ... : load0 ... : q (hold)."""
+        b = NB()
+        clk = b.input("clk")[0]
+        q = b.net("q", b.new(w), **({"init": init} if init is not None else {}))
+        srcs = [b.op("$add", A=q, B=const(k, w)) for k in up_steps]
+        srcs += [b.op("$sub", A=q, B=const(k, w)) for k in down_steps]
+        srcs += [const(k, w) for k in loads]
+        if other is not None:
+            srcs.append(other(b))
+        d = q
+        for src in srcs:
+            d = b.mux(d, src, b.input(f"s{len(b.ports)}")[0])
+        ffkw = ff or {}
+        b.ff(d, clk, q=q, name="ff", **ffkw)
+        nl = b.build()
+        return nl, q, mux_sources(nl, d)
+
+    def bound(self, up=True, step=1, uninit="zero", **kw):
+        nl, q, paths = self.counter(**kw)
+        return min_cycles_to_wrap(nl, "ff", q, paths, up, step, uninit)
+
+    def test_flip_flop_kinds_and_operand_order(self):
+        self.assertEqual(self.bound(ff={"en": 0, "arst": 0, "arst_val": 12}), 4)    # $adffe
+        self.assertEqual(self.bound(ff={"en": 0, "srst": 0, "srst_val": 3}), 13)    # $sdffe
+        b = NB()                                                                    # 1 + q
+        q = b.net("q", b.new(4))
+        d = b.op("$add", A=const(1, 4), B=q)
+        b.ff(d, b.input("clk")[0], q=q, name="ff")
+        nl = b.build()
+        self.assertEqual(min_cycles_to_wrap(nl, "ff", q, mux_sources(nl, d), True, 1), 16)
+        b = NB()                                                                    # 1 - q is no step
+        q = b.net("q", b.new(4))
+        d = b.op("$sub", A=const(1, 4), B=q)
+        b.ff(d, b.input("clk")[0], q=q, name="ff")
+        nl = b.build()
+        self.assertIsNone(min_cycles_to_wrap(nl, "ff", q, mux_sources(nl, d), True, 1))
+
+    def test_more_flip_flops_and_operations(self):
+        self.assertEqual(self.bound(ff={"en": 0}), 16)                              # $dffe
+        nl, q, paths = self.counter(ff={"en": 0, "srst": 0, "srst_val": 3})
+        nl.cells["ff"]["type"] = "$sdffce"
+        self.assertEqual(min_cycles_to_wrap(nl, "ff", q, paths, True, 1), 13)
+        self.assertIsNone(self.bound(other=lambda b: b.op("$mul", A=b.netnames["q"]["bits"], B=const(2, 4))))
+        for signed in ({"A_SIGNED": 1}, {"B_SIGNED": 1}):
+            b = NB()
+            q = b.net("q", b.new(4))
+            d = b.op("$add", params=signed, A=q, B=const(1, 4))
+            b.ff(d, b.input("clk")[0], q=q, name="ff")
+            nl = b.build()
+            self.assertIsNone(min_cycles_to_wrap(nl, "ff", q, mux_sources(nl, d), True, 1), signed)
+        self.assertIsNone(self.bound(up_steps=(), down_steps=(1,)))                # no step in that direction
+
+    def test_edges(self):
+        self.assertEqual(self.bound(loads=(14,)), 2)                # one increment from the end
+        self.assertEqual(self.bound(up_steps=(15,), step=15), 2)    # the largest step there is
+        self.assertEqual(self.bound(up=False, step=2, up_steps=(), down_steps=(2,), loads=(15,), init="1111"), 8)
+        nl, q, paths = self.counter()
+        self.assertEqual(min_cycles_to_wrap(nl, "ff", q, paths, True, 1), 16)     # uninit defaults to zero
+
+    def test_up_counter(self):
+        self.assertEqual(self.bound(), 16)                          # 15 increments from 0, then the wrap
+        self.assertEqual(self.bound(w=64), (1 << 64))               # PicoRV32's count_instr
+        self.assertEqual(self.bound(loads=(10,)), 6)                # loaded with 10: 5 increments to 15
+        self.assertEqual(self.bound(up_steps=(1, 4), step=1), 5)    # +4 a cycle: 15 / 4 rounded up, + 1
+        self.assertEqual(self.bound(up_steps=(1, 4), step=4), 4)    # +4 wraps from 12: 12 / 4, + 1
+        self.assertIsNone(self.bound(loads=(15,)))                  # starts where it wraps
+        self.assertEqual(self.bound(down_steps=(1,)), 16)           # counting down never helps it wrap up
+
+    def test_down_counter(self):
+        self.assertEqual(self.bound(up=False, up_steps=(), down_steps=(1,), loads=(15,), ff={"arst": 0,
+                                    "arst_val": 15}, init="1111"), 16)
+        self.assertIsNone(self.bound(up=False, up_steps=(), down_steps=(1,)))   # starts at 0: wraps at once
+
+    def test_start_value(self):
+        self.assertEqual(self.bound(ff={"arst": 0, "arst_val": 12}), 4)          # asynchronous reset value
+        self.assertEqual(self.bound(ff={"srst": 0, "srst_val": 3}), 13)          # synchronous reset value
+        self.assertEqual(self.bound(init="1010"), 6)                             # initial value 10
+        self.assertIsNone(self.bound(init="10x0"))
+        self.assertIsNone(self.bound(uninit="free"))                             # free power-up value
+        self.assertEqual(self.bound(uninit="free", init="0000"), 16)
+
+    def test_no_bound(self):
+        self.assertIsNone(self.bound(other=lambda b: b.input("din", 4)))         # loaded from an input
+        self.assertIsNone(self.bound(other=lambda b: b.op("$add", A=b.input("o", 4), B=const(1, 4))))
+        self.assertIsNone(self.bound(other=lambda b: b.op("$mul", A=b.input("o2", 4), B=const(2, 4))))
+        nl, q, paths = self.counter()
+        nl.cells["ff"]["type"] = "$dffsr"                                        # set/reset per bit
+        self.assertIsNone(min_cycles_to_wrap(nl, "ff", q, paths, True, 1))
+        b = NB()                                                                 # a signed adder
+        q = b.net("q", b.new(4))
+        d = b.op("$add", params={"A_SIGNED": 1, "B_SIGNED": 1}, A=q, B=const(1, 4))
+        b.ff(d, b.input("clk")[0], q=q, name="ff")
+        nl = b.build()
+        self.assertIsNone(min_cycles_to_wrap(nl, "ff", q, mux_sources(nl, d), True, 1))
+
+    def test_detect_all_defaults_to_zero_power_up(self):
+        b = NB()
+        q = b.net("q", b.new(8))
+        cmp = b.op("$ne", w=1, A=q, B=const(200, 8))
+        b.ff(b.mux(q, b.op("$add", A=q, B=const(1, 8)), cmp[0]), b.input("clk")[0], q=q, name="ff_q")
+        (c,), _ = detect_all(b.build(), 3)
+        self.assertEqual(c.min_cycles, 256)
+
+    def test_on_the_check(self):
+        b = NB()
+        q = b.net("q", b.new(8))
+        cmp = b.op("$ne", w=1, A=q, B=const(200, 8))
+        b.ff(b.mux(q, b.op("$add", A=q, B=const(1, 8)), cmp[0]), b.input("clk")[0], q=q, name="ff_q")
+        (c,), _ = detect_counters(b.build(), 3)
+        self.assertEqual(c.min_cycles, 256)
+        (c,), _ = detect_counters(b.build(), 3, uninit="free")
+        self.assertIsNone(c.min_cycles)
+
+    def test_fmt_cycles(self):
+        self.assertEqual(fmt_cycles(16), "16")
+        self.assertEqual(fmt_cycles(1_000_000), "1,000,000")
+        self.assertEqual(fmt_cycles(1 << 64), "2^64")
+        self.assertEqual(fmt_cycles((1 << 20) - 1), "1,048,575")
+        self.assertEqual(fmt_cycles(1 << 20), "2^20")
+        self.assertEqual(fmt_cycles((1 << 32) + 1), "more than 2^32")
+
+
 class CaseStatements(unittest.TestCase):
     def build(self, attrs, a=None, sels=3, sel_bits=None, use=True):
         b = NB()
@@ -670,6 +917,168 @@ class CaseStatements(unittest.TestCase):
         b.cell("m", "$mux", {"A": ys[0], "B": ys[1], "S": b.input("pick"), "Y": gnt})
         checks = detect_case(b.build())
         self.assertEqual(sorted((c.src, c.target) for c in checks), [("c.v:12", "gnt#1"), ("c.v:9", "gnt")])
+
+
+class Labels(unittest.TestCase):
+    def test_label(self):
+        for name, want in (("q", "q"), ("u_x.q", "u_x.q"), ("", None), ("$auto$x", None), ("u.$auto$x", None),
+                           ("$0\\cpu_state[7:0]", "cpu_state"), ("$flatten\\u_x.$0\\q[3:0]", "u_x.q"),
+                           ("u_x.$0\\q[3:0]", "u_x.q"), ("$procmux$1841_Y", None), ("g$1.q", "g$1.q"),
+                           ("$0$memwr$\\cpuregs$/a/b.v:1327$123_DATA[31:0]$456", "cpuregs"),
+                           ("$flatten\\u_m.$0$memwr$\\mem$x.v:3$7_ADDR", "u_m.mem")):
+            with self.subTest(name=name):
+                self.assertEqual(_label(name), want)
+
+
+class HarmlessFullCase(unittest.TestCase):
+    """full_case checks whose pragma changes nothing ('x before the case)."""
+
+    @staticmethod
+    def design(defaults, pragma=True):
+        """One case statement assigning a and b; `defaults`: their values when no item matches."""
+        b = NB()
+        sel = b.input("s", 2)
+        attrs = {"parallel_case": PAR, "src": "c.v:9.1-9.2"}
+        if pragma:
+            attrs["fvlint_full_case"] = PAR
+        for name, dflt in defaults.items():
+            a = dflt(b) if callable(dflt) else dflt
+            y = b.pmux(a, [b.input(f"{name}_0"), b.input(f"{name}_1")], sel, attrs=attrs)
+            b.ff(y, b.input(f"clk_{name}")[0], q=b.net(name, b.new(1)))
+        return b.build()
+
+    def test_x_before_the_case(self):
+        checks = [c for c in detect_case(self.design({"a": ["x"], "b": ["x"]})) if c.kind == "full_case"]
+        self.assertEqual(len(checks), 2)
+        # Without the pragma, a's default is still 'x (set to 'x first); b's is a real value.
+        nofc = self.design({"a": ["x"], "b": lambda b: b.input("b_prev")}, pragma=False)
+        self.assertEqual(harmless_full_case(checks, nofc), 1)
+        by_part = {c.part: c for c in checks}
+        self.assertEqual(by_part["a"].preset, INFO)
+        self.assertEqual(by_part["a"].detail, "the code sets a to 'x before the case, so when no item matches "
+                                              "simulation gives 'x just as synthesis may: the full_case pragma "
+                                              "changes nothing; not checked")
+        self.assertIsNone(by_part["b"].preset)                           # the real hazard stays checked
+
+    def test_only_parallel_case_muxes_count(self):
+        checks = [c for c in detect_case(self.design({"a": ["x"]})) if c.kind == "full_case"]
+        b = NB()                                                         # a priority case: no parallel_case
+        y = b.pmux(["x"], [b.input("i0"), b.input("i1")], b.input("s", 2), attrs={"src": "c.v:9.1-9.2"})
+        b.ff(y, b.input("clk")[0], q=b.net("a", b.new(1)))
+        self.assertEqual(harmless_full_case(checks, b.build()), 0)
+
+    def test_only_full_case_checks(self):
+        checks = detect_case(self.design({"a": ["x"]}))
+        nofc = self.design({"a": ["x"]}, pragma=False)
+        done = [c for c in checks if c.kind == "full_case"]
+        done[0].preset, done[0].detail = INFO, "earlier"
+        self.assertEqual(harmless_full_case(checks, nofc), 0)
+        self.assertEqual([(c.kind, c.preset) for c in checks], [("parallel_case", None), ("full_case", INFO)])
+        self.assertEqual(done[0].detail, "earlier")
+
+    def test_no_counterpart_keeps_the_check(self):
+        checks = [c for c in detect_case(self.design({"a": ["x"]})) if c.kind == "full_case"]
+        self.assertEqual(harmless_full_case(checks, self.design({"other": ["x"]}, pragma=False)), 0)
+        self.assertEqual(harmless_full_case(checks, NB().build()), 0)
+        # Two candidates for one check (ambiguous): kept.
+        b = NB()
+        sel = b.input("s", 2)
+        for i in range(2):
+            y = b.pmux(["x"], [b.input(f"i{i}0"), b.input(f"i{i}1")], sel,
+                       attrs={"parallel_case": PAR, "src": "c.v:9.1-9.2"})
+            b.ff(y, b.input(f"clk{i}")[0], q=b.net("a", b.new(1)) if i == 0 else b.netnames["a"]["bits"])
+        self.assertEqual(harmless_full_case(checks, b.build()), 0)
+        self.assertIsNone(checks[0].preset)
+
+
+class CaseStatementNames(unittest.TestCase):
+    """One check per case statement, named after what it assigns."""
+
+    def statement(self, b, dests, sel, src, guard=None):
+        """A case statement (one $pmux per destination register) inside `guard`."""
+        for d in dests:
+            q = b.net(d, b.new(1)) if d not in b.netnames else b.netnames[d]["bits"]
+            y = b.pmux(b.input(f"{d}_{src}_dflt"), [b.input(f"{d}_{src}_{i}") for i in range(len(sel))], sel,
+                       attrs={"parallel_case": PAR, "src": f"c.v:{src}.1-{src}.2"})
+            if guard is not None:
+                y = b.mux(b.input(f"{d}_{src}_other"), y, guard)
+            b.ff(y, b.input(f"clk_{d}_{src}")[0], q=q)
+
+    def test_statement_with_several_signals(self):
+        b = NB()
+        sel = b.input("s", 2)
+        self.statement(b, ["beta", "alpha"], sel, 5)
+        self.statement(b, ["e", "d", "c", "b", "a"], sel, 9)
+        checks = detect_case(b.build())
+        self.assertEqual(sorted({c.group for c in checks}), ["parallel_case:a,b,c,+2", "parallel_case:alpha,beta"])
+        self.assertEqual(sorted(c.part for c in checks if c.group == "parallel_case:alpha,beta"), ["alpha", "beta"])
+        self.assertEqual(len({c.id for c in checks}), 7)               # every part has its own id for the engine
+
+    def test_one_signal_keeps_its_plain_name(self):
+        b = NB()
+        self.statement(b, ["gnt"], b.input("s", 2), 5)
+        (c,) = detect_case(b.build())
+        self.assertEqual((c.id, c.group), ("parallel_case:gnt", None))
+
+    def test_a_unique_name_gets_no_state(self):
+        b = NB()
+        st = b.net("st", b.new(2))
+        g = b.op("$eq", w=1, A=st, B=const(1, 2))[0]
+        self.statement(b, ["x"], b.input("s", 2), 20, guard=g)
+        self.assertEqual([c.id for c in detect_case(b.build())], ["parallel_case:x"])
+
+    def test_four_signals_in_full(self):
+        b = NB()
+        self.statement(b, ["d", "c", "b", "a"], b.input("s", 2), 5)
+        self.assertEqual({c.group for c in detect_case(b.build())}, {"parallel_case:a,b,c,d"})
+
+    def test_two_statements_told_apart(self):
+        b = NB()
+        st = b.net("st", b.new(2))
+        sel = b.input("s", 2)
+        for code, line, op in ((1, 20, "$eq"), (2, 10, "$eqx")):
+            g = b.op(op, w=1, A=const(code, 2), B=st)[0]                 # either operand order
+            self.statement(b, ["x"], sel, line, guard=g)
+        got = sorted((c.src, c.id) for c in detect_case(b.build()))
+        self.assertEqual(got, [("c.v:10", "parallel_case:x@st=2'b10"), ("c.v:20", "parallel_case:x@st=2'b01")])
+
+    def test_statements_told_apart_by_fsm_state(self):
+        # PicoRV32: several states of cpu_state hold a case statement assigning the same signals.
+        b = NB()
+        st = b.net("st", b.new(2))
+        sel = b.input("s", 2)
+        for code, line in ((1, 20), (2, 10), (2, 30)):
+            g = b.op("$eq", w=1, A=st, B=const(code, 2))[0]
+            self.statement(b, ["x", "y"], sel, line, guard=g)
+        self.statement(b, ["z"], sel, 40)
+        got = sorted((c.src, c.group or c.id) for c in detect_case(b.build()))
+        self.assertEqual(sorted(set(got)), [("c.v:10", "parallel_case:x,y@st=2'b10"),
+                                            ("c.v:20", "parallel_case:x,y@st=2'b01"),
+                                            ("c.v:30", "parallel_case:x,y@st=2'b10#1"),     # same state: numbered
+                                            ("c.v:40", "parallel_case:z")])
+
+    def test_name_through_fan_out_and_yosys_temporaries(self):
+        b = NB()
+        sel = b.input("s", 2)
+        y = b.pmux(b.input("dflt"), [b.input("i0"), b.input("i1")], sel, attrs={"parallel_case": PAR,
+                                                                              "src": "c.v:7.1-7.2"})
+        m1 = b.mux(y, b.input("o1"), b.input("s1")[0])                  # y has two readers: forward() stops
+        m2 = b.mux(b.input("o2"), y, b.input("s2")[0])
+        nxt = b.net("$0\\cpu_state[0:0]", b.mux(m1, m2, b.input("s3")[0]), hidden=True)
+        b.ff(nxt, b.input("clk")[0], q=b.net("cpu_state", b.new(1)))
+        (c,) = detect_case(b.build())
+        self.assertEqual(c.id, "parallel_case:cpu_state")
+        nl = b.build()
+        self.assertEqual(_dest_name(nl, nxt, [], "a/c.v:7"), "cpu_state")  # Yosys' $0\\name for it
+
+    def test_fan_out_to_different_signals_has_no_name(self):
+        b = NB()
+        y = b.pmux(b.input("dflt"), [b.input("i0"), b.input("i1")], b.input("s", 2),
+                   attrs={"parallel_case": PAR, "src": "c.v:7.1-7.2"})
+        b.ff(b.mux(y, b.input("o1"), b.input("s1")[0]), b.input("clk")[0], q=b.net("p", b.new(1)))
+        b.ff(b.mux(y, b.input("o2"), b.input("s2")[0]), b.input("clk")[0], q=b.net("r", b.new(1)))
+        (c,) = detect_case(b.build())
+        self.assertEqual(c.id, "parallel_case:c.v:7")
 
 
 class PartSelects(unittest.TestCase):
@@ -801,6 +1210,9 @@ class Dedupe(unittest.TestCase):
               Check("k", "t", "?", "")]
         _dedupe(cs)
         self.assertEqual([c.target for c in cs], ["t#2", "t#1", "u", "t"])
+        two = [Check("k", "t", "a.v:5", ""), Check("k", "t", "a.v:3", "")]
+        _dedupe(two)
+        self.assertEqual([c.target for c in two], ["t#1", "t"])
 
 
 class RealNetlists(unittest.TestCase):
@@ -849,10 +1261,13 @@ class RealNetlists(unittest.TestCase):
 
     def test_case_index_memory(self):
         checks, lemmas = detect_all(load_snapshot("snap_mux"), 3)
-        got = {c.id: c.params for c in checks}
+        got = {c.group or c.id: c.params for c in checks}
+        # One case statement assigns z and w: one check, proven for each of them.
+        self.assertEqual(sorted((c.id, c.part) for c in checks if c.group == "parallel_case:w,z"),
+                         [("parallel_case:w,z~0", "z"), ("parallel_case:w,z~1", "w")])
         self.assertEqual(got, {
             "parallel_case:gnt": {"W": 3}, "parallel_case:y": {"W": 2}, "full_case:y": {"W": 2},
-            "parallel_case:z": {"W": 2}, "parallel_case:w": {"W": 2},       # no full_case:z: a default item, no pragma
+            "parallel_case:w,z": {"W": 2},                              # no full_case: a default item, no pragma
             "index_range:lane": {"W": 32, "LO": 0, "HI": 8, "SIGNED": 0},
             "mem_addr:mem.rd0": {"W": 3, "LO": 0, "HI": 5, "SIGNED": 0},
             "mem_addr:mem.wr0": {"W": 3, "LO": 0, "HI": 5, "SIGNED": 0},

@@ -31,21 +31,46 @@ INFO  fsm_summary:u_framer.st             examples/demo/demo_top.sv:61  4 reacha
 |---|---|---|
 | `counter_overflow` / `counter_underflow` | register fed back through `+ c` / `- c` with a constant step (signed or unsigned) | the step is never taken when it would wrap (or overflow, for signed arithmetic) |
 | `parallel_case` | `unique case`, `unique casez`, `(* parallel_case *)` | at most one item matches whenever the result is used |
-| `full_case` | `unique` / `(* full_case *)` case with no default | an item that assigns the signal always matches (otherwise synthesis may differ from simulation) |
+| `full_case` | `unique` / `priority` / `(* full_case *)` case with no default | an item that assigns the signal always matches (otherwise synthesis may differ from simulation) |
 | `index_range` | variable part/bit select (`x[i*8 +: 8]`) | the offset stays inside the vector |
 | `mem_addr` | memory whose depth is not a power of two | read/write addresses stay in range when enabled |
 | `fsm_unreachable` | FSM state register | every assigned or decoded state is reachable from reset |
 | `fsm_trap` (warning) | FSM state register | the FSM can get back to its reset state from every reachable state |
 
-A counter whose increment condition doesn't depend on the counter itself (a
-free-running timer, say) is reported as `INFO`, since its wrap-around looks
-intentional. Logic disabled by a parameter (even through a wire) is
-recognized as dead and isn't checked.
+Some checks are settled without a proof and reported as `INFO`:
+
+* **Free-running counters**: the increment condition doesn't depend on the
+  counter itself (a timebase, say), so the wrap-around looks intentional.
+* **Counters that can't wrap within the horizon**: a counter that only
+  resets or loads constants and steps by constants can't wrap sooner than
+  its distance to the end divided by its largest step. A 64-bit instruction
+  counter that adds 1 needs 2^64 cycles. Past `--horizon` (default 2^60
+  cycles, about 36 years at 1 GHz) it isn't checked. A counter that ends
+  `UNKNOWN` says how many cycles a wrap needs at least, so you can judge it
+  (`--horizon 2^32` accepts a 32-bit UART divider).
+* **Logic in an unreachable FSM state**: a check that only applies in a
+  state the FSM analysis shows is unreachable points at that
+  `fsm_unreachable` finding instead of being proved vacuous. Waive or fix
+  the state and the rest follows.
+* **`full_case` pragmas that change nothing**: when the code sets the signal
+  to `'x` before the case (`alu_out = 'bx; case ...`), simulation gives `'x`
+  when no item matches, just as synthesis may. fvlint elaborates the design
+  a second time without the pragmas to see the value before the case, and
+  only checks the statements where it isn't `'x`.
+
+Logic disabled by a parameter, even through a wire or an expression such as
+`ENABLE_IRQ && timer`, is recognized as dead and isn't checked at all.
 
 Check IDs are **structural**: they name the register, memory port or
 destination signal, e.g. `parallel_case:u_arb.gnt` or
 `counter_overflow:u_fifo.count`. Waivers therefore survive edits elsewhere in
-the file.
+the file. A case statement is one check, named after the signals it assigns
+(`parallel_case:alu_wait,alu_wait_2,cpu_state,mem_do_rinst`, with the first
+three and a count past four). Statements that would share a name get the FSM
+state they sit in (`@cpu_state=8'b00010000`), then a number in source
+order (`#1`). Behind one check, the property is proven for each signal the
+statement assigns (Yosys builds one multiplexer per signal); the result
+names the signal that failed.
 
 ## How it works
 
@@ -127,8 +152,10 @@ fvlint --help
 fvlint --top TOP [files...] [-f files.f | -F files.f] [-I dir] [-D define] [-P param=value]
        [--frontend yosys|slang] [--reset NAME[:LEVEL] | --no-reset] [--reset-cycles N]
        [--reset-anytime] [--uninit zero|free] [--assume assumptions.sv]
-       [--waivers waivers.txt] [--checks kind,...] [--engine auto|pdr|smtbmc]
-       [--max-level N] [--no-cegar] [--no-vacuity] [-j N] [-o OUTDIR] [-v]
+       [--waivers waivers.txt] [--recheck-waived] [--checks kind,...] [--horizon CYCLES]
+       [--engine auto|pdr|smtbmc] [--max-level N] [--no-cegar] [--no-vacuity] [-j N]
+       [-o OUTDIR] [-v] [--summary-md FILE] [--github]
+fvlint --config fvlint.toml [NAME...] [options for every configuration]
 ```
 
 * `--frontend slang` is recommended for real SystemVerilog (packages,
@@ -140,10 +167,82 @@ fvlint --top TOP [files...] [-f files.f | -F files.f] [-I dir] [-D define] [-P p
   `OUTDIR/results.json` and `OUTDIR/junit.xml` are written every run, and
   counterexamples come with a VCD trace.
 * `--list` shows the detected checks without proving anything.
+* `--horizon CYCLES` (an integer or `2^N`; default `2^60`, `0` to check
+  every counter): see *What it checks*.
+* `--summary-md FILE` appends a Markdown summary (the results that aren't
+  `PROVEN`, and unused waivers). `--github` prints GitHub Actions
+  annotations, so findings show on their source lines in a pull request,
+  and appends the summary to `$GITHUB_STEP_SUMMARY`.
 * File lists follow the simulator convention: relative paths in a list given
   with `-f` are relative to the current directory, with `-F` relative to the
   list file. Inside a list, `+incdir+`, `+define+`, `-I`, `-D`, nested
   `-f`/`-F` and `-v FILE` are understood; other simulator options are skipped.
+
+### Project files
+
+A design usually needs several runs: different tops, or one top under
+different parameters, since logic a parameter switches off can't be checked.
+Put them in a TOML file and run them together:
+
+```toml
+# fvlint.toml
+out = "fvlint_out"                 # each configuration writes to OUT/NAME
+
+[defaults]                         # shared by every configuration
+jobs = 2
+
+[config.default]
+top = "picorv32"
+files = ["picorv32.v"]             # paths are relative to this file
+waivers = "fvlint/waivers/default.txt"
+
+[config.irq]
+top = "picorv32"
+files = ["picorv32.v"]
+params = { ENABLE_IRQ = 1, ENABLE_IRQ_QREGS = 1, ENABLE_IRQ_TIMER = 1 }
+assume = "fvlint/assume/irq.sv"
+waivers = "fvlint/waivers/irq.txt"
+```
+
+```
+fvlint --config fvlint.toml                  # every configuration
+fvlint --config fvlint.toml irq -j 4 -v      # just this one, with more options
+```
+
+The keys are the long option names with `_` for `-`: `top`, `files`,
+`filelists` (`-f`), `filelists_rel` (`-F`), `include` (`-I`), `defines`,
+`params` (tables or `NAME=VALUE` lists), `libs`, `frontend`, `reset`,
+`no_reset`, `reset_anytime`, `reset_cycles`, `uninit`, `assume`, `waivers`,
+`recheck_waived`, `engine`, `solver`, `max_level`, `depth`, `timeout`,
+`pdr_timeout`, `horizon`, `checks`, `fail_on`, `jobs`, and `args` for any
+other options. Options on the command line apply to every configuration and
+win over the file. The exit status is the worst one: 2 if a configuration
+couldn't run, else 1 if any has a finding.
+
+### In CI (GitHub Actions)
+
+This repository is also a GitHub Action. It installs the OSS CAD Suite and
+the matching fvlint, runs a project file with `--github` (annotations and a
+job summary), and uploads the results with their counterexample traces:
+
+```yaml
+jobs:
+  fvlint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        config: [default, irq]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: tm-treehouse/fvlint@v0.4.0
+        with:
+          config: fvlint.toml        # the default
+          configs: ${{ matrix.config }}
+```
+
+Other inputs: `args` (more options), `output`, `upload`, `artifact-name`,
+`python-version` and `oss-cad-suite-version` (default: the build fvlint's own
+CI uses).
 
 ### Results
 
@@ -154,7 +253,7 @@ fvlint --top TOP [files...] [-f files.f | -F files.f] [-I dir] [-D define] [-P p
 | `VACUOUS` | "proven", but the check's condition can never occur (over-constrained assumptions or dead logic) |
 | `ERROR` | tool error, or an unsatisfiable environment (contradictory `--assume`) |
 | `UNKNOWN` | neither proven nor refuted, or refuted only on a cut slice |
-| `WARN` / `INFO` | FSM trap states, free-running counters, FSM summaries |
+| `WARN` / `INFO` | FSM trap states, FSM summaries, and checks settled without a proof (free-running counters, counters past the horizon, logic in unreachable states, `full_case` pragmas that change nothing) |
 | `WAIVED` | matched a waiver |
 
 ### Triage: assumptions and waivers
@@ -172,11 +271,11 @@ endmodule
 
 A `full_case` FAIL means a cycle where no item that assigns the signal
 matches, so the pragma lets synthesis pick any value where simulation keeps
-the one assigned before the case. If the code assigns `'x` there (a common
-style: `alu_out = 'bx;` before the case), both agree and the finding can be
-waived. When fvlint can't follow a case result to the register that uses
-it, `parallel_case` is checked in every cycle, so overlapping items in a
-cycle whose result is never used also FAIL; those are harmless.
+the one assigned before the case. (Where the code assigns `'x` before the
+case, both agree; fvlint recognizes that and doesn't check it.) When fvlint
+can't follow a case result to the register that uses it, `parallel_case` is
+checked in every cycle, so overlapping items in a cycle whose result is
+never used also FAIL; those are harmless.
 
 Waive what is intentional, either in a file of check-id globs or with an
 attribute on the register or memory in the RTL:
@@ -194,6 +293,11 @@ $ fvlint --frontend slang --top demo_top examples/demo/demo_top.sv \
          --assume examples/demo/assumptions.sv --waivers examples/demo/waivers.txt
 fvlint: 11 checks: 1 info, 8 proven, 2 waived
 ```
+
+Waivers go stale as the design changes. fvlint warns about every line of a
+waiver file that matches no check (with `--github`, on that line), and
+`--recheck-waived` proves the waived checks anyway and names the waivers that
+are no longer needed, while still treating them as waived.
 
 ## Regression testing
 
@@ -230,7 +334,7 @@ fvlint's own suite:
 | Suite | What it covers |
 |---|---|
 | `tests/unit/` | unit tests of every module's internals, no toolchain needed (about 2 s). Netlists are built by hand for exact edge cases and also loaded from committed Yosys snapshots of `tests/unit/data/rtl` for the shapes Yosys really produces; SymbiYosys log parsing is tested on lines in the formats of real runs, verbatim for the irregular ones (a step-0 failure has no step number). The scheduler is tested with a scripted solver (refinement, replay, batching, deep BMC, vacuity) that also checks every job it is handed is closed (no bit a checker reads is left undriven), and against a solver that answers from a per-property truth table over many random mixes, so its verdicts must follow from the truth; external tools are tested with stub executables. Kept honest by branch coverage and mutation testing (below). |
-| `tests/regress/manifest.toml` | 57 case runs over the fixtures in `tests/fixtures`. Each fixture has clean structures and planted bugs, including a reproduction for every defect found in the design review: multi-clock false proofs, vacuous assumptions, parameter-disabled logic, synchronous-reset FSM traps, reset synchronizers, signed counters, register-bounded timers. Many cases run under both engines, plus a 200-counter throughput case. |
+| `tests/regress/manifest.toml` | 65 case runs over the fixtures in `tests/fixtures`. Each fixture has clean structures and planted bugs, including a reproduction for every defect found in the design review: multi-clock false proofs, vacuous assumptions, parameter-disabled logic, synchronous-reset FSM traps, reset synchronizers, signed counters, register-bounded timers; and for the patterns found on PicoRV32: case statements in unreachable states, parameter-guarded timers, harmless and harmful `full_case` pragmas, wide counters and the horizon, statements told apart by FSM state. Many cases run under both engines, plus a 200-counter throughput case. |
 | `fvlint.fuzz` | soundness fuzzer: random designs (counters, registered guards, case statements, part-selects including narrow signed indices, memories, state machines (some overridden after the reset branch), second clocks, falling edges, synchronized resets, and flops that look like reset stages but that data can set). The generator writes down, for each construct it builds, when it is active and when it goes wrong, as plain Verilog. An independent oracle appends those monitors to its own copy of the design and re-checks every `PROVEN`, `VACUOUS`, `FAIL` and unreachable-state verdict with a plain bounded model check: it uses none of fvlint's netlist, slicing, refinement, lemmas, PDR, check parameters, path conditions or reset discovery. |
 
 ```
