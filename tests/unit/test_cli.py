@@ -446,6 +446,11 @@ class Flow(CliCase):
         self.assertEqual(cli.horizon_value((1 << 20) - 1), "1048575")
         self.assertEqual(cli.horizon_value((1 << 32) + 1), "2^32")
 
+    def test_horizon_value(self):
+        for n, want in ((16, "16"), ((1 << 20) - 1, "1048575"), (1 << 20, "2^20"), ((1 << 33) + 5, "2^33")):
+            self.assertEqual(cli.horizon_value(n), want)
+            self.assertLessEqual(cli.cycles_arg(want), n)                # pasted back: accepts the counter
+
     def test_cycles_arg(self):
         self.assertEqual(cli.cycles_arg("1000"), 1000)
         self.assertEqual(cli.cycles_arg("1_000"), 1000)

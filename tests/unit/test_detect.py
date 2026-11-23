@@ -7,8 +7,8 @@ from __future__ import annotations
 import unittest
 
 from fvlint.checks import INFO, Check
-from fvlint.detect import (MAX_FORWARD, MAX_PATHS, _bits_label, _compares, _dedupe, _dest_name, _fit, _label,
-                           _operand_is, _signed_val, clean_conds, detect_all, detect_case, detect_counters,
+from fvlint.detect import (MAX_FORWARD, MAX_PATHS, _bits_label, _compares, _dedupe, _dest_name, _fit, _guard,
+                           _label, _operand_is, _signed_val, clean_conds, detect_all, detect_case, detect_counters,
                            detect_index, detect_memory, fmt_cycles, forward, harmless_full_case, min_cycles_to_wrap,
                            mux_sources)
 
@@ -769,6 +769,11 @@ class WrapBound(unittest.TestCase):
         nl = b.build()
         self.assertIsNone(min_cycles_to_wrap(nl, "ff", q, mux_sources(nl, d), True, 1))
 
+    def test_steps_and_sources_that_give_no_bound(self):
+        mul = lambda b: b.op("$mul", A=b.netnames["q"]["bits"], B=const(2, 4))   # noqa: E731
+        self.assertIsNone(self.bound(up=False, up_steps=(), down_steps=(1,), loads=(15,), init="1111", other=mul))
+        self.assertIsNone(self.bound(up_steps=(), down_steps=(1,), init="0101"))  # an overflow check, no up step
+
     def test_more_flip_flops_and_operations(self):
         self.assertEqual(self.bound(ff={"en": 0}), 16)                              # $dffe
         nl, q, paths = self.counter(ff={"en": 0, "srst": 0, "srst_val": 3})
@@ -975,6 +980,29 @@ class Labels(unittest.TestCase):
         self.assertEqual(_bits_label(b.build(), tmp), "u_x.q_next")
 
 
+class LabelsOfBits(unittest.TestCase):
+    def test_one_written_name_wins_over_temporaries(self):
+        b = NB()
+        bits = b.new(2)
+        b.net("bus", bits[:1] + b.new(1))                               # bit 0 is part of `bus`
+        b.net("$0\\other[0:0]", bits[1:], hidden=True)                  # bit 1 is Yosys' temporary for `other`
+        self.assertEqual(_bits_label(b.build(), bits), "bus")
+
+    def test_dollar_in_the_last_component_is_not_written(self):
+        b = NB()
+        bits = b.net("u_x.$auto$3", b.new(2))                           # not hidden, but generated
+        self.assertIsNone(_bits_label(b.build(), bits))
+
+
+class GuardNames(unittest.TestCase):
+    def test_a_constant_the_signal_cannot_hold(self):
+        for k, want in ((3, "@st=2'b11"), (4, None)):
+            b = NB()
+            st = b.net("st", b.new(2))
+            eq = b.op("$eq", w=1, A=st + ["0"], B=const(k, 3))[0]
+            self.assertEqual(_guard(b.build(), [(eq, 1)]), want, k)
+
+
 class HarmlessFullCase(unittest.TestCase):
     """full_case checks whose pragma changes nothing ('x before the case)."""
 
@@ -1004,6 +1032,14 @@ class HarmlessFullCase(unittest.TestCase):
                                               "simulation gives 'x just as synthesis may: the full_case pragma "
                                               "changes nothing; not checked")
         self.assertEqual((by_part["b"].preset, by_part["b"].reason), (None, None))   # the real hazard stays checked
+
+    def test_dead_statements_in_the_second_netlist_do_not_count(self):
+        checks = [c for c in detect_case(self.design({"a": ["x"]})) if c.kind == "full_case"]
+        b = NB()                                                         # its result is never selected
+        y = b.pmux(["x"], [b.input("i0"), b.input("i1")], b.input("s", 2),
+                   attrs={"parallel_case": PAR, "src": "c.v:9.1-9.2"})
+        b.ff(b.mux(b.input("o"), y, "0"), b.input("clk")[0], q=b.net("a", b.new(1)))
+        self.assertEqual(harmless_full_case(checks, b.build()), 0)
 
     def test_only_parallel_case_muxes_count(self):
         checks = [c for c in detect_case(self.design({"a": ["x"]})) if c.kind == "full_case"]

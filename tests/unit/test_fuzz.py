@@ -160,6 +160,49 @@ class Generator(unittest.TestCase):
         self.assertEqual(seen, {"nested", "updown", "updown-initial", "full_case-x", "full_case-value", "param0",
                                 "param1", "horizon"})
 
+    def test_settled_constructs_of_known_designs(self):
+        # Exact text and monitors (checked by hand: a 3-bit `ud + 1` wraps from 7, so
+        # ud > 6; `pq - 1` wraps from 0, so pq < 1), and which registers start at zero.
+        d = fuzz.generate(1)
+        self.assertIn("output [63:0] o, output [31:0] o2);", d.text)
+        self.assertIn("  always @(posedge clk) if (rst) ud <= 3'd3; else if (in2 && ud != 3'd6) ud <= ud + 3'd1; "
+                      "else if (in0) ud <= ud - 3'd1;\n", d.text)
+        self.assertEqual(d.monitors[("counter_overflow", "ud", 1)]["bad"],
+                         ["(!(rst) && (in2 && ud != 3'd6) && (ud > 3'd6))"])
+        self.assertEqual(d.monitors[("counter_underflow", "ud", 1)]["bad"],
+                         ["(!(rst) && !(in2 && ud != 3'd6) && (in0) && (ud < 3'd1))"])
+        self.assertIn("  always @* begin fx = 2'bx; (* parallel_case, full_case *) case (1'b1) in2: fx = 2'd1; "
+                      "!in2: fx = 2'd2; endcase end\n", d.text)
+        self.assertEqual(d.monitors[("parallel_case", "fx")], {"en": ["1'b1"], "bad": ["((in2) && (!in2))"]})
+        self.assertEqual(d.monitors[("full_case", "fx")]["bad"], ["(!(in2) && !(!in2))"])
+        self.assertIn("  localparam PE = 1;\n  reg [3:0] pq;\n  always @(posedge clk) if (rst) pq <= 4'd0; else if "
+                      "(in3) pq <= 4'd14; else if (PE && pq != 4'd14) pq <= pq + 4'd1;\n", d.text)
+        self.assertEqual(d.monitors[("counter_overflow", "pq", 1)]["bad"],
+                         ["(!(rst) && !(in3) && (PE && pq != 4'd14) && (pq > 4'd14))"])
+        self.assertEqual(d.required, {("counter_overflow", "pq", 1)})
+        self.assertIn("  assign o2 = {ud, fx, pq};\n", d.text)
+        self.assertEqual([r for r in d.regs if r[0] in ("ud", "pq", "pv")], [("ud", 3), ("pq", 4)])
+        self.assertEqual((d.args, d.x_defaults), ([], {"fx"}))
+        d = fuzz.generate(4)                                             # its own power-up value
+        self.assertIn("  reg [3:0] ud;\n  initial ud = 4'd8;\n", d.text)
+        self.assertNotIn("ud", [r[0] for r in d.regs])
+        self.assertEqual(d.monitors[("counter_overflow", "ud", 1)]["bad"],
+                         ["(!(rst) && (in2 && ud != 4'd8) && (ud > 4'd14))"])
+        self.assertEqual(d.args, ["--horizon", "16"])
+        d = fuzz.generate(5)
+        self.assertIn("\n  reg [1:0] pv;\n  always @(posedge clk) if (rst) pv <= 2'd0; else case (st) 2'd0: begin "
+                      "(* parallel_case *) case (1'b1) in2: pv <= 2'd1; !in2: pv <= 2'd2; endcase end endcase\n",
+                      d.text)
+        self.assertEqual(d.monitors[("parallel_case", "pv")], {"en": ["(st == 2'd0)"],
+                                                               "bad": ["(st == 2'd0 && (in2) && (!in2))"]})
+        self.assertIn("  always @* begin fv = 2'd3; (* parallel_case, full_case *)", d.text)
+        self.assertIn("else if (PE && pq) pq <= pq - 3'd1;\n", d.text)
+        self.assertEqual(d.monitors[("counter_underflow", "pq", 1)]["bad"],
+                         ["(!(rst) && !(in3) && (PE && pq) && (pq < 3'd1))"])
+        self.assertEqual([r for r in d.regs if r[0] in ("ud", "pq", "pv")], [("pv", 2), ("pq", 3)])
+        self.assertIn("  assign o2 = {pv, fx, fv, pq};\n", d.text)
+        self.assertEqual(d.x_defaults, {"fx"})
+
     def test_state_machines(self):
         # Pinned: a plain one, one overridden after the reset branch, one with an unconditional arm.
         lines = lambda seed: [x for x in fuzz.generate(seed).text.splitlines() if " st" in x or "busy" in x]
@@ -561,7 +604,7 @@ class Oracle(TempDirCase):
     def test_harmless_full_case(self):
         # The oracle can't watch "set to 'x before the case"; the generator's record must agree.
         d = design(monitors=self.d.monitors, x_defaults={"fx"})
-        rows = [info("full_case:fx", "full_case_x"), info("full_case:fv", "full_case_x"),
+        rows = [info("full_case:fx#1", "full_case_x"), info("full_case:fv", "full_case_x"),
                 info("counter_overflow:q", "free_running", "q + 1 never wraps past 15 (4 bits)"),
                 info("fsm_summary:st", None)]
         problems, inconclusive = self.oracle(rows, design=d)
