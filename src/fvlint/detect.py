@@ -221,11 +221,18 @@ _PROC_TEMP = re.compile(r"^(?:\$flatten\\)?((?:[^$]*\.)?)\$\d+\\([^\[$]+)")
 _MEMWR_TEMP = re.compile(r"^(?:\$flatten\\)?((?:[^$]*\.)?)\$\d+\$memwr\$\\([^$]+)\$")
 
 
+def _written(name: str) -> bool:
+    """A name as the user wrote it: not one Yosys made up ($procmux$7_Y), and
+    not an intermediate value of a signal (u_x.$0\\q[3:0]), which is named
+    in its last hierarchy component."""
+    return bool(name) and not name.startswith("$") and "$" not in name.rsplit(".", 1)[-1]
+
+
 def _label(name: str) -> str | None:
     """A net name as the user wrote it, or None for an anonymous net."""
     if not name:
         return None
-    if not name.startswith("$") and "$" not in name.rsplit(".", 1)[-1]:
+    if _written(name):
         return name
     m = _MEMWR_TEMP.match(name) or _PROC_TEMP.match(name)
     return (m.group(1) + m.group(2)) if m else None
@@ -237,12 +244,12 @@ def _bits_label(nl: Netlist, bits: list) -> str | None:
     names stand for."""
     if not bits:
         return None
-    name = nl.visible_name(bits)
-    if name:
-        return name
+    for name, n in nl.nets_for(bits):
+        if not n.get("hide_name", 0) and _written(name):
+            return name
     names = {nl.bit_name.get(b, "").rsplit("[", 1)[0] for b in bits if not is_const(b)}
     names.discard("")
-    visible = {n for n in names if not n.startswith("$")}
+    visible = {n for n in names if _written(n)}
     if len(visible) == 1:
         return visible.pop()
     labels = {_label(n) for n in names} - {None}

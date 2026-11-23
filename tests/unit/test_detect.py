@@ -7,9 +7,10 @@ from __future__ import annotations
 import unittest
 
 from fvlint.checks import INFO, Check
-from fvlint.detect import (MAX_FORWARD, MAX_PATHS, _compares, _dedupe, _dest_name, _fit, _label, _operand_is,
-                           _signed_val, clean_conds, detect_all, detect_case, detect_counters, detect_index,
-                           detect_memory, fmt_cycles, forward, harmless_full_case, min_cycles_to_wrap, mux_sources)
+from fvlint.detect import (MAX_FORWARD, MAX_PATHS, _bits_label, _compares, _dedupe, _dest_name, _fit, _label,
+                           _operand_is, _signed_val, clean_conds, detect_all, detect_case, detect_counters,
+                           detect_index, detect_memory, fmt_cycles, forward, harmless_full_case, min_cycles_to_wrap,
+                           mux_sources)
 
 from .support import NB, const, load_snapshot
 
@@ -928,6 +929,18 @@ class Labels(unittest.TestCase):
                            ("$flatten\\u_m.$0$memwr$\\mem$x.v:3$7_ADDR", "u_m.mem")):
             with self.subTest(name=name):
                 self.assertEqual(_label(name), want)
+
+    def test_intermediate_names_are_not_user_names(self):
+        # Flattened without the $flatten prefix, Yosys' `$0\\q` of an instance
+        # is a visible net (its name doesn't start with `$`): still not a name
+        # the user wrote, so not a check id.
+        b = NB()
+        tmp = b.net("u_x.$0\\q[3:0]", b.new(4))
+        nl = b.build()
+        self.assertEqual(_bits_label(nl, tmp), "u_x.q")                   # the whole net
+        self.assertEqual(_bits_label(nl, tmp[1:3]), "u_x.q")              # part of it
+        b.net("u_x.q_next", tmp)                                         # a written alias wins
+        self.assertEqual(_bits_label(b.build(), tmp), "u_x.q_next")
 
 
 class HarmlessFullCase(unittest.TestCase):
