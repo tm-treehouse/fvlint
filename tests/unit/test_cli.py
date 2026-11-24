@@ -16,6 +16,8 @@ from unittest import mock
 
 from fvlint import __version__, cli
 from fvlint.checks import FAIL, PROVEN, UNKNOWN, VACUOUS, Check, Result
+from fvlint.elaborate import AssumePort
+from fvlint.netlist import Netlist
 from fvlint.tools import ToolError
 
 from .support import NB, TempDirCase, captured, snapshot
@@ -342,16 +344,45 @@ class ToolProblems(CliCase):
 
 
 class Environment(CliCase):
-    def test_assumption_ports_must_be_top_inputs(self):
-        for ports in ({"nope": "input"}, {"en": "output"}, {"o": "input"}):
+    def test_assumption_ports_bind_to_inputs_and_nets(self):
+        nl = Netlist.load(snapshot("snap_counters"), "snap_counters")
+        self.elab["assume_ports"] = {"en": AssumePort("input", 1, "en"),
+                                     "q": AssumePort("input", 4, "u_sub.q"),            # fvlint_net attribute
+                                     "u_sub.en": AssumePort("input", 1, "u_sub.en"),    # escaped identifier
+                                     "o": AssumePort("input", 32, "o")}                 # a top-level output
+        self.assertEqual(self.run_cli()[0], 0)
+        self.assertEqual(self.Engine.last.assume_ports,
+                         {"en": nl.ports["en"]["bits"], "q": nl.netnames["u_sub.q"]["bits"],
+                          "u_sub.en": nl.netnames["u_sub.en"]["bits"], "o": nl.ports["o"]["bits"]})
+
+    def test_assumption_ports_that_dont_fit(self):
+        cases = [
+            ({"x": AssumePort("output", 1, "en")}, "port x of fvlint_assumptions is an output"),
+            ({"q": AssumePort("input", 4, "u_sub.qq")}, "port q: snap_counters has no input or net named u_sub.qq "
+                                                        "(did you mean u_sub.q"),
+            ({"z": AssumePort("input", 1, "zzzz")}, "port z: snap_counters has no input or net named zzzz. "),
+            ({"q": AssumePort("input", 3, "u_sub.q")}, "port q is 3 bit(s) wide, u_sub.q is 4"),
+            ({"t": AssumePort("input", 6, "$0\\acc[5:0]")},                                  # a hidden net
+             "port t: snap_counters has no input or net named $0\\acc[5:0]."),
+        ]
+        for ports, msg in cases:
             with self.subTest(ports=ports):
                 self.elab["assume_ports"] = ports
                 rc, _, err = self.run_cli()
                 self.assertEqual(rc, 2)
-                self.assertIn(f"fvlint_assumptions ports {next(iter(ports))} are not inputs of snap_counters", err)
-        self.elab["assume_ports"] = {"en": "input", "din": "input"}
-        self.assertEqual(self.run_cli()[0], 0)
-        self.assertEqual(self.Engine.last.assume_ports, {"en": "input", "din": "input"})
+                self.assertIn("fvlint: --assume: " + msg, err)
+                self.assertIn("by its fvlint_net attribute, else by its own name", err)
+        self.elab["assume_ports"] = {"a": AssumePort("output", 1, "en"), "b": AssumePort("input", 2, "en")}
+        err = self.run_cli()[2]
+        self.assertIn("is an output; assumptions only read the design; port b is 2 bit(s) wide, en is 1.", err)
+        self.elab["assume_ports"] = {"x": AssumePort("output", 1, "nope")}          # one error per port
+        err = self.run_cli()[2]
+        self.assertIn("port x of fvlint_assumptions is an output; assumptions only read the design. ", err)
+        self.assertNotIn("nope", err)
+        self.elab["assume_ports"] = {"s": AssumePort("input", 1, "u_sub.x")}        # 4 near names: the 3 nearest
+        err = self.run_cli()[2]
+        self.assertEqual(err.count("(did you mean "), 1)
+        self.assertEqual(err.split("(did you mean ")[1].split("?)")[0].count(", "), 2)
 
     def test_reset_options(self):
         rc, _, err = self.run_cli("--reset", "nope")
@@ -475,8 +506,8 @@ class Flow(CliCase):
 
     # Spelled out here, not read back from cli.KINDS: a misspelt entry there
     # would make that kind unselectable while a loop over KINDS still passes.
-    ALL_KINDS = ["counter_overflow", "counter_underflow", "parallel_case", "full_case", "index_range", "mem_addr",
-                 "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary"]
+    ALL_KINDS = ["counter_overflow", "counter_underflow", "parallel_case", "full_case", "index_range",
+                 "shift_range", "div_zero", "mem_addr", "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary"]
 
     def test_every_check_kind_is_accepted(self):
         self.assertEqual(cli.KINDS, self.ALL_KINDS)

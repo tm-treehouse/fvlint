@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import os
 import re
 import sys
@@ -23,10 +24,37 @@ from .tools import Toolchain, ToolError
 from .waivers import Waivers
 
 KINDS = ["counter_overflow", "counter_underflow", "parallel_case", "full_case", "index_range",
-         "mem_addr", "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary"]
+         "shift_range", "div_zero", "mem_addr", "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary"]
 
 
 DEFAULT_HORIZON = 1 << 60
+
+
+def bind_assumptions(nl: Netlist, ports: dict) -> dict:
+    """{port: design bits} for the ports of fvlint_assumptions: a top-level
+    input, or any other net of the design by its hierarchical name.  Raises
+    ValueError naming every port that doesn't fit."""
+    # Every port of the top module is a net of its own name too.
+    visible = {n: x["bits"] for n, x in nl.netnames.items() if not x.get("hide_name", 0)}
+    bound, errors = {}, []
+    for name, p in ports.items():
+        if p.direction != "input":
+            errors.append(f"port {name} of fvlint_assumptions is an {p.direction}; "
+                          "assumptions only read the design")
+            continue
+        bits = visible.get(p.net)
+        if bits is None:
+            near = difflib.get_close_matches(p.net, visible, n=3)
+            hint = f" (did you mean {', '.join(near)}?)" if near else ""
+            errors.append(f"port {name}: {nl.top} has no input or net named {p.net}{hint}")
+        elif len(bits) != p.width:
+            errors.append(f"port {name} is {p.width} bit(s) wide, {p.net} is {len(bits)}")
+        else:
+            bound[name] = list(bits)
+    if errors:
+        raise ValueError("; ".join(errors) + ". A port reads the top-level input or the net (hierarchical "
+                         "name, e.g. u_core.state) named by its fvlint_net attribute, else by its own name")
+    return bound
 
 
 def cycles_arg(v: str) -> int:
@@ -114,8 +142,9 @@ def build_parser():
                    help="cycles to hold reset at start (default: 1 + longest reset synchronizer)")
     g.add_argument("--uninit", choices=["zero", "free"], default="zero",
                    help="power-up value of registers without reset/init (default: zero, FPGA style)")
-    g.add_argument("--assume", help="SV file with module fvlint_assumptions whose ports are top-level "
-                                    "inputs (by name) and which contains assume statements")
+    g.add_argument("--assume", help="SV file with module fvlint_assumptions and its assume statements; its ports "
+                                    "read top-level inputs or other nets (hierarchical name, by port name or "
+                                    "an fvlint_net attribute); fvl_assume_* interface rules are available")
     g = p.add_argument_group("proof")
     g.add_argument("--engine", choices=["auto", "pdr", "smtbmc"], default="auto",
                    help="auto: ABC PDR if yosys-abc is available, else k-induction (default)")
@@ -211,12 +240,12 @@ def main(argv=None, project: dict | None = None) -> int:
     if nl.unknown_types:
         _warn("cell types not modelled by fvlint are cut (treated as free): "
               + ", ".join(sorted(nl.unknown_types)))
+    assume = {}
     if elab["assume_ports"]:
-        bad = [p for p, d in elab["assume_ports"].items()
-               if p not in nl.ports or nl.ports[p]["direction"] != "input" or d != "input"]
-        if bad:
-            print(f"fvlint: --assume: fvlint_assumptions ports {', '.join(bad)} are not inputs of "
-                  f"{args.top}; ports are matched to top-level inputs by name", file=sys.stderr)
+        try:
+            assume = bind_assumptions(nl, elab["assume_ports"])
+        except ValueError as e:
+            print(f"fvlint: --assume: {e}", file=sys.stderr)
             return 2
     try:
         resets = discover(nl, args.reset, args.no_reset, args.reset_cycles, args.reset_anytime)
@@ -283,7 +312,7 @@ def main(argv=None, project: dict | None = None) -> int:
                    pdr_timeout=args.pdr_timeout,
                    uninit=args.uninit, vacuity=not args.no_vacuity, cegar=not args.no_cegar,
                    batch_cells=args.batch_cells, batch_props=args.batch_props, jobs=args.jobs)
-    engine = Engine(nl, tools, out, lemmas, resets, opts, elab["assume_ports"], elab["assume_file"])
+    engine = Engine(nl, tools, out, lemmas, resets, opts, assume, elab["assume_file"])
     env_err = engine.environment_ok() if todo else None
     if env_err:
         results += [Result(check=c, status=ERROR, detail=env_err) for c in todo]

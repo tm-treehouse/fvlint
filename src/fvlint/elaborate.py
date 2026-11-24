@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 from dataclasses import dataclass, field
+from importlib import resources
 
 from .tools import IDENT, Toolchain, ToolError, yosys_arg
 
@@ -197,6 +198,33 @@ def failed_fsm(log_full: str) -> str | None:
     return names[-1] if names else None
 
 
+# Interface rules (fvl_assume_handshake, ...) every --assume file can use.
+ASSUME_LIB = resources.files("fvlint").joinpath("assume_lib.sv").read_text()
+ASSUME_LIB_FILE = "fvl_assume_lib.sv"
+
+
+@dataclass
+class AssumePort:
+    """A port of the fvlint_assumptions module: the design signal it reads."""
+    direction: str
+    width: int
+    net: str              # a top-level input, or an internal net (hierarchical name)
+
+
+def assumption_ports(module: dict) -> dict:
+    """{port: AssumePort} of fvlint_assumptions (its Yosys JSON).  A port
+    reads the design signal named by its fvlint_net attribute, else the one
+    with its own name (an escaped identifier such as \\u_core.valid names an
+    internal net)."""
+    out = {}
+    for name, p in module["ports"].items():
+        attrs = module.get("netnames", {}).get(name, {}).get("attributes", {})
+        net = attrs.get("fvlint_net")
+        net = net.strip() if isinstance(net, str) and net.strip() else name
+        out[name] = AssumePort(p["direction"], len(p["bits"]), net)
+    return out
+
+
 def elaborate(src: Sources, top: str, frontend: str, tools: Toolchain, outdir: str,
               assume_file: str | None = None) -> dict:
     """One Yosys run producing main.json (structure preserved for detection
@@ -250,12 +278,14 @@ def elaborate(src: Sources, top: str, frontend: str, tools: Toolchain, outdir: s
 
     assume_ports = None
     if assume_file:
-        tools.run_yosys(f"read_verilog -formal -sv {yosys_arg(path(assume_file))}\n"
+        with open(os.path.join(edir, ASSUME_LIB_FILE), "w") as f:
+            f.write(ASSUME_LIB)
+        tools.run_yosys(f"read_verilog -formal -sv {ASSUME_LIB_FILE}\n"
+                        f"read_verilog -formal -sv {yosys_arg(path(assume_file))}\n"
                         "hierarchy -top fvlint_assumptions\nproc\nwrite_json assume.json\n",
                         edir, "assume")
         with open(os.path.join(edir, "assume.json")) as f:
-            m = json.load(f)["modules"]["fvlint_assumptions"]
-        assume_ports = {n: p["direction"] for n, p in m["ports"].items()}
+            assume_ports = assumption_ports(json.load(f)["modules"]["fvlint_assumptions"])
     return {"main": main, "fsm": fsm_json if os.path.exists(fsm_json) else None,
             "fsm_warning": fsm_warning, "src_base": edir, "src_map": src_map,
             "assume_ports": assume_ports, "assume_file": assume_file}

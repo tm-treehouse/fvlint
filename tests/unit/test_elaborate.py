@@ -9,7 +9,8 @@ import json
 import os
 import unittest
 
-from fvlint.elaborate import (HDL_EXT, MAX_FSM_RETRIES, Sources, _fsm_commands, _slang_arg, _stage, elaborate,
+from fvlint.elaborate import (ASSUME_LIB, ASSUME_LIB_FILE, HDL_EXT, MAX_FSM_RETRIES, AssumePort, Sources,
+                              assumption_ports, _fsm_commands, _slang_arg, _stage, elaborate,
                               elaborate_without_full_case, failed_fsm, read_commands, without_full_case)
 from fvlint.tools import ToolError
 
@@ -34,7 +35,9 @@ class FakeTools:
         if name == "assume":
             with open(os.path.join(cwd, "assume.json"), "w") as f:
                 json.dump({"modules": {"fvlint_assumptions": {"ports": {
-                    "lane": {"direction": "input", "bits": [2, 3]}, "x": {"direction": "output", "bits": [4]}}}}}, f)
+                    "lane": {"direction": "input", "bits": [2, 3]}, "x": {"direction": "output", "bits": [4]},
+                    "q": {"direction": "input", "bits": [5, 6, 7]}, "u_a.v": {"direction": "input", "bits": [8]}},
+                    "netnames": {"q": {"bits": [5, 6, 7], "attributes": {"fvlint_net": "u_core.q"}}}}}}, f)
             return 0
         for out in self.outputs:
             with open(os.path.join(cwd, out), "w") as f:
@@ -388,12 +391,31 @@ class Elaboration(TempDirCase):
         assume = self.write("fv/assume.sv", "module fvlint_assumptions(input [1:0] lane); endmodule\n")
         tools = FakeTools()
         r = elaborate(Sources(files=[self.rtl]), "top", "yosys", tools, self.out, assume)
-        self.assertEqual(r["assume_ports"], {"lane": "input", "x": "output"})
+        self.assertEqual(r["assume_ports"], {"lane": AssumePort("input", 2, "lane"),
+                                             "x": AssumePort("output", 1, "x"),
+                                             "q": AssumePort("input", 3, "u_core.q"),
+                                             "u_a.v": AssumePort("input", 1, "u_a.v")})
         self.assertEqual(r["assume_file"], assume)
-        name, script, _, allow_fail = tools.runs[1]
+        name, script, cwd, allow_fail = tools.runs[1]
         self.assertEqual((name, allow_fail), ("assume", False))
-        self.assertEqual(script, f"read_verilog -formal -sv {assume}\nhierarchy -top fvlint_assumptions\n"
-                                 "proc\nwrite_json assume.json\n")
+        self.assertEqual(script, f"read_verilog -formal -sv {ASSUME_LIB_FILE}\nread_verilog -formal -sv {assume}\n"
+                                 "hierarchy -top fvlint_assumptions\nproc\nwrite_json assume.json\n")
+        with open(os.path.join(cwd, ASSUME_LIB_FILE)) as f:
+            self.assertEqual(f.read(), ASSUME_LIB)
+        self.assertIn("module fvl_assume_handshake", ASSUME_LIB)
+
+    def test_assumption_port_names(self):
+        ports = {"a": {"direction": "input", "bits": [2]}, "b": {"direction": "input", "bits": [3, 4]},
+                 "c": {"direction": "input", "bits": [5]}, "d": {"direction": "input", "bits": [6]}}
+        nets = {"a": {"attributes": {"fvlint_net": "u_x.a "}},       # Yosys may pad a string attribute
+                "b": {"attributes": {"src": "a.sv:1"}},
+                "c": {"attributes": {"fvlint_net": "  "}},          # blank: the port's own name
+                "d": {"attributes": {"fvlint_net": 1}}}             # not a string: the port's own name
+        self.assertEqual(assumption_ports({"ports": ports, "netnames": nets}),
+                         {"a": AssumePort("input", 1, "u_x.a"), "b": AssumePort("input", 2, "b"),
+                          "c": AssumePort("input", 1, "c"), "d": AssumePort("input", 1, "d")})
+        self.assertEqual(assumption_ports({"ports": {"e": {"direction": "input", "bits": [7]}}}),
+                         {"e": AssumePort("input", 1, "e")})          # no netnames at all
 
 
 if __name__ == "__main__":

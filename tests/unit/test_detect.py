@@ -9,8 +9,8 @@ import unittest
 from fvlint.checks import INFO, Check
 from fvlint.detect import (MAX_FORWARD, MAX_PATHS, _bits_label, _compares, _dedupe, _dest_name, _fit, _guard,
                            _label, _operand_is, _signed_val, clean_conds, detect_all, detect_case, detect_counters,
-                           detect_index, detect_memory, fmt_cycles, forward, harmless_full_case, min_cycles_to_wrap,
-                           mux_sources)
+                           detect_div, detect_index, detect_memory, detect_shift, fmt_cycles, forward,
+                           harmless_full_case, min_cycles_to_wrap, mux_sources)
 
 from .support import NB, const, load_snapshot
 
@@ -253,11 +253,21 @@ class Forward(unittest.TestCase):
         b.ff(b.mux(b.input("o1"), v[1:], s1), b.input("clk")[0], q=b.net("q1", b.new(1)))
         self.assertEqual(forward(b.build(), v), ([], v))                 # one bit each: nothing in common
 
-    def test_unused_bit_stops_the_walk(self):
+    def test_unused_bits_are_left_behind(self):
+        # A result stored in a narrower register: v[1] is read by nothing,
+        # v[0] goes on through the mux (and so do its conditions).
         b = NB()
         v, s = b.input("v", 2), b.input("s")[0]
-        b.mux(b.input("o"), v[:1], s)                                  # v[1] is read by nothing
+        y = b.mux(b.input("o"), v[:1], s)
+        self.assertEqual(forward(b.build(), v), ([(s, 1)], y))
+
+    def test_unused_value_stops_the_walk(self):
+        b = NB()
+        v = b.input("v", 2)
         self.assertEqual(forward(b.build(), v), ([], v))
+        s = b.input("s")[0]
+        y = b.mux(b.input("o", 2), v, s)                               # the mux output is read by nothing
+        self.assertEqual(forward(b.build(), v), ([(s, 1)], y))
 
     def test_depth_limit_is_exact(self):
         b = NB()
@@ -1253,6 +1263,132 @@ class PartSelects(unittest.TestCase):
         self.assertEqual(c.params["HI"], 7)
         nl, _ = self.build(8, 4, 4, signed=1)                           # valid 0..4
         self.assertEqual(detect_index(nl)[0].params["HI"], 4)
+
+
+class Shifts(unittest.TestCase):
+    def build(self, ctype, aw, yw, bw, b_bits=None, dead=False, guard=False, a_bits=None):
+        b = NB()
+        a = a_bits if a_bits is not None else b.input("d", aw)
+        amt = b_bits if b_bits is not None else b.input("s", bw)
+        y = b.op(ctype, w=yw, A=a, B=amt, attrs={"src": "s.v:4.1-4.9"})
+        g = None
+        if dead:
+            y = b.mux(b.input("o", yw), y, "0")
+        elif guard:
+            g = b.input("g")[0]
+            y = b.mux(b.input("z", yw), y, g)
+        b.net("out", y)
+        return b.build(), amt, g
+
+    def test_left_shift_against_the_result_width(self):
+        nl, amt, _ = self.build("$shl", 4, 8, 4)                    # amount up to 15, result 8 bits
+        (c,) = detect_shift(nl)
+        self.assertEqual((c.id, c.src, c.checker), ("shift_range:out", "s.v:4", "fvl_range"))
+        self.assertEqual((c.params, c.ports, c.conds), ({"W": 4, "LO": 0, "HI": 7, "SIGNED": 0}, {"v": amt}, []))
+        self.assertEqual(c.desc, "left shift amount stays within 0..7 (a 8-bit result: more shifts every bit out)")
+        self.assertEqual(detect_shift(self.build("$shl", 4, 8, 3)[0]), [])            # at most 7 < 8
+        self.assertEqual(detect_shift(self.build("$sshl", 8, 4, 2)[0]), [])           # at most 3 < 4
+        self.assertEqual(detect_shift(self.build("$sshl", 8, 4, 3)[0])[0].params["HI"], 3)
+
+    def test_right_shift_against_the_value_width(self):
+        nl, amt, _ = self.build("$shr", 4, 8, 3)                    # value 4 bits: 4..7 shift it all out
+        (c,) = detect_shift(nl)
+        self.assertEqual(c.params, {"W": 3, "LO": 0, "HI": 3, "SIGNED": 0})
+        self.assertTrue(c.desc.startswith("right shift amount stays within 0..3 (a 4-bit value:"))
+        self.assertEqual(detect_shift(self.build("$sshr", 8, 4, 3)[0]), [])           # at most 7 < 8
+        (c,) = detect_shift(self.build("$sshr", 8, 8, 4)[0])
+        self.assertEqual(c.params["HI"], 7)
+        self.assertTrue(c.desc.startswith("right shift amount stays within 0..7 (a 8-bit value:"))
+
+    def test_right_shift_counts_the_bits_that_carry_data(self):
+        x = [1000, 1001, 1002, 1003]                       # bits of a net outside the builder's range
+        for a, hi in ((x + ["0"] * 4, 3),                  # {4'b0, x}: 4..7 shift x out
+                      (x + ["0", "1", "0", "0"], 5),       # a constant 1 at bit 5 carries data
+                      (x[:2] + ["0", "0"] + x[2:] + ["0"], 5)):   # only the top zeros count
+            with self.subTest(a=a):
+                (c,) = detect_shift(self.build("$shr", len(a), 8, 4, a_bits=a)[0])
+                self.assertEqual(c.params["HI"], hi)
+        self.assertEqual(detect_shift(self.build("$shr", 4, 8, 4, a_bits=["0"] * 4)[0]), [])   # nothing to shift
+        self.assertEqual(detect_shift(self.build("$shl", 8, 8, 4, a_bits=x + ["0"] * 4)[0])[0].params["HI"], 7)
+
+    def test_amounts_that_cannot_reach_the_width_are_skipped(self):
+        self.assertEqual(detect_shift(self.build("$shl", 8, 8, 4, b_bits=const(9, 4))[0]), [])
+        s = [1000, 1001, 1002]                             # bits outside the builder's range
+        # Top bit constant 0: at most 7 < 8.  With it a constant 1, 8..15.
+        self.assertEqual(detect_shift(self.build("$shl", 8, 8, 4, b_bits=s + ["0"])[0]), [])
+        self.assertEqual(len(detect_shift(self.build("$shl", 8, 8, 4, b_bits=s + ["1"])[0])), 1)
+        self.assertEqual(len(detect_shift(self.build("$shl", 8, 8, 4, b_bits=["0", "0", "0"] + s[:1])[0])), 1)
+        self.assertEqual(detect_shift(self.build("$shl", 8, 0, 4)[0]), [])            # no result bits
+
+    def test_unused_or_guarded_results(self):
+        self.assertEqual(detect_shift(self.build("$shl", 8, 8, 4, dead=True)[0]), [])
+        nl, _, g = self.build("$shr", 8, 8, 4, guard=True)
+        (c,) = detect_shift(nl)
+        self.assertEqual(c.conds, [(g, 1)])
+
+    def test_other_cells_are_not_shifts(self):
+        for t in ("$shift", "$shiftx", "$add", "$div"):
+            with self.subTest(t=t):
+                self.assertEqual(detect_shift(self.build(t, 8, 8, 4)[0]), [])
+
+    def test_same_destination_twice(self):
+        b = NB()
+        s = b.input("s", 4)
+        y1 = b.op("$shl", w=8, A=b.input("a", 8), B=s, attrs={"src": "s.v:9.1-9.2"})
+        y2 = b.op("$shl", w=8, A=b.input("c", 8), B=s, attrs={"src": "s.v:3.1-3.2"})
+        b.net("o", b.mux(y1, y2, b.input("k")[0]))
+        self.assertEqual(sorted(c.id for c in detect_shift(b.build())), ["shift_range:o", "shift_range:o#1"])
+
+
+class Division(unittest.TestCase):
+    def build(self, ctype, bw=4, b_bits=None, dead=False, guard=False):
+        b = NB()
+        a = b.input("a", 8)
+        d = b_bits if b_bits is not None else b.input("b", bw)
+        y = b.op(ctype, w=8, A=a, B=d, attrs={"src": "d.v:7.1-7.9"})
+        g = None
+        if dead:
+            y = b.mux(b.input("o", 8), y, "0")
+        elif guard:
+            g = b.input("g")[0]
+            y = b.mux(b.input("z", 8), y, g)
+        b.net("q", y)
+        return b.build(), d, g
+
+    def test_divisor_never_zero(self):
+        for ctype, what in (("$div", "quotient"), ("$divfloor", "quotient"),
+                            ("$mod", "remainder"), ("$modfloor", "remainder")):
+            with self.subTest(ctype=ctype):
+                nl, d, _ = self.build(ctype)
+                (c,) = detect_div(nl)
+                self.assertEqual((c.id, c.src, c.checker, c.params, c.ports, c.conds),
+                                 ("div_zero:q", "d.v:7", "fvl_nonzero", {"W": 4}, {"s": d}, []))
+                self.assertEqual(c.desc, f"divisor is never 0 where the {what} is used")
+
+    def test_divisors_that_cannot_be_zero_are_skipped(self):
+        self.assertEqual(detect_div(self.build("$div", b_bits=const(3, 4))[0]), [])
+        self.assertEqual(detect_div(self.build("$div", b_bits=const(0, 4))[0]), [])   # constant: not ours
+        s = [1000, 1001, 1002]                             # bits outside the builder's range
+        self.assertEqual(detect_div(self.build("$mod", b_bits=["1"] + s)[0]), [])      # b | 1
+        self.assertEqual(len(detect_div(self.build("$mod", b_bits=["0"] + s)[0])), 1)
+
+    def test_unused_or_guarded_results(self):
+        self.assertEqual(detect_div(self.build("$div", dead=True)[0]), [])
+        nl, _, g = self.build("$div", guard=True)
+        self.assertEqual(detect_div(nl)[0].conds, [(g, 1)])
+
+    def test_other_cells_are_not_divisions(self):
+        for t in ("$mul", "$shl", "$pow"):
+            with self.subTest(t=t):
+                self.assertEqual(detect_div(self.build(t)[0]), [])
+
+    def test_same_destination_twice(self):
+        b = NB()
+        d = b.input("d", 4)
+        y1 = b.op("$div", w=8, A=b.input("a", 8), B=d, attrs={"src": "d.v:9.1-9.2"})
+        y2 = b.op("$mod", w=8, A=b.input("c", 8), B=d, attrs={"src": "d.v:3.1-3.2"})
+        b.net("o", b.mux(y1, y2, b.input("k")[0]))
+        self.assertEqual(sorted(c.id for c in detect_div(b.build())), ["div_zero:o", "div_zero:o#1"])
 
 
 class Memories(unittest.TestCase):

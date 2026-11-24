@@ -5,6 +5,60 @@ SPDX-License-Identifier: ISC
 
 # Changelog
 
+## 0.5.0
+
+Assumptions on any net of the design, an assumption library for common
+interfaces, and two new checks.
+
+### Behaviour changes
+
+* `shift_range` and `div_zero` run by default, so a design with a variable
+  shift or division can get new findings. `--checks` (or `checks` in a
+  project file) selects the kinds to run; waivers work as for every check.
+* `--assume` errors are worded differently: a port that names no input or
+  net says which name it looked for and suggests the nearest ones.
+
+### Assumptions on internal nets
+
+* A port of `fvlint_assumptions` can read any net of the design, named by
+  its hierarchical name in an `fvlint_net` attribute or as an escaped
+  identifier (`input \u_core.state`), not only a top-level input. Ports are
+  checked against the design: an unknown name (with the nearest names), a
+  width that doesn't match, or an output port is an error.
+* The logic that drives an assumed net is in every proof slice. Left out,
+  the net would be a free value, and a counterexample the assumption rules
+  out could be reported as a `FAIL` on the full design; a regression case
+  (`assume/internal`) shows the difference.
+* An assumption library ships with fvlint and every `--assume` file can use
+  it: `fvl_assume_onehot`, `fvl_assume_onehot0`, `fvl_assume_range`,
+  `fvl_assume_stable` (configuration inputs), `fvl_assume_handshake`
+  (valid/ready sources) and `fvl_assume_pulse`.
+
+### New checks
+
+* `shift_range`: a shift by a variable amount that can move every bit out
+  (left: past the result's width; right: past the bits of the value that
+  carry data), where the result is used.
+* `div_zero`: division or modulo by a variable that can be 0 where the
+  result is used. Divisors with a constant 1 bit are skipped.
+
+### Detection
+
+* Following a value to the register that stores it no longer stops at bits
+  nothing reads (the top of a result stored in a narrower register): the
+  check gets the conditions and the name of the bits that are used. No
+  check id of the regression suite changed.
+
+### Tests
+
+* The fuzzer generates shifts and divisions by registers (guarded by
+  conditions that are or aren't enough) and an internal net assumed to be
+  0, given to fvlint through `fvlint_net` and to the oracle as the same
+  assume statement.
+* Regression cases for both new checks (clean, guarded and buggy) and for
+  internal-net assumptions and every library rule (each `FAIL` without the
+  assumption, `PROVEN` with it), on both proof engines.
+
 ## 0.4.0
 
 Fewer findings that need a waiver, and the integration work a project had
