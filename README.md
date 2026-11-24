@@ -254,6 +254,12 @@ Other inputs: `args` (more options), `output`, `upload`, `artifact-name`,
 CI uses). The action can run several times in one job (the OSS CAD Suite is
 installed once), with one `oss-cad-suite-version` per job.
 
+[fvlint-example](https://github.com/tm-treehouse/fvlint-example) is a
+minimal repository set up this way: a small design, a project file,
+assumptions, waivers and the workflow, with its CI passing.
+[picorv32-fvlint](https://github.com/tm-treehouse/picorv32-fvlint) runs
+fvlint on a real core, PicoRV32.
+
 ### Results
 
 | Status | Meaning |
