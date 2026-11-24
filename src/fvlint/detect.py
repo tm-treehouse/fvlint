@@ -156,18 +156,19 @@ def _forward_walk(nl: Netlist, cur: list, conds: list, depth: int, budget: list)
         depth -= 1
         if any(is_const(b) for b in cur):
             break
+        used = [b for b in cur if nl.readers.get(b)]
+        if not used:
+            break                                        # nothing reads the value: stop here
+        # Bits nothing reads (the top of a result stored in a narrower
+        # register) don't matter: follow the others.
+        cur = used
         readers, single = {}, True
         for b in cur:
-            rs = nl.readers.get(b, [])
-            if not rs:
-                single = None                            # an unused bit: stop here
-                break
+            rs = nl.readers[b]
             if len(rs) != 1:
                 single = False
             for cell, port, off in rs:
                 readers.setdefault((cell, port), []).append(off)
-        if single is None:
-            break
         if single and len(readers) == 1:
             (cell, port), offs = next(iter(readers.items()))
             step = _forward_step(nl, cell, port, offs)
@@ -728,6 +729,82 @@ def detect_index(nl: Netlist):
     return _dedupe(checks)
 
 
+# ------------------------------------------------------ shifts and division
+def _zero_top(bits: list) -> int:
+    """How many of the top bits are constant 0."""
+    n = 0
+    for b in reversed(bits):
+        if b != "0":
+            break
+        n += 1
+    return n
+
+
+def _max_value(bits: list) -> int:
+    """The largest unsigned value bits can take: constant 0 bits stay 0."""
+    return sum(1 << i for i, b in enumerate(bits) if b != "0")
+
+
+SHIFT_TYPES = {"$shl": "left", "$sshl": "left", "$shr": "right", "$sshr": "right"}
+DIV_TYPES = {"$div": "quotient", "$divfloor": "quotient", "$mod": "remainder", "$modfloor": "remainder"}
+
+
+def detect_shift(nl: Netlist):
+    """A shift by a variable amount that can move every bit out: past the
+    result's width for a left shift, past the bits of the shifted value that
+    can carry data for a right shift (the amount is unsigned, as Verilog and
+    Yosys treat it)."""
+    checks = []
+    for cell, c in nl.cells.items():
+        way = SHIFT_TYPES.get(c["type"])
+        if not way:
+            continue
+        b = nl.conn(cell, "B")
+        if all(is_const(x) for x in b):
+            continue
+        a, y = nl.conn(cell, "A"), nl.conn(cell, "Y")
+        # A right shift loses the value once it is past the bits that can
+        # carry data: constant 0 bits on top (`{24'b0, x} >> n`, or a value
+        # Yosys widened to the result) don't count.
+        width = len(y) if way == "left" else len(a) - _zero_top(a)
+        if width == 0 or _max_value(b) < width:
+            continue                                     # the amount can't reach the width
+        conds, dest = forward(nl, y)
+        if conds is None:
+            continue
+        src = nl.cell_src(cell)
+        checks.append(Check(
+            kind="shift_range", target=_dest_name(nl, dest, y, src), src=src,
+            desc=f"{way} shift amount stays within 0..{width - 1} (a {width}-bit "
+                 f"{'result' if way == 'left' else 'value'}: more shifts every bit out)",
+            checker="fvl_range", params={"W": len(b), "LO": 0, "HI": width - 1, "SIGNED": 0},
+            ports={"v": b}, conds=conds))
+    return _dedupe(checks)
+
+
+def detect_div(nl: Netlist):
+    """Division or modulo by a variable that can be zero where the result is
+    used (Verilog gives 'x; hardware gives whatever the divider does)."""
+    checks = []
+    for cell, c in nl.cells.items():
+        what = DIV_TYPES.get(c["type"])
+        if not what:
+            continue
+        b = nl.conn(cell, "B")
+        if all(is_const(x) for x in b) or "1" in b:
+            continue                                     # constant, or a bit that is always 1
+        y = nl.conn(cell, "Y")
+        conds, dest = forward(nl, y)
+        if conds is None:
+            continue
+        src = nl.cell_src(cell)
+        checks.append(Check(
+            kind="div_zero", target=_dest_name(nl, dest, y, src), src=src,
+            desc=f"divisor is never 0 where the {what} is used",
+            checker="fvl_nonzero", params={"W": len(b)}, ports={"s": b}, conds=conds))
+    return _dedupe(checks)
+
+
 # ----------------------------------------------------------------- memory
 def detect_memory(nl: Netlist):
     checks = []
@@ -790,5 +867,5 @@ def _dedupe(checks):
 
 def detect_all(nl: Netlist, max_level: int, uninit: str = "zero"):
     counters, lemmas = detect_counters(nl, max_level, uninit)
-    checks = counters + detect_case(nl) + detect_index(nl) + detect_memory(nl)
+    checks = counters + detect_case(nl) + detect_index(nl) + detect_shift(nl) + detect_div(nl) + detect_memory(nl)
     return checks, lemmas

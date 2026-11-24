@@ -15,12 +15,14 @@ import json
 import os
 import threading
 import unittest
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from fvlint.checks import ERROR, FAIL, PROVEN, UNKNOWN, VACUOUS, Check, Lemma, Result
 from fvlint.cone import UNBOUNDED, ConeSpec, slice_spec
 from fvlint.detect import detect_counters
+from fvlint.elaborate import ASSUME_LIB
 from fvlint.engine import Engine, Options, St
 from fvlint.netlist import Netlist, is_const
 from fvlint.resets import ResetBit, Resets, discover
@@ -331,17 +333,38 @@ class Plumbing(EngineCase):
         self.assertEqual(os.path.basename(eng._dir("x")), "00401_x")
 
     def test_reset_and_assumption_cells(self):
-        eng = self.engine(resets=Resets(self.rst, [], 3, anytime=True), assume_ports={"en": "input", "nope": "input"})
-        self.assertEqual(eng._keep_ports(), {"en", "nope", "rst"})
-        spec = slice_spec(self.nl, self.checks["cnt"].roots(), ["ff_cnt"], 0)
-        m = eng._module(spec)
+        en, lim = self.nl.ports["en"]["bits"], self.nl.netnames["lim"]["bits"]
+        # `load` is bound to an internal net that has the name of a top-level input.
+        eng = self.engine(resets=Resets(self.rst, [], 3, anytime=True),
+                          assume_ports={"en": en, "l": lim, "load": lim})
+        self.assertEqual(eng._keep_ports(), {"rst"})
+        m = eng._module(eng._slice(self.checks["other"], [], 0))
         r = m["cells"]["fvl_reset"]
         self.assertEqual((r["type"], r["parameters"], r["connections"]),
                          ("fvl_reset_init", {"ACTIVE": 1, "CYCLES": 3, "ANYTIME": 1}, {"rst": [self.rst.bit]}))
         a = m["cells"]["fvl_assume"]
-        self.assertEqual((a["type"], a["connections"]), ("fvlint_assumptions", {"en": self.nl.ports["en"]["bits"]}))
+        self.assertEqual((a["type"], a["port_directions"], a["connections"]),
+                         ("fvlint_assumptions", {"en": "input", "l": "input", "load": "input"},
+                          {"en": en, "l": lim, "load": lim}))
         self.assertIn("rst", m["ports"])
-        self.assertIn("en", m["ports"])
+        self.assertIn("en", m["ports"])                     # assumed: in the slice though `other` doesn't read it
+        self.assertIn("lim", m["netnames"])                 # cut at level 0, but there for the assumption
+        self.assertNotIn("load", m["ports"])
+
+    def test_assumed_nets_are_in_every_slice(self):
+        lim = self.nl.netnames["lim"]["bits"]
+        plain, assumed = self.engine(), self.engine(assume_ports={"l": lim + ["0"]})
+        self.assertEqual(assumed.assume_bits, lim)
+        self.assertEqual(assumed.assume_cells, {"ff_lim"})
+        self.assertEqual((plain.assume_bits, plain.assume_cells), ([], set()))
+        other = self.checks["other"]
+        self.assertNotIn("ff_lim", plain._slice(other, [], UNBOUNDED).keep | plain._slice(other, [], 0).cut)
+        self.assertIn("ff_lim", assumed._slice(other, [], 0).cut)
+        full = assumed._slice(other, [], UNBOUNDED)
+        self.assertIn("ff_lim", full.keep)
+        self.assertTrue(full.full)
+        self.assertLessEqual(set(self.nl.ports["din"]["bits"] + self.nl.ports["load"]["bits"]), full.inputs)
+        self.assertFalse(set(self.nl.ports["din"]["bits"]) & plain._slice(other, [], UNBOUNDED).inputs)
 
     def test_no_reset_no_assumptions(self):
         eng = self.engine(resets=Resets())
@@ -366,7 +389,7 @@ class Plumbing(EngineCase):
     def test_assumption_file(self):
         p = self.write("a.sv", "module fvlint_assumptions; endmodule\n")
         self.assertEqual(self.engine(assume_file=p)._extra_files(),
-                         {"fvl_assume.sv": "module fvlint_assumptions; endmodule\n"})
+                         {"fvl_assume_lib.sv": ASSUME_LIB, "fvl_assume.sv": "module fvlint_assumptions; endmodule\n"})
 
     def test_target_and_lemma_props(self):
         eng = self.engine(resets=Resets(self.rst, [ResetBit("r2", 99, 0, 1)], 2))
@@ -461,8 +484,29 @@ class Environment(EngineCase):
     def test_unsatisfiable_or_broken(self):
         for result in (jr("FAIL"), jr("ERROR", error="assumptions are unsatisfiable")):
             with self.subTest(status=result.status):
-                eng = self.engine(lambda c, r=result: r, assume_ports={"en": "input"})
+                eng = self.engine(lambda c, r=result: r, assume_ports={"en": self.nl.ports["en"]["bits"]})
                 self.assertIn("unsatisfiable", eng.environment_ok())
+
+    def test_assumed_nets_are_checked_with_their_logic(self):
+        lim = self.nl.netnames["lim"]["bits"]
+        eng = self.engine(lambda c: jr("PASS", fvl_s0="fail"), resets=Resets(), assume_ports={"l": lim})
+        self.assertIsNone(eng.environment_ok())
+        (c,) = eng.run.calls
+        self.assertEqual(c.spec.keep, {"ff_lim"} | {cell for cell in c.spec.keep if not self.nl.is_stateful(cell)})
+        self.assertTrue(c.spec.full)
+        self.assertFalse(c.multiclock)
+
+    def test_assumed_logic_on_several_clocks(self):
+        # The probe runs in the model the assumed logic needs, and counts
+        # two global steps per reset cycle there.
+        lim = self.nl.netnames["lim"]["bits"]
+        for assume, mc, n in ((None, False, 2), ({"l": lim}, True, 3)):
+            with self.subTest(assume=assume):
+                eng = self.engine(lambda c: jr("PASS", fvl_s0="fail"), assume_ports=assume)
+                with mock.patch("fvlint.engine.needs_multiclock", lambda nl, spec: "ff_lim" in spec.keep):
+                    self.assertIsNone(eng.environment_ok())
+                (c,) = eng.run.calls
+                self.assertEqual((c.multiclock, c.extra_cells["fvl_s0"]["parameters"]["N"], c.depth), (mc, n, n + 2))
 
 
 class Packing(EngineCase):
@@ -481,6 +525,14 @@ class Packing(EngineCase):
         batches = eng._pack(ss)
         self.assertEqual(len(batches), 1)                               # small groups, same clock: one job
         self.assertEqual([s.chk.target for s in batches[0]], ["c", "b", "a", "d"])   # group by src, then next group
+
+    def test_assumed_logic_is_no_reason_to_batch(self):
+        lim = self.nl.netnames["lim"]["bits"]
+        for assume, sizes in ((None, [2]), ({"l": lim}, [1, 1])):
+            with self.subTest(assume=assume):
+                eng = self.engine(assume_ports=assume)
+                ss = self.states(eng, [("a", {"ff_cnt", "ff_lim"}), ("d", {"ff_other", "ff_lim"})])
+                self.assertEqual([len(b) for b in eng._pack(ss, cells=2)], sizes)
 
     def test_budgets(self):
         eng = self.engine()

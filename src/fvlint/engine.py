@@ -28,7 +28,8 @@ from dataclasses import dataclass, field
 
 from .checks import ERROR, FAIL, PROVEN, UNKNOWN, VACUOUS, Check, Result, src_key
 from .cone import UNBOUNDED, ConeSpec, build_module, clocks, merge_specs, needs_multiclock, slice_spec
-from .netlist import Netlist
+from .elaborate import ASSUME_LIB, ASSUME_LIB_FILE
+from .netlist import Netlist, is_const
 from .replay import divergent, read_vcd, read_yw, stim_module
 from .resets import Resets
 from .sby import JobResult, Prop, parse_job, write_job, yw_for
@@ -77,10 +78,11 @@ class St:
 
 class Engine:
     def __init__(self, nl: Netlist, tools: Toolchain, outdir: str, lemmas: dict, resets: Resets,
-                 opts: Options, assume_ports: dict | None = None, assume_file: str | None = None):
+                 opts: Options, assume: dict | None = None, assume_file: str | None = None):
         self.nl, self.tools, self.outdir = nl, tools, outdir
         self.lemmas, self.resets, self.opts = lemmas, resets, opts
-        self.assume_ports = assume_ports or {}
+        # fvlint_assumptions port -> the design bits it reads (cli.bind_assumptions).
+        self.assume = assume or {}
         self.assume_file = assume_file
         self.creator = nl.data.get("creator", "fvlint")
         if opts.engine == "auto":
@@ -96,9 +98,18 @@ class Engine:
         # with their synchronizer flops (anchored, never cut into free inputs).
         self.reset_bits = [r.bit for r in resets.all()]
         self.reset_cells = sorted({nl.driver[r.bit].cell for r in resets.derived if r.bit in nl.driver})
+        # The signals the assumptions read are in every slice too.  An
+        # assumption on an internal net constrains the logic that drives it;
+        # left out, the net would be free and a counterexample the assumption
+        # rules out could pass for a real one.  Their logic is shared by every
+        # slice, so it is no reason to batch checks together.
+        self.assume_bits = [b for bits in self.assume.values() for b in bits if not is_const(b)]
+        self.assume_cells = (slice_spec(nl, self.assume_bits, [], UNBOUNDED).kept_state
+                             if self.assume_bits else set())
 
     def _slice(self, chk: Check, keep: list, level: int) -> ConeSpec:
-        return slice_spec(self.nl, chk.roots() + self.reset_bits, list(chk.anchors) + self.reset_cells + keep, level)
+        return slice_spec(self.nl, chk.roots() + self.reset_bits + self.assume_bits,
+                          list(chk.anchors) + self.reset_cells + keep, level)
 
     # ------------------------------------------------------------ job plumbing
     def _dir(self, tag: str) -> str:
@@ -111,10 +122,8 @@ class Engine:
         return d
 
     def _keep_ports(self) -> set:
-        ports = set(self.assume_ports)
-        if self.resets.primary:
-            ports.add(self.resets.primary.name)
-        return ports
+        # (The inputs the assumptions read are in every slice already: their bits are roots.)
+        return {self.resets.primary.name} if self.resets.primary else set()
 
     def _module(self, spec: ConeSpec, extra_ports=()) -> dict:
         mod = build_module(self.nl, spec, self._keep_ports() | set(extra_ports), self.opts.uninit)
@@ -126,8 +135,8 @@ class Engine:
                                                  "ANYTIME": int(self.resets.anytime)},
                                   "attributes": {}, "port_directions": {"rst": "input"},
                                   "connections": {"rst": [r.bit]}}
-        if self.assume_ports:
-            conn = {p: mod["ports"][p]["bits"] for p in self.assume_ports if p in mod["ports"]}
+        if self.assume:
+            conn = {p: list(bits) for p, bits in self.assume.items()}
             cells["fvl_assume"] = {"hide_name": 0, "type": "fvlint_assumptions", "parameters": {},
                                    "attributes": {}, "port_directions": {p: "input" for p in conn},
                                    "connections": conn}
@@ -142,7 +151,7 @@ class Engine:
         if not self.assume_file:
             return {}
         with open(self.assume_file) as f:
-            return {"fvl_assume.sv": f.read()}
+            return {ASSUME_LIB_FILE: ASSUME_LIB, "fvl_assume.sv": f.read()}
 
     def run(self, tag, spec, props, mode, depth, multiclock, engine=None, extra_cells=None,
             extra_files=None, extra_ports=(), timeout=None) -> JobResult:
@@ -185,15 +194,17 @@ class Engine:
     # ------------------------------------------------------------------ main
     def environment_ok(self) -> str | None:
         """Reset model + assumptions must be satisfiable, or every proof is vacuous."""
-        if not self.assume_ports and not self.resets.primary:
+        if not self.assume and not self.resets.primary:
             return None
-        spec = ConeSpec().finish(self.nl)
+        # The logic behind assumed internal nets is part of it, on its own clocks.
+        spec = slice_spec(self.nl, self.assume_bits + self.reset_bits, self.reset_cells, UNBOUNDED)
+        mc = needs_multiclock(self.nl, spec)
         # Reach the first step after reset release (plus one): an assumption
         # that contradicts the release itself is only visible from there on.
-        n = min(self._reset_cycles(None) + 1, 254)
+        n = min(self._reset_cycles(spec) + 1, 254)
         cell = {"fvl_s0": {"hide_name": 0, "type": "fvl_cover_true", "parameters": {"N": n},
                            "attributes": {}, "port_directions": {}, "connections": {}}}
-        r = self.run("env", spec, [], "cover", n + 2, False, engine=self.engine_str_cover(), extra_cells=cell)
+        r = self.run("env", spec, [], "cover", n + 2, mc, engine=self.engine_str_cover(), extra_cells=cell)
         if r.error or r.get("fvl_s0").status != "fail":
             return ("the environment is unsatisfiable: the --assume constraints (with the reset "
                     "model) contradict each other, so every proof would be vacuous")
@@ -262,7 +273,7 @@ class Engine:
                 i = parent[i]
             return i
         owner = {}
-        shared = set(self.reset_cells)          # in every slice: not a reason to batch together
+        shared = set(self.reset_cells) | self.assume_cells     # in every slice: not a reason to batch together
         for i, s in enumerate(states):
             for cell in s.spec.kept_state - shared:
                 j = owner.setdefault(cell, i)

@@ -7,7 +7,9 @@ statements, part-selects, non-power-of-two memories, state machines,
 occasionally a second clock or a falling-edge register, and constructs
 fvlint settles without a proof: case statements in FSM states, up/down
 counters under a small --horizon, full_case on 'x or valued signals,
-parameter guards), runs fvlint on each,
+parameter guards), shifts and divisions by registers, and sometimes an
+assumption on an internal net (the same assume statement in fvlint's
+--assume file and in the oracle's copy), runs fvlint on each,
 and then checks every verdict with an independent oracle.  The generator
 knows what it built, so for each construct it also writes down, as plain
 Verilog expressions, when the construct is active and when it goes wrong (an
@@ -76,6 +78,15 @@ class Design:
     # Monitors of constructs the generator knows are live (a parameter guard
     # that is 1): fvlint must report a check for each.
     required: set = field(default_factory=set)
+    # Internal 1-bit nets assumed to be 0: fvlint gets them through an
+    # --assume file (fvlint_net), the oracle as assume statements.
+    assumptions: list = field(default_factory=list)
+
+    def assume_file(self) -> str:
+        """The fvlint_assumptions module for `assumptions`."""
+        ports = ", ".join(f'(* fvlint_net = "{n}" *) input a{i}' for i, n in enumerate(self.assumptions))
+        body = "".join(f"  always @* assume (!a{i});\n" for i in range(len(self.assumptions)))
+        return f"module fvlint_assumptions ({ports});\n{body}endmodule\n"
 
     def monitor(self, key, en, bad):
         m = self.monitors.setdefault(key, {"en": [], "bad": []})
@@ -292,6 +303,8 @@ def generate(seed: int) -> Design:
         d.monitor(("mem_addr", "mem.rd0"), "1'b1", f"(({addr}) > {depth - 1})")
         extra.append("rd")
     extra2 = _settling_constructs(d, random.Random(seed * 104729 + 31), lines, widths, ins)
+    extra2 += _op_constructs(d, random.Random(seed * 15485863 + 47), lines, widths, ins,
+                             single_clock=not two_clocks and neg is None)
     outs = ", ".join([f"r{i}" for i in range(n)] + extra)
     lines.append(f"  assign o = {{{outs}}};")
     if extra2:
@@ -392,6 +405,52 @@ def _settling_constructs(d: Design, g: random.Random, lines: list, widths: list,
     return out
 
 
+def _op_constructs(d: Design, g: random.Random, lines: list, widths: list, ins: list, single_clock: bool) -> list:
+    """Shifts, divisions and an assumption on an internal net, from their
+    own random stream `g` (every decision drawn whether or not it is used,
+    as in _settling_constructs).  Returns the signals for the o2 output."""
+    out = []
+    n = len(widths)
+
+    # (e) A shift by a register: left into a W-bit result, or right out of
+    # din; sometimes behind a guard on the amount that may or may not be enough.
+    use, k, left, width, guarded, slack = (g.random() < 0.5, g.randrange(n), g.random() < 0.5,
+                                           g.choice([4, 6, 8]), g.random() < 0.4, g.randint(-1, 1))
+    if use:
+        w = width if left else 4                               # what the amount must stay below
+        expr = f"din << r{k}" if left else f"din >> r{k}"
+        guard = f"(r{k} < 8'd{w + slack})" if guarded else "1'b1"
+        rhs = f"{guard} ? ({expr}) : {width}'d0" if guarded else expr
+        lines.append(f"  wire [{width - 1}:0] shv = {rhs};")
+        d.monitor(("shift_range", "shv"), guard, f"({guard} && (r{k} > 8'd{w - 1}))")
+        out.append("shv")
+
+    # (f) A division by a register, guarded by a condition that is enough
+    # (r != 0), not enough (r != 1) or unrelated.
+    use, k, mod, guard_kind = g.random() < 0.5, g.randrange(n), g.random() < 0.5, g.randrange(4)
+    if use:
+        guard = [f"(r{k} != {widths[k]}'d0)", f"(r{k} != {widths[k]}'d1)", ins[g.randrange(4)], "1'b1"][guard_kind]
+        expr = f"din {'%' if mod else '/'} r{k}"
+        rhs = expr if guard == "1'b1" else f"{guard} ? ({expr}) : 4'd0"
+        lines.append(f"  wire [3:0] dq = {rhs};")
+        d.monitor(("div_zero", "dq"), guard, f"({guard} && (r{k} == {widths[k]}'d0))")
+        out.append("dq")
+
+    # (g) An internal net assumed to be 0: two inputs the checks read (the
+    # assumption constrains them only through logic the checks don't read),
+    # or, in a one-clock design, a register value and an input.
+    use, on_reg, k, i1, i2 = g.random() < 0.4, g.random() < 0.5, g.randrange(n), g.randrange(4), g.randrange(4)
+    c = g.randrange(1 << widths[k])
+    if use:
+        if on_reg and single_clock:
+            lines.append(f"  wire fa = (r{k} == {widths[k]}'d{c}) && {ins[i1]};")
+        else:
+            lines.append(f"  wire fa = {ins[i1]} && {ins[(i1 + 1 + i2 % 3) % 4]};")
+        d.assumptions.append("fa")
+        out.append("fa")
+    return out
+
+
 # -------------------------------------------------------------------- oracle
 
 
@@ -434,6 +493,7 @@ def oracle_text(design: Design, asserts: list, hold: int, edge: str | None = Non
         body = ["  // (oracle: on another clock, not modelled here)" if other(ln) else ln for ln in body]
     lines = body[:-1] + [
         "  // ---- fvlint-fuzz oracle: not part of the design fvlint sees",
+        *(f"  always @* assume (!{name});" for name in design.assumptions),
         "  initial begin " + " ".join(f"{name} = {w}'d0;" for name, w in design.regs) + " end",
         "  (* gclk *) wire fvo_gclk;",
         "  reg [7:0] fvo_n = 8'd0;",
@@ -656,7 +716,13 @@ def run(seeds, outroot: str, depth: int = 24, extra_args=(), verbose=False) -> d
         src = os.path.join(d, f"{design.top}.v")
         with open(src, "w") as f:
             f.write(design.text)
-        rc = _quiet(cli.main, ["--top", design.top, src, "-o", d, "-j", "1", *extra_args, *design.args])
+        args = list(design.args)
+        if design.assumptions:
+            assume = os.path.join(d, "assume.sv")
+            with open(assume, "w") as f:
+                f.write(design.assume_file())
+            args += ["--assume", assume]
+        rc = _quiet(cli.main, ["--top", design.top, src, "-o", d, "-j", "1", *extra_args, *args])
         summary["seeds"] += 1
         if rc == 2 or not os.path.exists(os.path.join(d, "results.json")):
             summary["problems"].append(f"seed {seed}: fvlint did not complete (rc={rc}), see {d}")

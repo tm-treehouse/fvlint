@@ -33,6 +33,8 @@ INFO  fsm_summary:u_framer.st             examples/demo/demo_top.sv:61  4 reacha
 | `parallel_case` | `unique case`, `unique casez`, `(* parallel_case *)` | at most one item matches whenever the result is used |
 | `full_case` | `unique` / `priority` / `(* full_case *)` case with no default | an item that assigns the signal always matches (otherwise synthesis may differ from simulation) |
 | `index_range` | variable part/bit select (`x[i*8 +: 8]`) | the offset stays inside the vector |
+| `shift_range` | shift by a variable amount (`<<`, `>>`, `<<<`, `>>>`) | the amount stays below the result's width (left) or the shifted value's (right), so the shift doesn't move every bit out |
+| `div_zero` | division or modulo by a variable (`/`, `%`) | the divisor is never 0 where the result is used |
 | `mem_addr` | memory whose depth is not a power of two | read/write addresses stay in range when enabled |
 | `fsm_unreachable` | FSM state register | every assigned or decoded state is reachable from reset |
 | `fsm_trap` (warning) | FSM state register | the FSM can get back to its reset state from every reachable state |
@@ -270,12 +272,54 @@ installed once), with one `oss-cad-suite-version` per job.
 
 Most `FAIL`s on block-level runs come from unconstrained top-level inputs.
 Constrain them with a module named `fvlint_assumptions` whose ports are
-top-level inputs, matched by name. Misspelled ports are rejected, and
-contradictory assumptions are reported, never silently accepted:
+matched to the design's signals by name. Misspelled ports are rejected (with
+the nearest names), and contradictory assumptions are reported, never
+silently accepted:
 
 ```systemverilog
 module fvlint_assumptions (input [1:0] lane);
   always @* assume (lane <= 2'd2);
+endmodule
+```
+
+A port can also read any other net of the design, by its hierarchical
+name: in an `fvlint_net` attribute, or as an escaped identifier. That is the
+way to state what a submodule's environment guarantees, or a fact about
+internal state the design relies on:
+
+```systemverilog
+module fvlint_assumptions (
+  (* fvlint_net = "u_core.mem_wordsize" *) input [1:0] wordsize,
+  input \u_dec.illegal
+);
+  always @* assume (wordsize != 2'd3);
+  always @* assume (!\u_dec.illegal );
+endmodule
+```
+
+The logic behind an assumed net is part of every proof, so an assumption
+on an internal net is as strong as one on an input: a `FAIL` is still a
+trace of the whole design that meets every assumption. The more logic stands
+behind the assumed nets, the larger each proof gets.
+
+fvlint ships interface rules to instantiate in `fvlint_assumptions`. The
+clocked ones say nothing while the reset (active at `RST_ACTIVE`) is
+active:
+
+| Module | Assumes |
+|---|---|
+| `fvl_assume_onehot #(W) (s)` | exactly one bit of `s` is set |
+| `fvl_assume_onehot0 #(W) (s)` | at most one bit of `s` is set |
+| `fvl_assume_range #(W, LO, HI) (v)` | `LO <= v <= HI` (unsigned) |
+| `fvl_assume_stable #(W, RST_ACTIVE) (clk, rst, v)` | `v` keeps its value from the first cycle after reset (configuration inputs, straps) |
+| `fvl_assume_handshake #(W, RST_ACTIVE) (clk, rst, valid, ready, data)` | a raised `valid` stays raised, with `data` unchanged, until a clock edge with `ready` |
+| `fvl_assume_pulse #(RST_ACTIVE) (clk, rst, p)` | `p` is never high in two consecutive cycles |
+
+```systemverilog
+module fvlint_assumptions (input clk, input rst_n, input in_valid, input in_ready,
+                           input [31:0] in_data, input [3:0] cfg);
+  fvl_assume_handshake #(.W(32), .RST_ACTIVE(0)) u_in (clk, rst_n, in_valid, in_ready, in_data);
+  fvl_assume_stable #(.W(4), .RST_ACTIVE(0)) u_cfg (clk, rst_n, cfg);
 endmodule
 ```
 
@@ -389,7 +433,13 @@ or on demand.
 
 ## Limitations
 
-* **Assumptions** can only constrain top-level inputs.
+* **Assumptions** read nets of the flattened design. A net Yosys optimises
+  away (unused, or merged into another name) can't be named; the error
+  lists the nearest names that are still there.
+* **`div_zero` and `shift_range`** follow the result through multiplexers
+  to the register that stores it, like `index_range`. A result stored every
+  cycle counts as used every cycle, even if nothing reads it while the
+  divisor is 0 or the amount is too large.
 * **Vendor primitives** must be supplied as blackbox stubs (`--lib`). Their
   outputs are unconstrained.
 * **Multi-clock model inputs:** under the multi-clock model, top-level inputs

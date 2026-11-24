@@ -89,7 +89,8 @@ class Generator(unittest.TestCase):
         # Settled-without-proof constructs come on top (their own random stream).
         self.assertEqual(m[("full_case", "fx")], {"en": ["1'b1"], "bad": ["(!(in2) && !(!in2))"]})
         self.assertEqual(m[("parallel_case", "fx")]["bad"], ["((in2) && (!in2))"])
-        self.assertEqual(len(m), 11)
+        self.assertEqual(m[("div_zero", "dq")], {"en": ["in0"], "bad": ["(in0 && (r3 == 2'd0))"]})   # and a division
+        self.assertEqual(len(m), 12)
 
     def test_case_and_part_select_monitors(self):
         seen = set()
@@ -180,7 +181,7 @@ class Generator(unittest.TestCase):
         self.assertEqual(d.monitors[("counter_overflow", "pq", 1)]["bad"],
                          ["(!(rst) && !(in3) && (PE && pq != 4'd14) && (pq > 4'd14))"])
         self.assertEqual(d.required, {("counter_overflow", "pq", 1)})
-        self.assertIn("  assign o2 = {ud, fx, pq};\n", d.text)
+        self.assertIn("  assign o2 = {ud, fx, pq, shv};\n", d.text)
         self.assertEqual([r for r in d.regs if r[0] in ("ud", "pq", "pv")], [("ud", 3), ("pq", 4)])
         self.assertEqual((d.args, d.x_defaults), ([], {"fx"}))
         d = fuzz.generate(4)                                             # its own power-up value
@@ -200,8 +201,85 @@ class Generator(unittest.TestCase):
         self.assertEqual(d.monitors[("counter_underflow", "pq", 1)]["bad"],
                          ["(!(rst) && !(in3) && (PE && pq) && (pq < 3'd1))"])
         self.assertEqual([r for r in d.regs if r[0] in ("ud", "pq", "pv")], [("pv", 2), ("pq", 3)])
-        self.assertIn("  assign o2 = {pv, fx, fv, pq};\n", d.text)
+        self.assertIn("  assign o2 = {pv, fx, fv, pq, shv, dq};\n", d.text)
         self.assertEqual(d.x_defaults, {"fx"})
+
+    def test_op_constructs(self):
+        # Shifts, divisions and assumptions: their own stream again.
+        seen = set()
+        for seed in range(1, 80):
+            d = fuzz.generate(seed)
+            m, text = d.monitors, d.text
+            with self.subTest(seed=seed):
+                shv = re.search(r"wire \[(\d+):0\] shv = (?:\((r\d) < 8'd(\d+)\) \? \()?din (<<|>>) (r\d)", text)
+                if shv:
+                    top, gr, lim, op, r = shv.groups()
+                    w = int(top) + 1 if op == "<<" else 4
+                    guard = f"({gr} < 8'd{lim})" if gr else "1'b1"
+                    self.assertEqual(m[("shift_range", "shv")],
+                                     {"en": [guard], "bad": [f"({guard} && ({r} > 8'd{w - 1}))"]})
+                    if gr:
+                        self.assertEqual(gr, r)
+                        self.assertIn(int(lim) - w, (-1, 0, 1))
+                    seen.add(("shift", op, bool(gr)))
+                else:
+                    self.assertNotIn(("shift_range", "shv"), m)
+                dq = re.search(r"wire \[3:0\] dq = (?:(.*) \? \()?din ([/%]) (r\d)", text)
+                if dq:
+                    guard, op, r = dq.groups()
+                    w = dict(d.regs)[r]
+                    self.assertIn(guard, (None, f"({r} != {w}'d0)", f"({r} != {w}'d1)", "in0", "in1", "in2", "in3"))
+                    guard = guard or "1'b1"
+                    self.assertEqual(m[("div_zero", "dq")], {"en": [guard], "bad": [f"({guard} && ({r} == {w}'d0))"]})
+                    kind = "input" if guard.startswith("in") else guard if guard == "1'b1" else guard[-4:-1]
+                    seen.add(("div", op, kind))
+                else:
+                    self.assertNotIn(("div_zero", "dq"), m)
+                fa = re.search(r"  wire fa = (.*);", text)
+                self.assertEqual(d.assumptions, ["fa"] if fa else [])
+                if fa:
+                    self.assertIn("fa", re.search(r"assign o2 = \{(.*)\};", text).group(1).split(", "))
+                    on_reg = fa.group(1).startswith("(r")
+                    if on_reg:
+                        self.assertNotIn("posedge clk2", text)                  # one clock: one oracle job
+                        self.assertNotIn("negedge clk", text)
+                    else:
+                        a, b = re.fullmatch(r"(in\d) && (in\d)", fa.group(1)).groups()
+                        self.assertNotEqual(a, b)
+                    seen.add(("assume", on_reg))
+        self.assertEqual(seen, {("shift", "<<", False), ("shift", "<<", True), ("shift", ">>", False),
+                                ("shift", ">>", True), ("div", "/", "1'b1"), ("div", "%", "1'b1"),
+                                ("div", "/", "'d0"), ("div", "%", "'d0"), ("div", "/", "'d1"), ("div", "%", "'d1"),
+                                ("div", "/", "input"), ("div", "%", "input"), ("assume", True), ("assume", False)})
+
+    def test_op_constructs_of_known_designs(self):
+        # Checked by hand: din << r0 into 6 bits loses everything from 6 on
+        # (r0 is 2 bits, so never: fvlint has no check); din >> r1 loses din's
+        # 4 bits from 4 on, though the result is 8 bits; a guard r != 0 makes
+        # a division safe.
+        d = fuzz.generate(1)
+        self.assertIn("  wire [5:0] shv = din << r0;\n", d.text)
+        self.assertEqual(d.monitors[("shift_range", "shv")], {"en": ["1'b1"], "bad": ["(1'b1 && (r0 > 8'd5))"]})
+        d = fuzz.generate(11)                                          # a 4-bit result: 4 on loses it
+        self.assertIn("  wire [3:0] shv = din << r0;\n", d.text)
+        self.assertEqual(d.monitors[("shift_range", "shv")]["bad"], ["(1'b1 && (r0 > 8'd3))"])
+        d = fuzz.generate(31)
+        self.assertIn("  wire [7:0] shv = din >> r1;\n  wire [3:0] dq = din / r1;\n  wire fa = in2 && in0;\n", d.text)
+        self.assertEqual(d.monitors[("shift_range", "shv")]["bad"], ["(1'b1 && (r1 > 8'd3))"])
+        self.assertEqual(d.monitors[("div_zero", "dq")]["bad"], ["(1'b1 && (r1 == 2'd0))"])
+        self.assertEqual(d.assumptions, ["fa"])
+        d = fuzz.generate(15)
+        self.assertIn("  wire [5:0] shv = (r1 < 8'd5) ? (din << r1) : 6'd0;\n"
+                      "  wire [3:0] dq = (r1 != 2'd0) ? (din / r1) : 4'd0;\n"
+                      "  wire fa = (r0 == 2'd0) && in0;\n", d.text)
+        self.assertEqual(d.monitors[("div_zero", "dq")], {"en": ["(r1 != 2'd0)"],
+                                                         "bad": ["((r1 != 2'd0) && (r1 == 2'd0))"]})
+        self.assertEqual(d.assume_file(), 'module fvlint_assumptions ((* fvlint_net = "fa" *) input a0);\n'
+                                          "  always @* assume (!a0);\nendmodule\n")
+        two = fuzz.Design("", "t", assumptions=["fa", "fb"])
+        self.assertEqual(two.assume_file(), 'module fvlint_assumptions ((* fvlint_net = "fa" *) input a0, '
+                                            '(* fvlint_net = "fb" *) input a1);\n'
+                                            "  always @* assume (!a0);\n  always @* assume (!a1);\nendmodule\n")
 
     def test_state_machines(self):
         # Pinned: a plain one, one overridden after the reset branch, one with an unconditional arm.
@@ -280,6 +358,16 @@ class OracleText(unittest.TestCase):
         self.assertEqual(text.count("endmodule"), 1)
         self.assertIn("  wire fvo_gate = !rst;", fuzz.oracle_text(design(), ["x"], 1)[0])
         self.assertIn("  wire fvo_gate = !rst && !s1;", fuzz.oracle_text(design(stages=["s1"]), ["x"], 1)[0])
+        self.assertFalse([ln for ln in lines if ln.startswith("  always @* assume (")])     # no assumptions
+
+    def test_assumptions_go_into_the_oracle(self):
+        d = design()
+        d.assumptions = ["fa", "fb"]
+        text, first = fuzz.oracle_text(d, ["(a)"], 1)
+        lines = text.splitlines()
+        i = lines.index("  // ---- fvlint-fuzz oracle: not part of the design fvlint sees")
+        self.assertEqual(lines[i + 1:i + 3], ["  always @* assume (!fa);", "  always @* assume (!fb);"])
+        self.assertEqual(lines[first - 1], "  always @* if (fvo_gate) assert (!((a)));")
 
     def test_one_clock_jobs_leave_other_clocks_out(self):
         text = ("module t (input clk, input clk2, input rst, input e);\n  reg a, b, c;\n"
@@ -679,6 +767,26 @@ class Driver(TempDirCase):
         self.assertIn("seed 3: 2 checks, 1 problem(s)", err.getvalue())
         with open(os.path.join(self.tmp, "seed1", "fz1.v")) as f:
             self.assertEqual(f.read(), fuzz.generate(1).text)
+
+    def test_run_with_assumptions(self):
+        argvs = []
+
+        def fake_main(argv):
+            argvs.append(argv)
+            with open(os.path.join(argv[argv.index("-o") + 1], "results.json"), "w") as f:
+                json.dump({"results": []}, f)
+            return 0
+        with mock.patch.object(cli, "main", fake_main), \
+                mock.patch.object(fuzz, "oracle", lambda *a: ([], [])):
+            s = fuzz.run([7, 1], self.tmp)
+        self.assertEqual(s["problems"], [])
+        assume = os.path.join(self.tmp, "seed7", "assume.sv")
+        self.assertEqual(argvs[0][-2:], ["--assume", assume])
+        with open(assume) as f:
+            self.assertEqual(f.read(), fuzz.generate(7).assume_file())
+        self.assertEqual(fuzz.generate(1).assumptions, [])
+        self.assertNotIn("--assume", argvs[1])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "seed1", "assume.sv")))
 
     def test_main(self):
         captured_args = []

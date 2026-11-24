@@ -145,7 +145,7 @@ name = "vacuity/assume_typo"
 files = ["../fixtures/memory.sv"]
 top = "ring_bug"
 args = ["--assume", "{dir}/../fixtures/assume_typo.sv"]
-expect_error = "raddr are not inputs of ring_bug"
+expect_error = "port raddr: ring_bug has no input or net named raddr"
 tags = ["vacuity", "review"]
 
 # ------------------------------------------------------------- case / index
@@ -233,6 +233,125 @@ top = "lane_sel_fixed"
 expect = { "index_range:lane" = "PROVEN", "counter_overflow:sel" = "PROVEN" }
 strict = true
 tags = ["index"]
+
+# ------------------------------------------------------ shifts and division
+[[case]]
+name = "ops/shift_bug"
+files = ["../fixtures/ops.sv"]
+top = "shift_bug"
+expect = { "shift_range:y" = "FAIL" }
+strict = true
+tags = ["ops", "bug"]
+
+[[case]]
+name = "ops/shift_narrow"
+files = ["../fixtures/ops.sv"]
+top = "shift_narrow"
+expect = {}
+strict = true
+exit = 0
+tags = ["ops"]
+
+[[case]]
+name = "ops/shift_guarded"
+files = ["../fixtures/ops.sv"]
+top = "shift_guarded"
+engines = ["pdr", "smtbmc"]
+expect = { "shift_range:y" = "PROVEN" }
+strict = true
+tags = ["ops"]
+
+[[case]]
+name = "ops/shift_counter"
+files = ["../fixtures/ops.sv"]
+top = "shift_counter"
+engines = ["pdr", "smtbmc"]
+expect = { "shift_range:y" = "PROVEN", "counter_overflow:n" = "PROVEN" }
+strict = true
+tags = ["ops", "cone"]
+
+[[case]]
+name = "ops/shift_decode"
+files = ["../fixtures/ops.sv"]
+top = "shift_decode"
+expect = { "shift_range:en" = "FAIL" }
+strict = true
+tags = ["ops", "bug"]
+
+[[case]]
+name = "ops/div_bug"
+files = ["../fixtures/ops.sv"]
+top = "div_bug"
+expect = { "div_zero:q" = "FAIL", "div_zero:r" = "FAIL" }
+strict = true
+tags = ["ops", "bug"]
+
+[[case]]
+name = "ops/div_guarded"
+files = ["../fixtures/ops.sv"]
+top = "div_guarded"
+engines = ["pdr", "smtbmc"]
+expect = { "div_zero:q" = "PROVEN" }
+strict = true
+tags = ["ops"]
+
+[[case]]
+name = "ops/div_reg"
+files = ["../fixtures/ops.sv"]
+top = "div_reg"
+engines = ["pdr", "smtbmc"]
+expect = { "div_zero:q" = "PROVEN" }
+strict = true
+tags = ["ops", "cone"]
+
+# ------------------------------------------- assumptions on internal nets
+[[case]]
+name = "assume/internal_bare"
+files = ["../fixtures/assume_internal.sv"]
+top = "ai_internal"
+expect = { "index_range:lane" = "FAIL", "index_range:pick" = "FAIL" }
+strict = true
+tags = ["assume", "bug"]
+
+[[case]]
+name = "assume/internal"
+files = ["../fixtures/assume_internal.sv"]
+top = "ai_internal"
+args = ["--assume", "{dir}/../fixtures/assume_internal_nets.sv"]
+engines = ["pdr", "smtbmc"]
+# pick: the assumption is on u_g.x = a & b, which the check doesn't read;
+# without that logic in the slice this is a FAIL the assumption rules out.
+expect = { "index_range:lane" = "PROVEN", "index_range:pick" = "PROVEN" }
+strict = true
+exit = 0
+tags = ["assume"]
+
+[[case]]
+name = "assume/internal_typo"
+files = ["../fixtures/assume_internal.sv"]
+top = "ai_internal"
+args = ["--assume", "{dir}/../fixtures/assume_internal_typo.sv"]
+expect_error = "port m: ai_internal has no input or net named u_src.mod (did you mean u_src.mode"
+tags = ["assume"]
+
+[[case]]
+name = "assume/lib_bare"
+files = ["../fixtures/assume_internal.sv"]
+top = "ai_lib"
+expect = { "index_range:o_hs" = "FAIL", "index_range:o_cfg" = "FAIL", "index_range:o_p" = "FAIL", "parallel_case:y" = "FAIL", "full_case:y" = "FAIL", "index_range:o_r" = "FAIL" }
+strict = true
+tags = ["assume", "bug"]
+
+[[case]]
+name = "assume/lib"
+files = ["../fixtures/assume_internal.sv"]
+top = "ai_lib"
+args = ["--assume", "{dir}/../fixtures/assume_internal_lib.sv"]
+engines = ["pdr", "smtbmc"]
+expect = { "index_range:o_hs" = "PROVEN", "index_range:o_cfg" = "PROVEN", "index_range:o_p" = "PROVEN", "parallel_case:y" = "PROVEN", "full_case:y" = "PROVEN", "index_range:o_r" = "PROVEN" }
+strict = true
+exit = 0
+tags = ["assume"]
 
 [[case]]
 name = "params/lanes_disabled"
