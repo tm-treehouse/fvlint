@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fvlint"
-version = "0.5.0"
+version = "0.6.0"
 description = "Lightweight formal lint: auto-generated, locally scoped proofs for counters, case statements, part-selects, memories and FSMs in RTL"
 readme = "README.md"
 license = "ISC"

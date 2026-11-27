@@ -5,7 +5,7 @@ SPDX-License-Identifier: ISC
 
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 Baselines, so CI can fail on new findings only, and an opt-in check for
 dead branches.

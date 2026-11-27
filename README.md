@@ -277,7 +277,7 @@ jobs:
         config: [default, irq]
     steps:
       - uses: actions/checkout@v7
-      - uses: tm-treehouse/fvlint@v0.5.0
+      - uses: tm-treehouse/fvlint@v0.6.0
         with:
           config: fvlint.toml        # the default
           configs: ${{ matrix.config }}
