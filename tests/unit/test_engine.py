@@ -19,7 +19,7 @@ from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from fvlint.checks import ERROR, FAIL, PROVEN, UNKNOWN, VACUOUS, Check, Lemma, Result
+from fvlint.checks import ERROR, FAIL, PROVEN, REACH, UNKNOWN, VACUOUS, Check, Lemma, Result
 from fvlint.cone import UNBOUNDED, ConeSpec, slice_spec
 from fvlint.detect import detect_counters
 from fvlint.elaborate import ASSUME_LIB
@@ -912,6 +912,158 @@ class Replay(EngineCase):
         eng = self.engine(lambda c: jr("PASS", fvl_s0=PropResult("fail", trace=real, step=1, phase="cover")))
         tr = self.trace("tr/1/trace.vcd", {"lim": ["0000", "1111"]}, {"en": ["1", "1"]})
         self.assertEqual(eng._replay(self.cut_state(eng), PropResult("fail", trace=tr, step=1)), ("spurious", set()))
+
+
+class Reachability(EngineCase):
+    """Dead-branch checks: a bounded search on the full cones first, then the
+    usual rounds; their proofs get no vacuity probe (it would be the same
+    property)."""
+
+    def reach(self, target="en", bit=None, value=1):
+        bit = bit if bit is not None else self.nl.ports["en"]["bits"][0]
+        return Check("dead_branch", target, "t.v:3", "taken", checker=REACH, conds=[(bit, value)])
+
+    def test_witness_in_the_first_search(self):
+        def policy(c):
+            self.assertEqual(c.tag, "reach_bmc")
+            return jr("FAIL", fvl_t0=PropResult("fail", trace="t.vcd", step=3, phase="basecase"))
+        eng = self.engine(policy, abc=True, lemmas={})
+        (r,) = eng.prove_all([self.reach()])
+        self.assertEqual((r.status, r.step, r.trace, r.engine, r.level, r.full),
+                         (FAIL, 3, "t.vcd", "BMC", "full", True))
+        self.assertEqual(r.history, [("full", "bmc20:fail")])
+        self.assertIn("counterexample at step 3 on the full design", r.detail)
+        (c,) = eng.run.calls
+        self.assertEqual((c.mode, c.depth, c.engine, c.names, c.prop("fvl_t0").mode, c.prop("fvl_t0").checker),
+                         ("bmc", 20, "smtbmc --keep-going z3", ["fvl_t0"], 0, REACH))
+        self.assertTrue(c.spec.full)
+
+    def test_not_reached_then_proven_dead_without_a_vacuity_probe(self):
+        def policy(c):
+            return {"reach_bmc": jr("PASS"), "r0_kind0": jr("PASS")}[c.tag]
+        eng = self.engine(policy, lemmas={}, depth=9)
+        (r,) = eng.prove_all([self.reach()])
+        self.assertEqual((r.status, r.vacuity), (PROVEN, None))
+        self.assertEqual(r.history, [("full", "bmc9:PASS"), ("full", "pass")])
+        self.assertEqual(eng.run.tags, ["reach_bmc", "r0_kind0"])
+
+    def test_only_reachability_checks_go_first(self):
+        def policy(c):
+            if c.tag == "reach_bmc":
+                self.assertEqual([p.checker for p in c.props], [REACH])
+                return jr("FAIL", fvl_t0=PropResult("fail", trace="t.vcd", step=1, phase="basecase"))
+            if c.tag == "r0_kind0":
+                self.assertEqual([p.checker for p in c.props], ["fvl_range"])
+                return jr("PASS")
+            if c.tag == "vacuity_bmc":
+                self.assertEqual(len(c.props), 1)
+                return jr("FAIL", fvl_v0="fail")
+            self.fail(c.tag)
+        eng = self.engine(policy, lemmas={})
+        r1, r2 = eng.prove_all([self.checks["other"], self.reach()])
+        self.assertEqual((r1.status, r1.vacuity, r2.status), (PROVEN, "ok", FAIL))
+        self.assertEqual(eng.run.tags, ["reach_bmc", "r0_kind0", "vacuity_bmc"])
+        eng = self.engine(lambda c: jr("FAIL", fvl_v0="fail") if c.tag == "vacuity_bmc" else jr("PASS"), lemmas={})
+        eng.prove_all([self.checks["other"]])
+        self.assertNotIn("reach_bmc", eng.run.tags)
+
+    def test_taken_on_a_slice_goes_to_the_full_cone(self):
+        cnt = self.nl.netnames["cnt"]["bits"][0]
+        tr = self.trace("tr/s/trace.vcd", {"lim": ["0000"]}, {"en": ["1"]})
+
+        def policy(c):
+            if c.tag == "reach_bmc":
+                return jr("PASS")
+            if c.tag == "r0_kind0":
+                self.assertFalse(c.spec.full)
+                return jr("FAIL", fvl_t0=PropResult("fail", trace=tr, step=30, phase="basecase"))
+            if c.tag == "r1_kind0":
+                self.assertTrue(c.spec.full)
+                return jr("FAIL", fvl_t0=PropResult("fail", trace="f.vcd", step=31, phase="basecase"))
+            self.fail(c.tag)
+        eng = self.engine(policy, lemmas={})
+        (r,) = eng.prove_all([self.reach("c", cnt)])
+        self.assertEqual((r.status, r.step, r.trace, r.refinements), (FAIL, 31, "f.vcd", 0))
+        self.assertEqual(eng.run.tags, ["reach_bmc", "r0_kind0", "r1_kind0"])
+        # Undecided on the full cone: the slice's trace is no evidence, so the deep search runs.
+        def undecided(c):
+            if c.tag == "r1_kind0":
+                return jr("UNKNOWN", fvl_t0=PropResult("unknown", phase="induction"))
+            if c.tag == "deepbmc":
+                return jr("FAIL", fvl_t0=PropResult("fail", trace="d.vcd", step=64, phase="basecase"))
+            return policy(c)
+        eng = self.engine(undecided, lemmas={})
+        (r,) = eng.prove_all([self.reach("c", cnt)])
+        self.assertEqual((r.status, r.step, eng.run.tags[-1]), (FAIL, 64, "deepbmc"))
+        # Without the full cone (--no-full): the usual refinement.
+        eng = self.engine(lambda c: jr("PASS") if c.tag == "reach_bmc" else policy(c) if c.tag == "r0_kind0"
+                          else jr("PASS", fvl_s0=PropResult("fail", trace=tr, step=30, phase="cover"))
+                          if c.tag == "replay" else jr("PASS"), lemmas={}, try_full=False, max_level=0)
+        eng.prove_all([self.reach("c", cnt)])
+        self.assertIn("replay", eng.run.tags)
+
+    def test_undecided_branches_get_the_deepest_bounded_search(self):
+        def policy(c):
+            if c.tag in ("reach_bmc", "r0_kind0"):
+                return jr("UNKNOWN", **{n: PropResult("unknown", phase="induction") for n in c.names})
+            if c.tag == "deepbmc":
+                return jr("FAIL", fvl_t0=PropResult("fail", trace="d.vcd", step=64, phase="basecase"))
+            self.fail(c.tag)
+        eng = self.engine(policy, lemmas={}, max_level=0, try_full=False, max_bmc_depth=90)
+        (r,) = eng.prove_all([self.reach()])
+        self.assertEqual((r.status, r.step), (FAIL, 64))
+        self.assertEqual([(c.tag, c.depth) for c in eng.run.calls][-1], ("deepbmc", 90))
+
+    def test_batches(self):
+        seen = []
+
+        def policy(c):
+            if c.tag == "reach_bmc":
+                seen.append(len(c.props))
+                return jr("FAIL", **{n: PropResult("fail", trace="t.vcd", step=1, phase="basecase")
+                                     for n in c.names})
+            self.fail(c.tag)
+        checks = [self.reach(f"en{i}") for i in range(40)]
+        results = self.engine(policy, lemmas={}, batch_props=8).prove_all(checks)
+        self.assertEqual(sorted(seen), [8, 32])
+        self.assertEqual({r.status for r in results}, {FAIL})
+        self.assertEqual(len(self.engine(policy, lemmas={}, batch_props=2, jobs=3).prove_all(checks[:9])), 9)
+        self.assertEqual(sorted(seen[2:]), [1, 8])
+
+    def test_cell_budget_is_twice_the_proof_budget(self):
+        # Two unrelated groups (cnt's and other's cones) share a job while
+        # their cells fit in twice --batch-cells.
+        cnt = self.nl.netnames["cnt"]["bits"][0]
+        other = self.nl.netnames["other"]["bits"][0]
+        checks = [self.reach("c", cnt), self.reach("o", other)]
+        eng = self.engine(lemmas={})
+        both = len(eng._slice(checks[0], [], UNBOUNDED).keep | eng._slice(checks[1], [], UNBOUNDED).keep)
+        self.assertGreaterEqual(both, 6)
+
+        def jobs(cells):
+            n = []
+            eng = self.engine(lambda c: n.append(c.tag) or jr("FAIL", **{
+                m: PropResult("fail", trace="t.vcd", step=1, phase="basecase") for m in c.names}),
+                lemmas={}, batch_cells=cells)
+            eng.prove_all(checks)
+            return len(n)
+        self.assertEqual(jobs(both - 1), 1)                 # both <= 2 * cells
+        self.assertEqual(jobs((both + 2) // 3), 2)          # both > 2 * cells
+
+    def test_a_job_on_another_clock_is_multiclock(self):
+        b = NB()
+        clk, clk2, d = (b.input(n)[0] for n in ("clk", "clk2", "d"))
+        q1 = b.net("q1", b.new(1))
+        b.ff([d], clk, q=q1)
+        q2 = b.net("q2", b.new(1))
+        b.ff(q1, clk2, q=q2)
+        nl = b.build()
+        eng = Engine(nl, FakeTools(), self.tmp, {}, Resets(None, [], 1), Options(jobs=1), None, None)
+        eng.run = Scripted(eng, lambda c: jr("FAIL", fvl_t0=PropResult("fail", trace="t.vcd", step=2,
+                                                                       phase="basecase")))
+        (r,) = eng.prove_all([Check("dead_branch", "q2", "t.v:3", "taken", checker=REACH, conds=[(q2[0], 1)])])
+        self.assertEqual(r.status, FAIL)
+        self.assertTrue(eng.run.calls[0].multiclock)
 
 
 class Scenarios(EngineCase):

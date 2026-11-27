@@ -58,7 +58,8 @@ class Model(unittest.TestCase):
             "id": "counter_overflow:q", "kind": "counter_overflow", "target": "q", "src": "a.v:1",
             "property": "counter_overflow holds", "status": FAIL, "detail": "cex", "cone": "full",
             "full_design": True, "trace": "t.vcd", "cex_step": 4, "engine": "PDR", "lemmas_used": 2,
-            "refinements": 1, "vacuity": "ok", "history": [("0", "fail")], "waiver": None, "reason": None})
+            "refinements": 1, "vacuity": "ok", "history": [("0", "fail")], "waiver": None, "reason": None,
+            "baseline": None, "condition": None})
         json.dumps(d)                                                   # serialisable
 
     def test_reason_of_info_results(self):
@@ -312,6 +313,75 @@ class CiFormats(TempDirCase):
         self.assertEqual(_gh_location(f"{odd}:4", self.tmp), ",file=a%2Cb%3Ac.v,line=4")
         (err,) = github_annotations([res("mem_addr", "m", ERROR, src="?", detail="a\rb")], self.tmp)
         self.assertEqual(err, "::error title=fvlint ERROR%3A mem_addr%3Am::mem_addr holds: a%0Db")
+
+
+class BaselineReports(TempDirCase):
+    """Known findings (Result.baseline) in every report."""
+
+    def results(self):
+        return [res("counter_overflow", "q", FAIL, src="r.v:3", detail="cex", baseline=FAIL),
+                res("index_range", "x", UNKNOWN, src="r.v:4", detail="?", baseline=FAIL),
+                res("mem_addr", "m", FAIL, src="r.v:5", detail="new"), res("fsm_trap", "s", WARN, src="r.v:6"),
+                res("full_case", "c", PROVEN, src="r.v:7")]
+
+    META = {"file": "fvlint/b.json", "gone": ["k:gone"], "fixed": ["k:fixed"], "lines": {"k:gone": 4}}
+
+    def test_console(self):
+        text = console(self.results(), False, self.META)
+        self.assertEqual(text.splitlines()[:2], ["fvlint: 5 checks: 2 fail, 1 unknown, 1 warn, 1 proven",
+                                                 "baseline fvlint/b.json: 2 known findings, 2 new"])
+        self.assertIn("counter_overflow:q  r.v:3  (in baseline) cex", text)
+        self.assertIn("index_range:x       r.v:4  (in baseline as FAIL) ?", text)
+        self.assertIn("mem_addr:m          r.v:5  new", text)
+        self.assertNotIn("baseline", console(self.results()[2:], False))
+        one = [res("a", "b", FAIL, baseline=FAIL)]
+        self.assertEqual(report.baseline_summary(one, self.META), "baseline fvlint/b.json: 1 known finding, 0 new")
+        self.assertEqual(report.baseline_summary(one, None), "")
+        self.assertEqual(report.known_note(res("a", "b", FAIL)), "")
+
+    def test_markdown(self):
+        text = markdown(self.results(), {"elapsed_s": 2, "baseline": self.META}, "top")
+        self.assertIn("\n\nbaseline fvlint/b.json: 2 known findings, 2 new\n\n", text)
+        self.assertIn("| FAIL (baseline) | `counter_overflow:q` |", text)
+        self.assertIn("| UNKNOWN (baseline) | `index_range:x` |", text)
+        self.assertIn("| FAIL | `mem_addr:m` |", text)
+        self.assertTrue(text.endswith("Entries of `fvlint/b.json` to update (`--update-baseline`):\n\n"
+                                      "- `k:gone`: no such check any more\n- `k:fixed`: no finding now\n\n"))
+        fixed_only = markdown(self.results(), {"baseline": dict(self.META, gone=[])}, "top")
+        self.assertTrue(fixed_only.endswith("to update (`--update-baseline`):\n\n- `k:fixed`: no finding now\n\n"))
+        quiet = markdown(self.results(), {"baseline": dict(self.META, gone=[], fixed=[])}, "top")
+        self.assertNotIn("to update", quiet)
+        self.assertNotIn("to update", markdown(self.results(), {"baseline": {"file": "f"}}, "top"))
+        self.assertNotIn("baseline", markdown(self.results()[2:], {}, "top"))
+
+    def test_annotations(self):
+        meta = dict(self.META, file=os.path.join(self.tmp, "b.json"))
+        got = github_annotations(self.results(), self.tmp, baseline=meta)
+        self.assertEqual(got, [
+            "::notice title=fvlint FAIL (in baseline)%3A counter_overflow%3Aq::counter_overflow holds: cex",
+            "::error title=fvlint FAIL%3A mem_addr%3Am::mem_addr holds: new",
+            "::notice title=fvlint UNKNOWN (in baseline)%3A index_range%3Ax::index_range holds: ?",
+            "::warning title=fvlint WARN%3A fsm_trap%3As::fsm_trap holds: ",
+            "::warning title=fvlint%3A baseline out of date,file=b.json,line=4::k:gone matches no check (renamed, "
+            "fixed or no longer present?); update the baseline with --update-baseline",
+            "::notice title=fvlint%3A baseline out of date::k:fixed is no finding now; update the baseline with "
+            "--update-baseline"])
+        self.assertEqual(len(github_annotations(self.results(), self.tmp, baseline={"file": "x"})), 4)
+
+    def test_junit(self):
+        p = os.path.join(self.tmp, "j.xml")
+        write_junit(self.results(), p)
+        root = ET.parse(p).getroot()
+        self.assertEqual((root.get("tests"), root.get("failures"), root.get("skipped")), ("5", "1", "2"))
+        cases = {c.get("name"): c for c in root}
+        self.assertEqual(cases["counter_overflow:q"][0].tag, "skipped")
+        self.assertTrue(cases["counter_overflow:q"][0].get("message").startswith(
+            "known finding (FAIL, in the baseline): r.v:3: counter_overflow holds: cex"))
+        self.assertTrue(cases["index_range:x"][0].get("message").startswith("known finding (UNKNOWN, in the baseline)"))
+        self.assertEqual(cases["mem_addr:m"][0].tag, "failure")
+        known_warn = [res("fsm_trap", "s", WARN, baseline=WARN)]
+        write_junit(known_warn, p)
+        self.assertEqual(ET.parse(p).getroot()[0][0].tag, "system-out")
 
 if __name__ == "__main__":
     unittest.main()

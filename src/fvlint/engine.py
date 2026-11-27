@@ -216,6 +216,7 @@ class Engine:
     def prove_all(self, checks: list) -> list:
         states = [St(chk=c, idx=i, res=Result(check=c, status=UNKNOWN), t0=time.time())
                   for i, c in enumerate(checks)]
+        self._reach_first([s for s in states if s.chk.reach])
         for rnd in range(self.opts.max_rounds):
             active = [s for s in states if not s.done]
             if not active:
@@ -254,7 +255,8 @@ class Engine:
                 self._finish_unknown(s)
         self._deep_bmc([s for s in states if s.res.status == UNKNOWN and not s.cex])
         if self.opts.vacuity:
-            self._vacuity([s for s in states if s.res.status == PROVEN])
+            # A reachability check's probe would be its own property again.
+            self._vacuity([s for s in states if s.res.status == PROVEN and not s.chk.reach])
         for s in states:
             s.res.seconds = round(time.time() - s.t0, 2)
         return [s.res for s in states]
@@ -417,6 +419,12 @@ class Engine:
                 self._fail(s, pr.trace, pr.step, label, replayed=False)
                 return
             s.cex = (pr.trace, pr.step, label)
+            if s.chk.reach and self.opts.try_full:
+                # A slice takes a branch easily, through values its cut
+                # registers can't really have; the first bounded search found
+                # the near ones, so only the full cone's verdict is worth having.
+                s.level, s.cex = UNBOUNDED, None
+                return
             if self.opts.cegar and pr.trace and res.refinements < self.opts.max_refinements:
                 replays.append((s, pr, mc))
             else:
@@ -507,13 +515,46 @@ class Engine:
         real_v = read_vcd(os.path.join(self.outdir, reach.trace))
         return ("spurious", divergent(slice_v, real_v, cut_nets, step) - s.keep)
 
+    # ---------------------------------------------------------- reachability
+    def _reach_first(self, states: list):
+        """Reachability checks (dead branches) are mostly reached within a few
+        cycles of reset.  One bounded search per batch on the checks' full
+        cones finds those witnesses at once, and they are real: nothing is
+        cut.  The rest go through the rounds like any check, where a proof
+        on a slice means the condition never holds."""
+        if not states:
+            return
+        for s in states:
+            s.spec = self._slice(s.chk, [], UNBOUNDED)
+        batches = self._pack(states, props=4 * self.opts.batch_props, cells=2 * self.opts.batch_cells)
+
+        def one(batch):
+            spec = merge_specs(self.nl, [s.spec for s in batch])
+            mc = needs_multiclock(self.nl, spec)
+            props = {f"fvl_t{i}": s for i, s in enumerate(batch)}
+            r = self.run("reach_bmc", spec, [self._target(s, n) for n, s in props.items()], "bmc",
+                         self.opts.depth, mc, engine=self.smtbmc_str())
+            for n, s in props.items():
+                pr = r.get(n)
+                s.res.history.append(("full", f"bmc{self.opts.depth}:{pr.status if pr.status == 'fail' else r.status}"))
+                if pr.status == "fail":
+                    s.res.engine = "BMC"
+                    self._fail(s, pr.trace, pr.step, "full", replayed=False)
+        with ThreadPoolExecutor(max_workers=max(1, self.opts.jobs)) as ex:
+            list(ex.map(one, batches))
+        for s in states:
+            s.spec = None
+
     # ------------------------------------------------------------ deep BMC
     def _deep_bmc(self, states: list):
         """k-induction gave up: search deeper for a counterexample, with a depth
         derived from the structure (e.g. 2^width for a counter)."""
         def one(s: St):
             spec = s.spec
-            hint = min(max(s.chk.depth_hint, self._lemma_bound(spec) + 4), self.opts.max_bmc_depth)
+            # A branch nothing decided: as deep as allowed (nothing in its
+            # structure says how far away it is).
+            hint = (self.opts.max_bmc_depth if s.chk.reach else
+                    min(max(s.chk.depth_hint, self._lemma_bound(spec) + 4), self.opts.max_bmc_depth))
             if hint <= self.opts.depth:
                 return
             r = self.run("deepbmc", spec, [self._target(s, "fvl_t0")], "bmc", hint,

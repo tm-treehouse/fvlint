@@ -507,7 +507,8 @@ class Flow(CliCase):
     # Spelled out here, not read back from cli.KINDS: a misspelt entry there
     # would make that kind unselectable while a loop over KINDS still passes.
     ALL_KINDS = ["counter_overflow", "counter_underflow", "parallel_case", "full_case", "index_range",
-                 "shift_range", "div_zero", "mem_addr", "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary"]
+                 "shift_range", "div_zero", "mem_addr", "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary",
+                 "dead_branch"]
 
     def test_every_check_kind_is_accepted(self):
         self.assertEqual(cli.KINDS, self.ALL_KINDS)
@@ -582,6 +583,183 @@ class Flow(CliCase):
     def test_one_failure_is_enough(self):
         self.Engine.status = staticmethod(lambda c: FAIL if c.target == "acc" else PROVEN)
         self.assertEqual(self.run_cli("--fail-on", "fail")[0], 1)
+
+
+class DeadBranches(CliCase):
+    top = "snap_branches"
+
+    def kinds(self):
+        return sorted({c.kind for c in self.Engine.last.proved})
+
+    def test_opt_in(self):
+        self.run_cli()
+        self.assertNotIn("dead_branch", self.kinds())
+        self.run_cli("--dead-branches")
+        self.assertIn("dead_branch", self.kinds())
+        self.assertIn("counter_overflow", self.kinds())
+        self.run_cli("--checks", "dead_branch")
+        self.assertEqual(self.kinds(), ["dead_branch"])
+        self.run_cli("--checks", "counter_overflow", "--dead-branches")
+        self.assertEqual(self.kinds(), ["counter_overflow", "dead_branch"])
+        self.assertEqual(cli.DEFAULT_KINDS, [k for k in self.ALL_KINDS if k != "dead_branch"])
+
+    ALL_KINDS = Flow.ALL_KINDS
+
+    def test_verdicts(self):
+        # The engine proves a reachability property (dead) or finds a trace (live).
+        self.Engine.status = staticmethod(lambda c: PROVEN if c.target in ("n==3'd7", "a") else FAIL)
+        rc, out, _ = self.run_cli("--checks", "dead_branch")
+        self.assertEqual(rc, 0)                                          # a dead branch is a WARN
+        res = {r["id"]: r for r in self.results()["results"]}
+        self.assertEqual(res["dead_branch:n==3'd7"]["status"], "WARN")
+        self.assertEqual(res["dead_branch:n==3'd7"]["detail"], "dead: `n == 3'd7` never holds after reset; fake")
+        self.assertEqual(res["dead_branch:n==3'd7"]["condition"], "n == 3'd7")
+        self.assertEqual(res["dead_branch:go"]["status"], "PROVEN")
+        self.assertTrue(res["dead_branch:go"]["detail"].startswith("live: taken at step None"))
+        self.assertNotIn("dead_branch:rst_n", res)                      # the reset is no branch
+        self.assertIn("WARN  dead_branch:a        snap_branches.sv:32", out)
+        self.assertEqual(self.run_cli("--checks", "dead_branch", "--fail-on", "unknown")[0], 0)
+
+    def test_reset_is_pinned_inactive(self):
+        self.run_cli("--dead-branches")
+        ids = {c.id for c in self.Engine.last.proved}
+        self.assertNotIn("dead_branch:rst_n", ids)
+        self.run_cli("--dead-branches", "--no-reset")
+        self.assertIn("dead_branch:rst_n", {c.id for c in self.Engine.last.proved})
+
+    def test_waived_and_rechecked(self):
+        w = self.write("w.txt", "dead_branch:n==3'd7   # defensive\n")
+        self.Engine.status = PROVEN
+        self.run_cli("--checks", "dead_branch", "--waivers", w)
+        res = {r["id"]: r for r in self.results()["results"]}
+        self.assertEqual(res["dead_branch:n==3'd7"]["status"], "WAIVED")
+        _, _, err = self.run_cli("--checks", "dead_branch", "--waivers", w, "--recheck-waived")
+        res = {r["id"]: r for r in self.results()["results"]}
+        self.assertIn("recheck: WARN", res["dead_branch:n==3'd7"]["detail"])
+        self.assertNotIn("no longer needed", err)
+        self.Engine.status = FAIL                                         # live: the waiver can go
+        _, _, err = self.run_cli("--checks", "dead_branch", "--waivers", w, "--recheck-waived")
+        self.assertIn("waiver for dead_branch:n==3'd7 no longer needed", err)
+
+    def test_unused_waivers_for_dead_branches_only_when_they_ran(self):
+        w = self.write("w.txt", "dead_branch:gone\n")
+        _, _, err = self.run_cli("--waivers", w)
+        self.assertNotIn("matches no check", err)
+        _, _, err = self.run_cli("--waivers", w, "--dead-branches")
+        self.assertIn("waiver 'dead_branch:gone' matches no check", err)
+
+
+class Baselines(CliCase):
+    """--baseline / --update-baseline on snap_counters, where the acc checks fail."""
+
+    def setUp(self):
+        super().setUp()
+        self.Engine.status = staticmethod(lambda c: FAIL if c.target == "acc" else PROVEN)
+        self.base = os.path.join(self.tmp, "fvlint", "baseline.json")
+
+    def baseline(self, findings):
+        return self.write_json("fvlint/baseline.json", {"fvlint_baseline": 1, "top": self.top, "findings": findings})
+
+    def test_record_then_compare(self):
+        self.chdir(self.tmp)                                            # paths are shown relative to it
+        rc, _, err = self.run_cli("--baseline", self.base, "--update-baseline")
+        self.assertEqual(rc, 0)                                         # every finding is known now
+        self.assertIn("fvlint: baseline fvlint/baseline.json updated: 2 finding(s), 2 added, 0 removed", err)
+        with open(self.base) as f:
+            data = json.load(f)
+        self.assertEqual(data, {"fvlint_baseline": 1, "top": "snap_counters", "findings": {
+            "counter_overflow:acc": "FAIL", "counter_underflow:acc": "FAIL"}})
+        meta = self.results()["meta"]["baseline"]
+        self.assertEqual({k: meta[k] for k in ("updated", "gone", "fixed", "lines", "known", "new")},
+                         {"updated": True, "gone": [], "fixed": [], "lines": {}, "known": 2, "new": 0})
+        self.assertIn("--baseline FILE", cli.build_parser().format_help())
+        rc, out, err = self.run_cli("--baseline", self.base)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("warning", err)
+        self.assertIn(": 2 known findings, 0 new", out)
+        self.assertIn("(in baseline) ", out)
+        meta = self.results()["meta"]["baseline"]
+        self.assertEqual({k: meta[k] for k in ("known", "new", "gone", "fixed", "updated")},
+                         {"known": 2, "new": 0, "gone": [], "fixed": [], "updated": False})
+        self.assertTrue(meta["file"].endswith("baseline.json"))
+        res = {r["id"]: r["baseline"] for r in self.results()["results"]}
+        self.assertEqual(res["counter_overflow:acc"], "FAIL")
+        self.assertIsNone(res["counter_underflow:down_q"])
+
+    def test_new_and_worse_findings_fail(self):
+        self.baseline({"counter_overflow:acc": "FAIL", "counter_underflow:acc": "UNKNOWN"})
+        rc, out, _ = self.run_cli("--baseline", self.base)
+        self.assertEqual(rc, 1)                                         # UNKNOWN before, FAIL now
+        self.assertIn(": 1 known finding, 1 new", out)
+        res = {r["id"]: r["baseline"] for r in self.results()["results"]}
+        self.assertEqual((res["counter_overflow:acc"], res["counter_underflow:acc"]), ("FAIL", None))
+
+    def test_known_unknowns_with_fail_on_unknown(self):
+        self.Engine.status = staticmethod(lambda c: UNKNOWN if c.target == "acc" else PROVEN)
+        self.assertEqual(self.run_cli("--fail-on", "unknown")[0], 1)
+        self.baseline({"counter_overflow:acc": "UNKNOWN", "counter_underflow:acc": "FAIL"})
+        self.assertEqual(self.run_cli("--fail-on", "unknown", "--baseline", self.base)[0], 0)
+        self.assertEqual(self.run_cli("--fail-on", "unknown", "--baseline", self.results_path())[0], 0)
+
+    def results_path(self):
+        p = os.path.join(self.tmp, "earlier.json")
+        with open(os.path.join(self.out, "results.json")) as f, open(p, "w") as g:
+            g.write(f.read())
+        return p
+
+    def test_out_of_date_entries(self):
+        self.baseline({"counter_overflow:acc": "FAIL", "counter_underflow:acc": "FAIL",
+                       "counter_overflow:gone": "FAIL", "counter_underflow:down_q": "WARN", "fsm_trap:x": "WARN"})
+        rc, _, err = self.run_cli("--baseline", self.base, "--checks", "counter_overflow,counter_underflow")
+        self.assertEqual(rc, 0)
+        self.assertIn("baseline entry counter_overflow:gone matches no check", err)
+        self.assertIn("baseline entry counter_underflow:down_q is no finding now", err)
+        self.assertNotIn("fsm_trap:x", err)                             # its kind did not run
+        meta = self.results()["meta"]["baseline"]
+        self.assertEqual((meta["gone"], meta["fixed"]), (["counter_overflow:gone"], ["counter_underflow:down_q"]))
+        self.assertEqual(meta["lines"], {"counter_overflow:gone": 1, "counter_underflow:down_q": 1})
+        # Updating with --checks keeps the entries of other kinds.
+        self.run_cli("--baseline", self.base, "--checks", "counter_overflow,counter_underflow", "--update-baseline")
+        with open(self.base) as f:
+            self.assertEqual(json.load(f)["findings"], {"counter_overflow:acc": "FAIL", "counter_underflow:acc": "FAIL",
+                                                        "fsm_trap:x": "WARN"})
+        self.assertEqual(self.results()["meta"]["baseline"]["gone"], [])
+
+    def test_ci_outputs(self):
+        self.baseline({"counter_overflow:acc": "FAIL", "counter_overflow:gone": "FAIL"})
+        summary = os.path.join(self.tmp, "summary.md")
+        os.environ["GITHUB_WORKSPACE"] = self.tmp
+        self.addCleanup(os.environ.pop, "GITHUB_WORKSPACE", None)
+        rc, out, _ = self.run_cli("--baseline", self.base, "--github", "--summary-md", summary)
+        self.assertEqual(rc, 1)
+        self.assertIn("::notice title=fvlint FAIL (in baseline)%3A counter_overflow%3Aacc", out)
+        self.assertIn("::error title=fvlint FAIL%3A counter_underflow%3Aacc", out)
+        self.assertRegex(out, r"::warning title=fvlint%3A baseline out of date,file=fvlint/baseline.json,line=\d+::"
+                              r"counter_overflow:gone matches no check")
+        with open(summary) as f:
+            md = f.read()
+        self.assertIn("| FAIL (baseline) | `counter_overflow:acc` |", md)
+        self.assertIn("- `counter_overflow:gone`: no such check any more", md)
+        junit = ET.parse(os.path.join(self.out, "junit.xml")).getroot()
+        self.assertEqual((junit.get("failures"), junit.get("skipped")), ("1", "1"))
+
+    def test_errors(self):
+        rc, _, err = self.run_cli("--update-baseline")
+        self.assertEqual(rc, 2)
+        self.assertIn("--update-baseline needs --baseline FILE", err)
+        rc, _, err = self.run_cli("--baseline", self.base)
+        self.assertEqual(rc, 2)
+        self.assertIn("fvlint: --baseline: ", err)
+        self.assertIn("No such file", err)
+        self.write("fvlint/baseline.json", "{")
+        rc, _, err = self.run_cli("--baseline", self.base)
+        self.assertEqual((rc, "not valid JSON" in err), (2, True))
+        self.assertEqual(self.elab_calls, [])                            # before any work
+        self.assertEqual(self.run_cli("--baseline", self.base, "--update-baseline")[0], 2)
+
+    def test_listing_ignores_the_baseline_but_checks_it(self):
+        self.baseline({})
+        self.assertEqual(self.run_cli("--baseline", self.base, "--list")[0], 0)
 
 
 if __name__ == "__main__":
