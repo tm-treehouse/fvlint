@@ -53,6 +53,7 @@ KEYS = {
     "uninit": ("--uninit", "str"),
     "assume": ("--assume", "path"),
     "waivers": ("--waivers", "path"),
+    "baseline": ("--baseline", "path"),
     "recheck_waived": ("--recheck-waived", "flag"),
     "engine": ("--engine", "str"),
     "solver": ("--solver", "str"),
@@ -62,6 +63,7 @@ KEYS = {
     "pdr_timeout": ("--pdr-timeout", "num"),
     "horizon": ("--horizon", "cycles"),
     "checks": ("--checks", "list"),
+    "dead_branches": ("--dead-branches", "flag"),
     "fail_on": ("--fail-on", "str"),
     "jobs": ("-j", "int"),
     "args": (None, "raw"),
@@ -236,14 +238,20 @@ def run_config(argv: list) -> int:
               file=sys.stderr)
         return 2
     base = os.path.dirname(os.path.abspath(path))
-    rc, runs = 0, []
+    rc, runs, argvs = 0, [], {}
     for name in names or list(configs):
         try:
-            run_argv = entry_argv({**data.get("defaults", {}), **configs[name]}, base)
+            argvs[name] = entry_argv({**data.get("defaults", {}), **configs[name]}, base)
         except ConfigError as e:
             print(f"fvlint: {path}: config.{name}: {e}", file=sys.stderr)
             rc = 2
-            continue
+    shared = shared_baselines({n: a + extra for n, a in argvs.items()})
+    for f, users in shared:
+        print(f"fvlint: {path}: configurations {', '.join(users)} share the baseline file {f}; "
+              "give each configuration its own", file=sys.stderr)
+    if shared:
+        return 2
+    for name, run_argv in argvs.items():
         print(f"=== fvlint: {name}", file=sys.stderr)
         sys.stderr.flush()
         info = {}
@@ -256,6 +264,29 @@ def run_config(argv: list) -> int:
             runs.append(info)
     report_unused_waivers(runs)
     return rc
+
+
+def baseline_of(argv: list) -> str | None:
+    """The --baseline file a command line gives (the last one wins)."""
+    found, it = None, iter(argv)
+    for a in it:
+        if a == "--baseline":
+            found = next(it, found)
+        elif a.startswith("--baseline="):
+            found = a.split("=", 1)[1]
+    return found
+
+
+def shared_baselines(argvs: dict) -> list:
+    """[(file, [configuration names])] for baseline files that several
+    configurations would use: each compares against its own checks, and
+    --update-baseline would have them overwrite each other."""
+    users = {}
+    for name, argv in argvs.items():
+        f = baseline_of(argv)
+        if f:
+            users.setdefault(os.path.realpath(f), []).append(name)
+    return [(f, names) for f, names in users.items() if len(names) > 1]
 
 
 def unused_waivers(runs: list) -> list:

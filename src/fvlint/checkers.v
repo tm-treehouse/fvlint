@@ -112,6 +112,21 @@ module fvl_member #(
   `FVL_EMIT
 endmodule
 
+// Reachability: can the condition c (every bit at POL) hold?  ok is 0, so
+// the assertion (MODE 0) says it never does, and a counterexample is a trace
+// that reaches it; the replay cover (MODE 1) is cover(en).
+module fvl_reach #(
+  parameter integer NC = 1,
+  parameter [NC-1:0] POL = 1,
+  parameter integer MODE = 0
+) (
+  input [NC-1:0] c
+);
+  wire en = &(~(c ^ POL));
+  wire ok = 1'b0;
+  `FVL_EMIT
+endmodule
+
 // Hold the design in reset for the first CYCLES global time steps; unless
 // ANYTIME is set, reset then stays released (no mid-run or glitching resets).
 module fvl_reset_init #(parameter ACTIVE = 1, parameter integer CYCLES = 1,

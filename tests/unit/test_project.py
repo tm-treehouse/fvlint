@@ -27,7 +27,8 @@ class EntryArgs(unittest.TestCase):
                  "reset_cycles": 3, "uninit": "free", "assume": "a.sv", "waivers": "w.txt",
                  "recheck_waived": True, "engine": "pdr", "solver": "z3", "max_level": 2, "depth": 30,
                  "timeout": 60.5, "pdr_timeout": 10, "horizon": "2^48", "checks": ["mem_addr", "index_range"],
-                 "fail_on": "unknown", "jobs": 4, "args": ["--no-cegar"]}
+                 "fail_on": "unknown", "jobs": 4, "args": ["--no-cegar"], "baseline": "base/b.json",
+                 "dead_branches": True}
         b = os.path.join(os.sep, "proj")
         self.assertEqual(entry_argv(entry, b), [
             "--top", "t", "-f", os.path.join(b, "a.f"), "-F", os.path.join(b, "b.f"), "-I", os.path.join(b, "inc"),
@@ -36,7 +37,9 @@ class EntryArgs(unittest.TestCase):
             "--assume", os.path.join(b, "a.sv"), "--waivers", os.path.join(b, "w.txt"), "--recheck-waived",
             "--engine", "pdr", "--solver", "z3", "--max-level", "2", "--depth", "30", "--timeout", "60.5",
             "--pdr-timeout", "10", "--horizon", "2^48", "--checks", "mem_addr,index_range", "--fail-on", "unknown",
-            "-j", "4", "--no-cegar", os.path.join(b, "rtl", "a.sv"), "/abs/b.sv"])
+            "-j", "4", "--no-cegar", "--baseline", os.path.join(b, "base", "b.json"), "--dead-branches",
+            os.path.join(b, "rtl", "a.sv"), "/abs/b.sv"])
+        self.assertEqual(entry_argv({"top": "t", "dead_branches": False}, b), ["--top", "t"])
         self.assertEqual(entry_argv({"top": "t", "params": {"EN": True}}, b), ["--top", "t", "-P", "EN=1"])
 
     def test_every_option_maps_to_a_real_option(self):
@@ -90,6 +93,26 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(_out_root(["-o"], {"out": "o"}), ("o", []))           # no value: the file's
         with self.assertRaisesRegex(ConfigError, "out: expected a path"):
             _out_root([], {"out": 3})
+
+
+class Baselines(unittest.TestCase):
+    def test_baseline_of(self):
+        from fvlint.project import baseline_of
+        self.assertIsNone(baseline_of(["--top", "t", "--waivers", "w"]))
+        self.assertEqual(baseline_of(["--baseline", "a.json", "--baseline=b.json"]), "b.json")
+        self.assertEqual(baseline_of(["--baseline=b.json", "--baseline", "c.json"]), "c.json")
+        self.assertEqual(baseline_of(["--baseline=a=b.json"]), "a=b.json")
+        self.assertIsNone(baseline_of(["--baseline"]))
+        self.assertEqual(baseline_of(["--baseline", "a.json", "--baseline"]), "a.json")
+
+    def test_shared(self):
+        from fvlint.project import shared_baselines
+        cwd = os.getcwd()
+        self.assertEqual(shared_baselines({"a": ["--baseline", "x.json"], "b": ["--baseline", "y.json"], "c": []}),
+                         [])
+        self.assertEqual(shared_baselines({"a": ["--baseline", "x.json"], "b": ["--baseline", "./x.json"],
+                                           "c": ["--baseline", "y.json"], "d": ["--baseline=x.json"]}),
+                         [(os.path.realpath(os.path.join(cwd, "x.json")), ["a", "b", "d"])])
 
 
 class Projects(CliCase):
@@ -167,6 +190,34 @@ class Projects(CliCase):
                 raise SystemExit(code)
             with self.subTest(code=code), mock.patch.object(cli, "main", run), captured():
                 self.assertEqual(project.run_config(["--config", p]), want)
+
+    def test_a_baseline_per_configuration(self):
+        p = self.project(self.TWO.format(out=self.out).replace('jobs = 1\n', 'jobs = 1\nbaseline = "b/mux.json"\n')
+                         .replace('files = ["../rtl/top.sv"]\n[config.mux]',
+                                  'files = ["../rtl/top.sv"]\nbaseline = "b/counters.json"\n[config.mux]'))
+        self.Engine.status = FAIL
+        rc, _, err = self.run_project(p, "--update-baseline")
+        self.assertEqual(rc, 0)
+        for name in ("counters", "mux"):
+            with open(os.path.join(self.tmp, "proj", "b", f"{name}.json")) as f:
+                self.assertEqual(json.load(f)["top"], f"snap_{name}")
+        self.assertEqual(self.run_project(p)[0], 0)
+        self.Engine.status = PROVEN
+        rc, _, err = self.run_project(p)
+        self.assertEqual(rc, 0)
+        self.assertIn("is no finding now", err)
+
+    def test_a_shared_baseline_file_is_refused(self):
+        p = self.project(self.TWO.format(out=self.out))
+        rc, _, err = self.run_project(p, "--baseline", "shared.json", "--update-baseline")
+        self.assertEqual(rc, 2)
+        self.assertIn(f"configurations counters, mux share the baseline file {os.path.join(self.tmp, 'shared.json')}"
+                      "; give each configuration its own", err)
+        self.assertEqual(self.elab_calls, [])                           # nothing ran
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "shared.json")))
+        rc, _, _ = self.run_project(p, "mux", "--baseline", "shared.json", "--update-baseline")
+        self.assertEqual(rc, 0)                                         # one configuration: fine
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "shared.json")))
 
     def test_project_file_errors(self):
         for text, msg in (("[config", "not valid TOML"), ("x = 1\n[config.a]\ntop = 't'\n", "unknown top-level key"),

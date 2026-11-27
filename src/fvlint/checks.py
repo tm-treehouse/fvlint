@@ -23,6 +23,8 @@ HORIZON = "horizon"                # the counter can't wrap within --horizon cyc
 DEAD_STATE = "dead_state"          # applies only in an unreachable FSM state
 FULL_CASE_X = "full_case_x"        # full_case on a signal set to 'x before the case: the pragma changes nothing
 
+REACH = "fvl_reach"                # checker of reachability checks (Check.reach)
+
 
 def src_key(src: str) -> tuple:
     """Sort key for 'file:line' locations: by file, then numerically by line."""
@@ -49,6 +51,13 @@ class Check:
     min_cycles: int | None = None       # a violation needs at least this many cycles (counters), if known
     group: str | None = None            # id of the reported check this one is a part of (case statements)
     part: str = ""                      # what this part covers (the signal a case statement assigns)
+    condition: str | None = None        # dead_branch: the branch's condition as Verilog, if it has one
+
+    @property
+    def reach(self) -> bool:
+        """A reachability check (dead_branch): the engine tries to show its
+        condition never holds; a counterexample is a witness that it can."""
+        return self.checker == REACH
 
     @property
     def id(self) -> str:
@@ -93,6 +102,7 @@ class Result:
     history: list = field(default_factory=list)   # [(cone, outcome)]
     waiver: str | None = None
     seconds: float = 0.0
+    baseline: str | None = None       # the baseline's status for a known finding (see baseline.py)
 
     def to_dict(self) -> dict:
         return {
@@ -103,6 +113,7 @@ class Result:
             "lemmas_used": self.lemmas_used, "refinements": self.refinements,
             "vacuity": self.vacuity, "history": self.history, "waiver": self.waiver,
             "reason": self.check.reason if self.status == INFO else None,
+            "baseline": self.baseline, "condition": self.check.condition,
         }
 
 

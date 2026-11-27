@@ -1,0 +1,7 @@
+{
+  "fvlint_baseline": 1,
+  "top": "credit_bug",
+  "findings": {
+    "counter_overflow:used": "FAIL"
+  }
+}

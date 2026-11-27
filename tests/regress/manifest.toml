@@ -588,3 +588,95 @@ top = "updown_wide"
 expect = { "counter_overflow:c" = "FAIL", "counter_underflow:c" = "FAIL" }
 strict = true
 tags = ["counter", "review"]
+
+# ------------------------------------------------------- dead branches
+[[case]]
+name = "branches/count"
+files = ["../fixtures/branches.sv"]
+top = "br_count"
+args = ["--dead-branches"]
+engines = ["pdr", "smtbmc"]
+expect = { "counter_overflow:n" = "PROVEN", "dead_branch:n==3'd7" = "WARN", "dead_branch:n==3'd6" = "WARN", "dead_branch:go" = "PROVEN", "dead_branch:!go" = "PROVEN", "dead_branch:n==3'd5" = "PROVEN", "dead_branch:n!=3'd5" = "PROVEN", "dead_branch:n!=3'd7" = "PROVEN", "dead_branch:n==3'd4" = "PROVEN", "dead_branch:n!=3'd4" = "PROVEN", "dead_branch:n==3'd0" = "PROVEN", "dead_branch:n==3'd3" = "PROVEN" }
+strict = true
+exit = 0
+tags = ["branches"]
+
+[[case]]
+name = "branches/count_slang"
+files = ["../fixtures/branches.sv"]
+top = "br_count"
+args = ["--frontend", "slang", "--checks", "dead_branch"]
+expect = { "dead_branch:n==3'd7" = "WARN", "dead_branch:n==3'd6" = "WARN", "dead_branch:go" = "PROVEN", "dead_branch:!go" = "PROVEN", "dead_branch:n==3'd5" = "PROVEN", "dead_branch:n!=3'd5" = "PROVEN", "dead_branch:n!=3'd7" = "PROVEN", "dead_branch:n==3'd4" = "PROVEN", "dead_branch:n!=3'd4" = "PROVEN", "dead_branch:n==3'd0" = "PROVEN", "dead_branch:n==3'd3" = "PROVEN" }
+strict = true
+exit = 0
+tags = ["branches", "slang"]
+
+[[case]]
+name = "branches/deep"
+files = ["../fixtures/branches.sv"]
+top = "br_deep"
+args = ["--dead-branches"]
+engines = ["pdr", "smtbmc"]
+# t == 40 and t == 63 are taken only after the first bounded search (20 cycles).
+expect = { "counter_overflow:t" = "PROVEN", "dead_branch:t==6'd63" = "PROVEN", "dead_branch:t!=6'd63" = "PROVEN", "dead_branch:t==6'd40" = "PROVEN", "dead_branch:t!=6'd40" = "PROVEN" }
+strict = true
+exit = 0
+tags = ["branches", "cone"]
+
+[[case]]
+name = "branches/always_true"
+files = ["../fixtures/branches.sv"]
+top = "br_always"
+args = ["--dead-branches"]
+expect = { "dead_branch:!ok" = "WARN", "dead_branch:ok" = "PROVEN" }
+strict = true
+exit = 0
+tags = ["branches"]
+
+[[case]]
+name = "branches/assume_bare"
+files = ["../fixtures/branches.sv"]
+top = "br_assume"
+args = ["--checks", "dead_branch"]
+expect = { "dead_branch:cmd==2'd0" = "PROVEN", "dead_branch:cmd==2'd1" = "PROVEN", "dead_branch:cmd==2'd2" = "PROVEN", "dead_branch:cmd==2'd3" = "PROVEN" }
+strict = true
+tags = ["branches", "assume"]
+
+[[case]]
+name = "branches/assume"
+files = ["../fixtures/branches.sv"]
+top = "br_assume"
+args = ["--checks", "dead_branch", "--assume", "{dir}/../fixtures/branches_assume.sv"]
+expect = { "dead_branch:cmd==2'd0" = "PROVEN", "dead_branch:cmd==2'd1" = "PROVEN", "dead_branch:cmd==2'd2" = "PROVEN", "dead_branch:cmd==2'd3" = "WARN" }
+strict = true
+exit = 0
+tags = ["branches", "assume"]
+
+[[case]]
+name = "branches/fsm_state"
+files = ["../fixtures/branches.sv"]
+top = "br_fsm"
+args = ["--dead-branches"]
+# The branches in the unreachable ERR state are INFO: fsm_unreachable is the finding.
+expect = { "fsm_unreachable:st=2'b11" = "FAIL", "fsm_summary:st" = "INFO", "dead_branch:st==2'd3" = "INFO", "dead_branch:d" = "INFO", "dead_branch:!d" = "INFO", "dead_branch:st!=2'd3" = "PROVEN", "dead_branch:st==2'd0" = "PROVEN", "dead_branch:st==2'd1" = "PROVEN", "dead_branch:go" = "PROVEN", "dead_branch:!go" = "PROVEN" }
+strict = true
+tags = ["branches", "fsm"]
+
+# ------------------------------------------------------------- baselines
+[[case]]
+name = "baseline/known"
+files = ["../fixtures/counters.sv"]
+top = "credit_bug"
+args = ["--baseline", "{dir}/credit_bug_baseline.json"]
+expect = { "counter_overflow:used" = "FAIL", "counter_underflow:used" = "PROVEN" }
+exit = 0
+tags = ["baseline"]
+
+[[case]]
+name = "baseline/new"
+files = ["../fixtures/counters.sv"]
+top = "credit_bug"
+args = ["--baseline", "{dir}/empty_baseline.json"]
+expect = { "counter_overflow:used" = "FAIL", "counter_underflow:used" = "PROVEN" }
+exit = 1
+tags = ["baseline"]

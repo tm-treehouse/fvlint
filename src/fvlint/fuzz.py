@@ -9,8 +9,9 @@ fvlint settles without a proof: case statements in FSM states, up/down
 counters under a small --horizon, full_case on 'x or valued signals,
 parameter guards), shifts and divisions by registers, and sometimes an
 assumption on an internal net (the same assume statement in fvlint's
---assume file and in the oracle's copy), runs fvlint on each,
-and then checks every verdict with an independent oracle.  The generator
+--assume file and in the oracle's copy), runs fvlint on each (half of them
+with --dead-branches), and then checks every verdict with an independent
+oracle.  The generator
 knows what it built, so for each construct it also writes down, as plain
 Verilog expressions, when the construct is active and when it goes wrong (an
 increment that wraps, two case items that match, an address past the end).  The oracle appends those
@@ -26,6 +27,12 @@ are inactive (a flop that data can set is not a reset).
                        enabling condition, for VACUOUS) within the bound.
 * FAIL              -> the oracle must find the violation.
 * fsm_unreachable   -> the oracle must not reach the state.
+* dead_branch       -> fvlint writes each branch's condition down as Verilog
+                       over the design's signals (results.json "condition");
+                       the oracle must not reach a dead one (WARN) and must
+                       reach a live one (PROVEN, with its witness step) on its
+                       own copy of the design.  Only the condition comes from
+                       fvlint's netlist, not the verdict.
 * INFO, by its results.json reason:
   dead_state        -> as VACUOUS: the enabling condition is never reached.
   horizon           -> no wrap within the --horizon N (the first N - 1 cycles
@@ -81,6 +88,8 @@ class Design:
     # Internal 1-bit nets assumed to be 0: fvlint gets them through an
     # --assume file (fvlint_net), the oracle as assume statements.
     assumptions: list = field(default_factory=list)
+    # Run with --dead-branches (drawn from its own random stream).
+    dead_branches: bool = False
 
     def assume_file(self) -> str:
         """The fvlint_assumptions module for `assumptions`."""
@@ -313,6 +322,7 @@ def generate(seed: int) -> Design:
     lines.append("endmodule")
     d.text = "\n".join(lines) + "\n"
     d.record()
+    d.dead_branches = random.Random(seed * 2750159 + 61).random() < 0.5
     return d
 
 
@@ -564,6 +574,18 @@ def oracle(out: str, design: Design, depth: int, engine_opts, max_depth: int = 8
     groups, problems, inconclusive = {}, [], []
     for res in results:
         st = res["status"]
+        if res["kind"] == "dead_branch":
+            # Taken (PROVEN: the oracle must reach the condition, like a
+            # FAIL's violation), dead (WARN: must not reach it), or INFO in
+            # an unreachable FSM state (as dead logic).
+            verdict = {"PROVEN": "FAIL", "WARN": "UNREACHABLE"}.get(st)
+            if st == "INFO" and res.get("reason") == "dead_state":
+                verdict = "DEAD"
+            if verdict and res.get("condition"):
+                key = ("branch", res["id"])
+                monitors[key] = {"en": [f"({res['condition']})"], "bad": [f"({res['condition']})"]}
+                groups[key] = [(verdict, res)]
+            continue
         if res["kind"].startswith("fsm_"):
             # fsm_unreachable FAIL: fvlint says this state of the register is never reached.
             sig, _, code = res["target"].partition("=")
@@ -692,7 +714,9 @@ def oracle(out: str, design: Design, depth: int, engine_opts, max_depth: int = 8
                 problems.append(f"{ids}: fvlint says unreachable, oracle reached it")
             elif st == "FAIL" and not failed:
                 if finished and (step + 4) * scale <= bound:
-                    problems.append(f"{ids}: fvlint FAIL, oracle found no violation within {bound} steps")
+                    live = ids.startswith("dead_branch:")
+                    problems.append(f"{ids}: fvlint {'says the branch is taken' if live else 'FAIL'}, oracle "
+                                    f"{'never reached it' if live else 'found no violation'} within {bound} steps")
                 else:
                     inconclusive.append(f"{ids}: FAIL at step {step} beyond the oracle's reach "
                                         f"(bound {bound}, job {status})")
@@ -722,6 +746,8 @@ def run(seeds, outroot: str, depth: int = 24, extra_args=(), verbose=False) -> d
             with open(assume, "w") as f:
                 f.write(design.assume_file())
             args += ["--assume", assume]
+        if design.dead_branches:
+            args.append("--dead-branches")
         rc = _quiet(cli.main, ["--top", design.top, src, "-o", d, "-j", "1", *extra_args, *args])
         summary["seeds"] += 1
         if rc == 2 or not os.path.exists(os.path.join(d, "results.json")):

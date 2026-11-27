@@ -5,6 +5,60 @@ SPDX-License-Identifier: ISC
 
 # Changelog
 
+## 0.6.0
+
+Baselines, so CI can fail on new findings only, and an opt-in check for
+dead branches.
+
+### Baselines
+
+* `--baseline FILE` compares a run with the findings recorded in FILE; only
+  findings it doesn't know count towards the exit status. A finding is
+  known when the file lists its id with the same status or a more severe
+  one. Known findings are still reported, marked `(in baseline)`; GitHub
+  annotations make them notices and JUnit skipped tests.
+* `--update-baseline` writes the run's findings to the file (and creates
+  it), keeping the entries of check kinds that didn't run.
+* Out-of-date entries (no such check any more, or no finding now) are
+  warnings, with `--github` on their line of the file, and listed in the
+  job summary. `results.json` records the baseline status of each result
+  and the counts in `meta.baseline`. An earlier `results.json` works as a
+  baseline too.
+* Project files take `baseline` per configuration; configurations can't
+  share one file.
+
+### Dead branches
+
+* `--dead-branches` (`dead_branches = true` in a project file) checks every
+  if/else arm, case item and `?:` choice: a branch whose condition never
+  holds after reset is a `dead_branch` `WARN`; one that is taken is
+  `PROVEN`, with its trace as the witness. Case defaults, reset branches,
+  branches that only matter during reset and parameter-disabled logic are
+  left out; branches in an unreachable FSM state are `INFO`.
+* A branch that assigns several signals (one multiplexer each in Yosys) is
+  one check, taken when any of its assignments can be; the implicit default
+  of a case statement is left out like an explicit one.
+* The engine proves these "the other way round": a proof that the
+  condition never holds (on a slice, as for any check) is a dead branch, a
+  counterexample on the full cone is a taken one. One bounded search on the
+  full cones settles most taken branches at once, before the rounds; a
+  branch a slice takes goes straight to the full cone (no refinement), and
+  an undecided one gets the deepest bounded search (`--max-bmc-depth`).
+  PicoRV32: 185 branches in about 15 s.
+* A check is named after its condition (`dead_branch:n==3'd7`), and
+  `results.json` has the condition as Verilog in `condition`.
+
+### Tests
+
+* The fuzzer runs half its designs with `--dead-branches`; the oracle must
+  reach every branch fvlint says is taken and must not reach a dead one, on
+  its own copy of the design, from the condition fvlint writes down.
+* Regression cases for dead branches (counters, a branch first taken after
+  40 cycles, an always-true condition, an assumption that makes an item
+  dead, branches in an unreachable FSM state; Yosys and slang frontends,
+  both engines) and for baselines (a known finding passes, a new one
+  fails).
+
 ## 0.5.0
 
 Assumptions on any net of the design, an assumption library for common

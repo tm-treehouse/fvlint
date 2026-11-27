@@ -301,6 +301,12 @@ class Generator(unittest.TestCase):
                          "endcase if (in3 && in2) st <= 2'd1; end")
         self.assertNotIn("reg [1:0] st;", fuzz.generate(7).text)
 
+    def test_dead_branches_per_seed(self):
+        # Drawn from a stream of its own: the designs themselves are unchanged.
+        self.assertEqual([s for s in range(1, 13) if fuzz.generate(s).dead_branches], [1, 4, 7, 10, 11, 12])
+        self.assertFalse(fuzz.Design("", "t").dead_branches)
+        self.assertEqual(sum(fuzz.generate(s).dead_branches for s in range(1, 201)), 102)   # about half
+
     def test_reset_stages(self):
         # Only the synchronizer stages something uses survive elaboration.
         self.assertEqual(fuzz.generate(4).stages, ["s1", "s2"])         # a register resets on s2
@@ -572,6 +578,31 @@ class Oracle(TempDirCase):
                                         "counter_overflow:q: FAIL, but the generator has no monitor for it"])
         self.assertEqual(self.runs, [])                                 # nothing left to check: no job
 
+    def test_dead_branches(self):
+        # Live (PROVEN): the oracle must reach the condition; dead (WARN): it
+        # must not; INFO in an unreachable FSM state: dead logic.  No
+        # condition, or no verdict to check: nothing to do.
+        def br(cid, status, cond, step=None, reason=None):
+            return dict(row(cid, status, step=step), condition=cond, reason=reason)
+        rows = [br("dead_branch:a", "PROVEN", "e", step=2), br("dead_branch:b", "WARN", "q == 4'd9"),
+                br("dead_branch:c", "INFO", "q == 4'd7 && e", reason="dead_state"),
+                br("dead_branch:d", "INFO", "q == 4'd1", reason="other"), br("dead_branch:e", "UNKNOWN", "!e"),
+                br("dead_branch:f", "WARN", None)]
+        self.assertEqual(self.oracle(rows, fails={"((e))": 2}), ([], []))
+        self.assertEqual(self.asserts(), ["always @* if (fvo_gate) assert (!((e)));",
+                                          "always @* if (fvo_gate) assert (!((q == 4'd9)));",
+                                          "always @* if (fvo_gate) assert (!((q == 4'd7 && e)));"])
+        problems, _ = self.oracle(rows, fails={"(q == 4'd9)": 4, "(q == 4'd7": 5})
+        self.assertEqual(problems, ["dead_branch:a: fvlint says the branch is taken, oracle never reached it "
+                                    "within 24 steps",
+                                    "dead_branch:b: fvlint says unreachable, oracle reached it",
+                                    "dead_branch:c: fvlint INFO (dead logic in an unreachable state), oracle reached "
+                                    "the check's condition"])
+        self.assertNotIn(("branch", "dead_branch:a"), self.d.monitors)
+        _, inconclusive = self.oracle(rows[:1], status="TIMEOUT")
+        self.assertEqual(inconclusive, ["dead_branch:a: FAIL at step 2 beyond the oracle's reach (bound 24, job "
+                                        "TIMEOUT)"])
+
     def test_unreachable_fsm_state(self):
         rows = [row("fsm_unreachable:q=4'b1010", "FAIL"), row("fsm_unreachable:q=4'd3", "FAIL"),
                 row("fsm_unreachable:a.b=2'b01", "FAIL"), row("fsm_unreachable:q=4'b0001", "PROVEN")]
@@ -754,7 +785,8 @@ class Driver(TempDirCase):
         self.assertEqual((s["seeds"], s["checks"], s["statuses"]), (4, 4, {"PROVEN": 2, "FAIL": 2}))
         self.assertEqual((again["seeds"], again["problems"]), (1, []))
         d1 = os.path.join(self.tmp, "seed1")
-        self.assertEqual(argvs[0], ["--top", "fz1", os.path.join(d1, "fz1.v"), "-o", d1, "-j", "1", "--engine", "pdr"])
+        self.assertEqual(argvs[0], ["--top", "fz1", os.path.join(d1, "fz1.v"), "-o", d1, "-j", "1", "--engine", "pdr",
+                                    "--dead-branches"])                # seed 1 also looks for dead branches
         self.assertEqual(argvs[1][-4:], ["--engine", "pdr", "--horizon", "12"])     # the design's own options
         self.assertEqual(fuzz.generate(2).args, ["--horizon", "12"])
         self.assertTrue(0 <= s["seconds"] < 60)
@@ -781,7 +813,7 @@ class Driver(TempDirCase):
             s = fuzz.run([7, 1], self.tmp)
         self.assertEqual(s["problems"], [])
         assume = os.path.join(self.tmp, "seed7", "assume.sv")
-        self.assertEqual(argvs[0][-2:], ["--assume", assume])
+        self.assertEqual(argvs[0][-3:], ["--assume", assume, "--dead-branches"])
         with open(assume) as f:
             self.assertEqual(f.read(), fuzz.generate(7).assume_file())
         self.assertEqual(fuzz.generate(1).assumptions, [])

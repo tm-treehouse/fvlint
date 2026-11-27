@@ -7,7 +7,7 @@
 # results (with counterexample traces).  Usage:
 #
 #   - uses: actions/checkout@v7
-#   - uses: tm-treehouse/fvlint@v0.5.0
+#   - uses: tm-treehouse/fvlint@v0.6.0
 #     with:
 #       config: fvlint.toml          # default
 #       configs: default irq         # default: every configuration in the file

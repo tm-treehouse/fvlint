@@ -12,6 +12,8 @@ import sys
 import time
 
 from . import __version__
+from .baseline import FINDINGS, Baseline, BaselineError
+from .branches import detect_branches, reach_verdicts
 from .checks import ERROR, FAIL, HORIZON, INFO, PROVEN, UNKNOWN, VACUOUS, WAIVED, Result, merge_parts
 from .detect import detect_all, fmt_cycles, harmless_full_case
 from .elaborate import Sources, elaborate, elaborate_without_full_case
@@ -24,7 +26,12 @@ from .tools import Toolchain, ToolError
 from .waivers import Waivers
 
 KINDS = ["counter_overflow", "counter_underflow", "parallel_case", "full_case", "index_range",
-         "shift_range", "div_zero", "mem_addr", "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary"]
+         "shift_range", "div_zero", "mem_addr", "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary",
+         "dead_branch"]
+# What runs without --checks.  Dead branches are opt-in (--dead-branches): a
+# check for every if/else arm, case item and ?: choice costs time, and
+# defensive code (an else that can't happen) is dead on purpose.
+DEFAULT_KINDS = [k for k in KINDS if k != "dead_branch"]
 
 
 DEFAULT_HORIZON = 1 << 60
@@ -169,10 +176,19 @@ def build_parser():
     g.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                    help="parallel solver jobs (default: half the CPUs; each job runs 2 processes)")
     g = p.add_argument_group("selection and output")
-    g.add_argument("--checks", help="comma-separated check kinds to run: " + ",".join(KINDS))
+    g.add_argument("--checks", help="comma-separated check kinds to run: " + ",".join(KINDS)
+                   + " (default: all but dead_branch)")
+    g.add_argument("--dead-branches", action="store_true",
+                   help="also look for dead branches: if/else arms, case items and ?: choices whose "
+                        "condition never holds after reset (WARN)")
     g.add_argument("--waivers", help="waiver file (check-id globs)")
     g.add_argument("--recheck-waived", action="store_true",
                    help="prove waived checks too, and say which waivers are no longer needed")
+    g.add_argument("--baseline", metavar="FILE",
+                   help="known findings (a baseline file, or an earlier results.json): only new findings "
+                        "count towards the exit status")
+    g.add_argument("--update-baseline", action="store_true",
+                   help="write this run's findings to the --baseline file (created if missing)")
     g.add_argument("--list", action="store_true", help="list detected checks without proving")
     g.add_argument("-o", "--out", default="fvlint_out", help="work/output directory")
     g.add_argument("--json", help="results JSON (default OUT/results.json)")
@@ -218,9 +234,20 @@ def main(argv=None, project: dict | None = None) -> int:
         print(f"fvlint: --checks: unknown check kind(s) {', '.join(sorted(want - set(KINDS)))}; "
               f"known: {', '.join(KINDS)}", file=sys.stderr)
         return 2
+    kinds = (set(DEFAULT_KINDS) if want is None else want) | ({"dead_branch"} if args.dead_branches else set())
     if not src.files:
         print("fvlint: no source files", file=sys.stderr)
         return 2
+    baseline = None
+    if args.update_baseline and not args.baseline:
+        print("fvlint: --update-baseline needs --baseline FILE (the file to write)", file=sys.stderr)
+        return 2
+    if args.baseline:
+        try:
+            baseline = Baseline.load(args.baseline, missing_ok=args.update_baseline)
+        except BaselineError as e:
+            print(f"fvlint: --baseline: {e}", file=sys.stderr)
+            return 2
     out = os.path.abspath(args.out)
     os.makedirs(out, exist_ok=True)
 
@@ -254,6 +281,8 @@ def main(argv=None, project: dict | None = None) -> int:
         return 2
 
     checks, lemmas = detect_all(nl, args.max_level, args.uninit)
+    if "dead_branch" in kinds:
+        checks += detect_branches(nl, dict(resets.inactive_conds()))
     if elab["fsm_warning"]:
         _warn(elab["fsm_warning"])
     fsms = {}
@@ -262,8 +291,7 @@ def main(argv=None, project: dict | None = None) -> int:
     checks += fsm_checks
     for k, v in fsm_lemmas.items():
         lemmas.setdefault(k, []).extend(v)
-    if want is not None:
-        checks = [c for c in checks if c.kind in want]
+    checks = [c for c in checks if c.kind in kinds]
     apply_horizon(checks, args.horizon)
     if any(c.kind == "full_case" and c.preset is None for c in checks):
         nofc = elaborate_without_full_case(src, args.top, args.frontend, tools, out)
@@ -324,10 +352,12 @@ def main(argv=None, project: dict | None = None) -> int:
             results += [Result(check=c, status=ERROR, detail=f"internal error: {e!r}")
                         for c in todo if c.id not in done]
 
+    reach_verdicts(results)
     results = merge_parts(results)
     explain_unknown(results, args.horizon)
     unneeded = recheck_waived(results, waived) if args.recheck_waived else []
-    unused = waivers.unused(want or set(KINDS))
+    unused = waivers.unused(kinds)
+    base_meta = apply_baseline(baseline, results, kinds, args.top, args.update_baseline) if baseline else None
     shown_unused = unused if project is None else []
     for n, pat in shown_unused:
         _warn(f"{args.waivers}:{n}: waiver {pat!r} matches no check (renamed, fixed or no longer present?)")
@@ -340,15 +370,15 @@ def main(argv=None, project: dict | None = None) -> int:
             "yosys": ".".join(map(str, tools.version)) if tools.version else None,
             "max_level": args.max_level, "horizon": args.horizon,
             "unused_waivers": [{"line": n, "pattern": pat} for n, pat in unused],
-            "unneeded_waivers": unneeded, **engine.stats}
+            "unneeded_waivers": unneeded, "baseline": base_meta, **engine.stats}
     write_json(results, args.json or os.path.join(out, "results.json"), meta)
     write_junit(results, args.junit or os.path.join(out, "junit.xml"))
-    print(console(results, args.verbose))
+    print(console(results, args.verbose, base_meta))
     title = f"{args.run_name} ({args.top})" if args.run_name else args.top
     md_files = [args.summary_md] if args.summary_md else []
     root = os.environ.get("GITHUB_WORKSPACE") or os.getcwd()
     if args.github:
-        for line in github_annotations(results, root, shown_unused, args.waivers, unneeded):
+        for line in github_annotations(results, root, shown_unused, args.waivers, unneeded, base_meta):
             print(line)
         if not md_files and os.environ.get("GITHUB_STEP_SUMMARY"):
             md_files.append(os.environ["GITHUB_STEP_SUMMARY"])
@@ -367,7 +397,35 @@ def main(argv=None, project: dict | None = None) -> int:
         bad.add(VACUOUS)
     if args.fail_on == "unknown":
         bad.add(UNKNOWN)
-    return 1 if any(r.status in bad for r in results) else 0
+    return 1 if any(r.status in bad and r.baseline is None for r in results) else 0
+
+
+def apply_baseline(baseline: Baseline, results, kinds, top: str, update: bool) -> dict:
+    """Mark the known findings; with `update`, first write this run's
+    findings to the baseline file, so that every finding is known.  Warns
+    about entries that want updating.  Returns the baseline part of
+    results.json's meta."""
+    meta = {"file": display_path(baseline.path), "updated": update, "gone": [], "fixed": [], "lines": {}}
+    if update:
+        new = baseline.updated(results, kinds)
+        added = sorted(c for c, st in new.items() if baseline.known(c, st) is None)
+        removed = sorted(set(baseline.findings) - set(new))
+        baseline.write(new, top)
+        print(f"fvlint: baseline {meta['file']} updated: {len(new)} finding(s), {len(added)} added, "
+              f"{len(removed)} removed", file=sys.stderr)
+        baseline = Baseline(baseline.path, new)
+    baseline.apply(results)
+    if not update:
+        meta["gone"], meta["fixed"] = baseline.stale(results, kinds)
+        meta["lines"] = baseline.lines(meta["gone"] + meta["fixed"])
+        for cid in meta["gone"]:
+            _warn(f"{meta['file']}: baseline entry {cid} matches no check (renamed, fixed or no longer "
+                  "present?); update it with --update-baseline")
+        for cid in meta["fixed"]:
+            _warn(f"{meta['file']}: baseline entry {cid} is no finding now; update it with --update-baseline")
+    meta["known"] = sum(r.baseline is not None for r in results)
+    meta["new"] = sum(r.baseline is None and r.status in FINDINGS for r in results)
+    return meta
 
 
 if __name__ == "__main__":

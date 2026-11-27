@@ -19,3 +19,9 @@ SPDX-License-Identifier = "ISC"
 path = ["tests/unit/mutation_baseline.json"]
 SPDX-FileCopyrightText = "2026 The fvlint Authors"
 SPDX-License-Identifier = "ISC"
+
+# Baseline files for the regression manifest: JSON, which cannot carry a header.
+[[annotations]]
+path = ["tests/regress/*_baseline.json"]
+SPDX-FileCopyrightText = "2026 The fvlint Authors"
+SPDX-License-Identifier = "ISC"

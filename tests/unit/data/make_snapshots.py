@@ -32,7 +32,7 @@ from fvlint.tools import Toolchain                # noqa: E402
 
 TOPS = {"snap_counters": "snap_counters.sv", "snap_mux": "snap_mux.sv",
         "snap_fsm": "snap_fsm.sv", "snap_reset": "snap_reset.sv", "snap_index": "snap_index.sv",
-        "snap_ops": "snap_ops.sv"}
+        "snap_ops": "snap_ops.sv", "snap_branches": "snap_branches.sv"}
 
 _SRC_PART = re.compile(r"([^|]*?)([^/|]+):(\d+\.\d+-\d+\.\d+)")
 
