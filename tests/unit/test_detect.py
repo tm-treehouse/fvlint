@@ -9,8 +9,8 @@ import unittest
 from fvlint.checks import INFO, Check
 from fvlint.detect import (MAX_FORWARD, MAX_PATHS, _bits_label, _compares, _dedupe, _dest_name, _fit, _guard,
                            _label, _operand_is, _signed_val, clean_conds, detect_all, detect_case, detect_counters,
-                           detect_div, detect_index, detect_memory, detect_shift, fmt_cycles, forward,
-                           harmless_full_case, min_cycles_to_wrap, mux_sources)
+                           detect_div, detect_index, detect_memory, detect_shift, detect_truncation, fmt_cycles,
+                           forward, harmless_full_case, min_cycles_to_wrap, mux_sources)
 
 from .support import NB, const, load_snapshot
 
@@ -1338,6 +1338,163 @@ class Shifts(unittest.TestCase):
         y2 = b.op("$shl", w=8, A=b.input("c", 8), B=s, attrs={"src": "s.v:3.1-3.2"})
         b.net("o", b.mux(y1, y2, b.input("k")[0]))
         self.assertEqual(sorted(c.id for c in detect_shift(b.build())), ["shift_range:o", "shift_range:o#1"])
+
+
+class Truncation(unittest.TestCase):
+    """detect_truncation on hand-made netlists: `q <= a OP b` with a narrow q."""
+
+    def build(self, ctype, aw, bw, yw, keep, b_const=None, signed=False, name_high=False, read_high=False,
+              guard=False, dead=False):
+        b = NB()
+        self.b = b
+        clk = b.input("clk")[0]
+        a = b.input("a", aw)
+        bb = const(b_const, bw) if b_const is not None else (b.input("b", bw) if bw else None)
+        ins = {"A": a} if bb is None else {"A": a, "B": bb}
+        params = {"A_SIGNED": 1, "B_SIGNED": 1} if signed else None
+        y = b.op(ctype, w=yw, params=params, attrs={"src": "w.v:6.1-6.9"}, **ins)
+        kept = y[:keep]
+        if guard:
+            self.g = b.input("g")[0]
+            q = b.net("q", b.new(keep))
+            kept = b.mux(q, kept, self.g)
+        elif dead:
+            q = b.net("q", b.new(keep))
+            kept = b.mux(q, kept, "0")
+        b.ff(kept, clk, q=b.net("q", b.new(keep)) if not (guard or dead) else q)
+        if name_high:
+            b.net("s", y)
+        if read_high:
+            b.output("hi", b.op("$not", A=y[-1:]))
+        self.y = y
+        return b.build()
+
+    def test_a_sum_stored_in_fewer_bits(self):
+        nl = self.build("$add", 8, 8, 8, 4)
+        (c,) = detect_truncation(nl)
+        self.assertEqual((c.id, c.src, c.checker, c.conds), ("truncation:q", "w.v:6", "fvl_range", []))
+        self.assertEqual((c.params, c.ports), ({"W": 8, "LO": 0, "HI": 15, "SIGNED": 0}, {"v": self.y}))
+        self.assertEqual(c.desc, "the + result fits the 4 bit(s) it is stored in (8 can be set)")
+
+    def test_nothing_dropped_or_dropped_on_purpose(self):
+        self.assertEqual(detect_truncation(self.build("$add", 8, 8, 8, 8)), [])         # every bit kept
+        self.assertEqual(detect_truncation(self.build("$add", 8, 8, 8, 4, name_high=True)), [])   # `s[3:0]`
+        self.assertEqual(detect_truncation(self.build("$add", 8, 8, 8, 4, read_high=True)), [])   # used elsewhere
+        self.assertEqual(detect_truncation(self.build("$add", 8, 8, 8, 4, dead=True)), [])        # never stored
+        b = NB()
+        b.op("$add", A=b.input("a", 4), B=b.input("b", 4))                      # nothing reads it at all
+        self.assertEqual(detect_truncation(b.build()), [])
+        b = NB()
+        y = b.op("$and", w=8, A=b.input("a", 8), B=b.input("b", 8))            # not arithmetic
+        b.ff(y[:4], b.input("clk")[0], q=b.net("q", b.new(4)))
+        self.assertEqual(detect_truncation(b.build()), [])
+
+    def test_which_names_make_bits_kept(self):
+        def build(**net):
+            b = NB()
+            y = b.op("$add", w=8, A=b.input("a", 8), B=b.input("b", 8))
+            b.ff(y[:4], b.input("clk")[0], q=b.net("q", b.new(4)))
+            if net.get("plain"):
+                b.netnames[net["plain"]] = {"bits": y, "attributes": {}}      # no hide_name: visible
+            elif net:
+                b.net(net["name"], y, hidden=net["hidden"])
+            return detect_truncation(b.build())
+        self.assertEqual(build(plain="s"), [])                                   # named: an explicit slice
+        self.assertEqual(len(build(name="s", hidden=True)), 1)                  # hidden: no one's name
+        self.assertEqual(len(build(name="$0\\q[7:0]", hidden=False)), 1)       # a name Yosys made up
+        self.assertEqual(len(build()), 1)
+
+    def test_only_bits_that_can_be_set_count(self):
+        # `c + 1` with an unsized 1: Yosys adds in 32 bits; 5 can be set.
+        self.assertEqual(detect_truncation(self.build("$add", 4, 32, 32, 5, b_const=1)), [])
+        (c,) = detect_truncation(self.build("$add", 4, 32, 32, 4, b_const=1))
+        self.assertEqual(c.params, {"W": 5, "LO": 0, "HI": 15, "SIGNED": 0})
+        self.assertEqual(c.ports["v"], self.y[:5])
+        (c,) = detect_truncation(self.build("$add", 2, 6, 8, 4))                # 6-bit operand: 7 bits
+        self.assertEqual(c.params["W"], 7)
+        (c,) = detect_truncation(self.build("$mul", 3, 2, 8, 4))                # 3 + 2 bits
+        self.assertEqual((c.params["W"], c.desc[:6]), (5, "the * "))
+        self.assertEqual(detect_truncation(self.build("$mul", 2, 2, 8, 4)), [])  # 4 bits: fits
+        (c,) = detect_truncation(self.build("$shl", 2, 2, 8, 4))                # 2 bits + up to 3
+        self.assertEqual((c.params["W"], c.desc[:7]), (5, "the << "))
+        self.assertEqual(detect_truncation(self.build("$shl", 2, 1, 8, 4)), [])  # 2 + 1: fits
+        (c,) = detect_truncation(self.build("$sshl", 2, 2, 8, 4))
+        self.assertEqual(c.desc, "the <<< result fits the 4 bit(s) it is stored in (5 can be set)")
+        # A difference or negation can borrow into every bit.
+        (c,) = detect_truncation(self.build("$sub", 4, 32, 32, 4, b_const=1))
+        self.assertEqual((c.params["W"], c.desc[:8]), (32, "the - re"))
+        (c,) = detect_truncation(self.build("$neg", 4, 0, 8, 4))
+        self.assertEqual((c.params["W"], c.desc[:14]), (8, "the unary - re"))
+
+    def test_signed(self):
+        (c,) = detect_truncation(self.build("$add", 8, 8, 8, 4, signed=True))
+        self.assertEqual(c.params, {"W": 8, "LO": -8, "HI": 7, "SIGNED": 1})
+        self.assertTrue(c.desc.endswith("(8 can be set, signed)"))
+        b = NB()
+        clk = b.input("clk")[0]
+        y = b.op("$add", w=8, A=b.input("a", 8), B=b.input("b", 8), params={"A_SIGNED": 1})   # one signed operand
+        b.ff(y[:4], clk, q=b.net("q", b.new(4)))
+        self.assertEqual(detect_truncation(b.build())[0].params["SIGNED"], 0)
+        b = NB()
+        clk = b.input("clk")[0]
+        y = b.op("$neg", w=8, A=b.input("a", 4), params={"A_SIGNED": 1})                      # -x of a signed x
+        b.ff(y[:4], clk, q=b.net("q", b.new(4)))
+        self.assertEqual(detect_truncation(b.build())[0].params, {"W": 8, "LO": -8, "HI": 7, "SIGNED": 1})
+
+    def test_signedness_parameters_missing(self):
+        # Yosys always sets them; without one, the operand is unsigned.
+        for params, signed in (({"B_SIGNED": 1}, 0), ({"A_SIGNED": 1}, 0), ({}, 0)):
+            with self.subTest(params=params):
+                b = NB()
+                y = b.new(8)
+                b.cell(None, "$add", {"A": b.input("a", 8), "B": b.input("b", 8), "Y": y}, dict(params, Y_WIDTH=8))
+                b.ff(y[:4], b.input("clk")[0], q=b.net("q", b.new(4)))
+                self.assertEqual(detect_truncation(b.build())[0].params["SIGNED"], signed)
+        b = NB()
+        y = b.new(8)
+        b.cell(None, "$neg", {"A": b.input("a", 8), "Y": y}, {"Y_WIDTH": 8})
+        b.ff(y[:4], b.input("clk")[0], q=b.net("q", b.new(4)))
+        self.assertEqual(detect_truncation(b.build())[0].params["SIGNED"], 0)
+
+    def test_path_conditions(self):
+        (c,) = detect_truncation(self.build("$add", 8, 8, 8, 4, guard=True))
+        self.assertEqual(c.conds, [(self.g, 1)])
+
+    def test_counters_are_left_to_counter_overflow(self):
+        # cnt <= cnt + 1 (an unsized 1): counter_overflow checks the wrap.
+        b = NB()
+        clk = b.input("clk")[0]
+        q = b.net("cnt", b.new(4))
+        y = b.op("$add", w=32, A=q + ["0"] * 28, B=const(1, 32))
+        b.ff(y[:4], clk, q=q)
+        self.assertEqual(detect_truncation(b.build()), [])
+        # An accumulator with a variable step is checked.
+        b = NB()
+        clk = b.input("clk")[0]
+        q = b.net("acc", b.new(4))
+        y = b.op("$add", w=8, A=q + ["0"] * 4, B=b.input("d", 8))
+        b.ff(y[:4], clk, q=q)
+        self.assertEqual([c.id for c in detect_truncation(b.build())], ["truncation:acc"])
+        # A constant step into another register is checked too.
+        b = NB()
+        clk = b.input("clk")[0]
+        y = b.op("$add", w=32, A=b.input("c", 4) + ["0"] * 28, B=const(1, 32))
+        b.ff(y[:4], clk, q=b.net("q", b.new(4)))
+        self.assertEqual([c.id for c in detect_truncation(b.build())], ["truncation:q"])
+
+    def test_two_into_one_name(self):
+        b = NB()
+        clk = b.input("clk")[0]
+        q = b.net("q", b.new(4))
+        y1 = b.op("$add", w=8, A=b.input("a", 8), B=b.input("b", 8), attrs={"src": "w.v:9.1-9.2"})
+        y2 = b.op("$add", w=8, A=b.input("c", 8), B=b.input("d", 8), attrs={"src": "w.v:5.1-5.2"})
+        b.ff(b.mux(y1[:4], y2[:4], b.input("s")[0]), clk, q=q)
+        self.assertEqual(sorted((c.id, c.src) for c in detect_truncation(b.build())),
+                         [("truncation:q", "w.v:5"), ("truncation:q#1", "w.v:9")])
+
+    def test_in_detect_all(self):
+        checks, _ = detect_all(self.build("$add", 8, 8, 8, 4), 3)
+        self.assertEqual([c.kind for c in checks], ["truncation"])
 
 
 class Division(unittest.TestCase):

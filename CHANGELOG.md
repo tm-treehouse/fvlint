@@ -5,6 +5,67 @@ SPDX-License-Identifier: ISC
 
 # Changelog
 
+## 0.7.0
+
+Two more checks, on by default: truncation and FIFOs.
+
+### Behaviour changes
+
+* `truncation`, `fifo_overflow` and `fifo_underflow` run by default, so a
+  design can get new findings (an unguarded ring buffer now fails both
+  FIFO checks). `--checks` selects the kinds to run.
+* The `counter_overflow` check of a FIFO pointer that wraps by overflowing
+  its width is `INFO` (`reason: fifo_pointer`) instead of a `FAIL`: the wrap
+  is the design. Pointers with an explicit wrap keep their check.
+
+### New checks
+
+* `truncation`: an arithmetic result (`+`, `-`, `*`, `<<`, unary `-`) stored
+  in fewer bits than it can have, through bits nothing reads and no one
+  named; the dropped bits must be 0 (signed: copies of the sign) where the
+  result is used. Explicit slices of named wires and counters are left out;
+  only bits that can be set count (`c + 1` with an unsized 1 is computed in
+  32 bits).
+* `fifo_overflow` / `fifo_underflow`: a memory written at one pointer
+  register and read at another, on one clock, whose pointers only hold, add
+  1 or wrap to 0. A checker counts the entries from the pointers' moves; a
+  write without a read when it holds as many entries as the memory has is an
+  overflow, a read when it holds none an underflow. The count starts over
+  with the FIFO's own reset, and after the first violation nothing more is
+  judged, so every `FAIL` is the first real one.
+* The engine can prove a check in a strengthened form first: a FIFO check
+  together with a guess at how the design counts (a register that steps up
+  and down, or the pointer difference). Proven, that is a proof of the
+  check; otherwise the plain check is proven instead, so a wrong guess
+  costs time, never a verdict. The demo's 100-entry FIFO: proven in
+  seconds, where PDR alone ran out of time after 20 minutes.
+
+### GitHub Action
+
+* New inputs: `fail-on-findings: "false"` reports findings without failing
+  the step (the `exit-code` output still says 1; a run that couldn't start
+  still fails), `annotations: "false"` writes the job summary without
+  annotating source lines.
+* fvlint's own CI no longer shows red annotations from the Action's smoke
+  test: its configuration with a FAIL records it in a baseline (a notice),
+  and the exit status of a new finding is checked with the two new inputs.
+
+### Tests
+
+* The fuzzer generates sums stored in fewer bits (guarded or not) and
+  four-entry FIFOs with one guard wrong or none, with the generator's own
+  monitors for the oracle. It found that the first FIFO checker lost a
+  write made while a later-released synchronized reset was still active;
+  the count now follows the FIFO's own reset.
+* Regression cases for both checks, on clean, guarded and buggy fixtures.
+
+### Documentation
+
+* The README's "What it checks" has a section per topic (settled without a
+  proof, truncation, FIFOs, dead branches, check IDs), "How it works"
+  covers dead branches and strengthened proofs, and Baselines moved next to
+  triage, where it belongs.
+
 ## 0.6.0
 
 Baselines, so CI can fail on new findings only, and an opt-in check for

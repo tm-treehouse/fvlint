@@ -7,10 +7,11 @@
 # results (with counterexample traces).  Usage:
 #
 #   - uses: actions/checkout@v7
-#   - uses: tm-treehouse/fvlint@v0.6.0
+#   - uses: tm-treehouse/fvlint@v0.7.0
 #     with:
 #       config: fvlint.toml          # default
 #       configs: default irq         # default: every configuration in the file
+#       fail-on-findings: false      # report only (default: findings fail the step)
 name: fvlint
 description: Formal lint for RTL with fvlint (counters, case statements, part-selects, memories, FSMs)
 branding:
@@ -27,6 +28,17 @@ inputs:
   args:
     description: More fvlint options for every configuration, e.g. "--fail-on unknown -j 4".
     default: ""
+  annotations:
+    description: >-
+      Annotate findings on their source lines ("true" or "false").  The job
+      summary is written either way.
+    default: "true"
+  fail-on-findings:
+    description: >-
+      Fail the step when fvlint has findings (exit status 1), "true" or
+      "false".  With "false" the step only reports them (see the exit-code
+      output); it still fails when fvlint can't run (exit status 2).
+    default: "true"
   output:
     description: Output directory; each configuration writes to OUTPUT/NAME.
     default: fvlint_out
@@ -101,11 +113,25 @@ runs:
         FVLINT_ARGS: ${{ inputs.args }}
         FVLINT_OUT: ${{ inputs.output }}
         FVLINT_ARTIFACT: ${{ inputs.artifact-name }}
+        FVLINT_ANNOTATIONS: ${{ inputs.annotations }}
+        FVLINT_FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
       run: |
+        for v in "$FVLINT_ANNOTATIONS" "$FVLINT_FAIL_ON_FINDINGS"; do
+          case $v in
+            true|false) ;;
+            *) echo "::error title=fvlint::annotations and fail-on-findings take \"true\" or \"false\", not '$v'"
+               echo "rc=2" >> "$GITHUB_OUTPUT"; exit 2 ;;
+          esac
+        done
         read -r -a names <<< "$FVLINT_CONFIGS"
         read -r -a extra <<< "$FVLINT_ARGS"
+        if [ "$FVLINT_ANNOTATIONS" = true ]; then
+          report=(--github)
+        else
+          report=(--summary-md "$GITHUB_STEP_SUMMARY")
+        fi
         set +e
-        fvlint --config "$FVLINT_CONFIG" "${names[@]}" -o "$FVLINT_OUT" --github "${extra[@]}"
+        fvlint --config "$FVLINT_CONFIG" "${names[@]}" -o "$FVLINT_OUT" "${report[@]}" "${extra[@]}"
         rc=$?
         set -e
         echo "rc=$rc" >> "$GITHUB_OUTPUT"
@@ -124,4 +150,11 @@ runs:
       shell: bash
       env:
         RC: ${{ steps.run.outputs.rc }}
-      run: exit "${RC:-2}"
+        FVLINT_FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+      run: |
+        rc="${RC:-2}"
+        if [ "$rc" = 1 ] && [ "$FVLINT_FAIL_ON_FINDINGS" = false ]; then
+          echo "fvlint found findings (exit status 1); fail-on-findings is false, so the step passes"
+          rc=0
+        fi
+        exit "$rc"

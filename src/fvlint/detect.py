@@ -805,6 +805,73 @@ def detect_div(nl: Netlist):
     return _dedupe(checks)
 
 
+# -------------------------------------------------------------- truncation
+TRUNC_OPS = {"$add": "+", "$sub": "-", "$mul": "*", "$shl": "<<", "$sshl": "<<<", "$neg": "unary -"}
+
+
+def _significant(bits: list) -> int:
+    """Width of an unsigned operand without its constant-zero top bits."""
+    return len(bits) - _zero_top(bits)
+
+
+def _natural_width(nl: Netlist, cell: str, signed: bool) -> int:
+    """How many low bits of the result can be other than zero (or, signed,
+    other than the sign): a sum one more than its widest operand, a product
+    both widths, a left shift the value's width plus the largest amount.
+    Unsized constants make Yosys compute `c + 1` in 32 bits; only these
+    bits can be lost.  A difference or negation can borrow into every bit."""
+    t, y = nl.ctype(cell), nl.conn(cell, "Y")
+    a, b = nl.conn(cell, "A"), nl.conn(cell, "B")
+    if signed or t in ("$sub", "$neg"):
+        return len(y)
+    if t == "$add":
+        n = max(_significant(a), _significant(b)) + 1
+    elif t == "$mul":
+        n = _significant(a) + _significant(b)
+    else:                                                       # shifts
+        n = _significant(a) + _max_value(b)
+    return min(n, len(y))
+
+
+def detect_truncation(nl: Netlist):
+    """An arithmetic result stored in fewer bits than it can have: the bits
+    above are dropped without a name (`q <= a + b` with a narrow q, not an
+    explicit `s[3:0]` of a named wire).  The check: they are 0 (signed:
+    copies of the sign) wherever the result is used.  A register stepped by
+    a constant (`cnt <= cnt + 1`) is left to counter_overflow."""
+    named = {b for n, x in nl.netnames.items() if not x.get("hide_name", 0) and _written(n) for b in x["bits"]}
+    checks = []
+    for cell, c in nl.cells.items():
+        op = TRUNC_OPS.get(c["type"])
+        if not op:
+            continue
+        y = nl.conn(cell, "Y")
+        kept = [i for i, bit in enumerate(y) if nl.readers.get(bit) or bit in named]
+        if not kept:
+            continue
+        k = max(kept) + 1
+        signed = bool(nl.param(cell, "A_SIGNED", 0)) and (c["type"] == "$neg" or bool(nl.param(cell, "B_SIGNED", 0)))
+        n = _natural_width(nl, cell, signed)
+        if n <= k:
+            continue                                            # nothing above the kept bits can be set
+        conds, dest = forward(nl, y[:k])
+        if conds is None:
+            continue
+        a, b = nl.conn(cell, "A"), nl.conn(cell, "B")
+        if dest and any(_operand_is(x, dest) for x in (a, b)) and any(all(is_const(v) for v in x) for x in (a, b)):
+            continue                                            # a counter: counter_overflow / counter_underflow
+        src = nl.cell_src(cell)
+        if signed:
+            params = {"W": n, "LO": -(1 << (k - 1)), "HI": (1 << (k - 1)) - 1, "SIGNED": 1}
+        else:
+            params = {"W": n, "LO": 0, "HI": (1 << k) - 1, "SIGNED": 0}
+        checks.append(Check(
+            kind="truncation", target=_dest_name(nl, dest, y[:k], src), src=src,
+            desc=f"the {op} result fits the {k} bit(s) it is stored in ({n} can be set{', signed' if signed else ''})",
+            checker="fvl_range", params=params, ports={"v": y[:n]}, conds=conds))
+    return _dedupe(checks)
+
+
 # ----------------------------------------------------------------- memory
 def detect_memory(nl: Netlist):
     checks = []
@@ -867,5 +934,6 @@ def _dedupe(checks):
 
 def detect_all(nl: Netlist, max_level: int, uninit: str = "zero"):
     counters, lemmas = detect_counters(nl, max_level, uninit)
-    checks = counters + detect_case(nl) + detect_index(nl) + detect_shift(nl) + detect_div(nl) + detect_memory(nl)
+    checks = (counters + detect_case(nl) + detect_index(nl) + detect_shift(nl) + detect_div(nl)
+              + detect_truncation(nl) + detect_memory(nl))
     return checks, lemmas

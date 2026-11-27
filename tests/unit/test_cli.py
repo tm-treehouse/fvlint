@@ -507,8 +507,8 @@ class Flow(CliCase):
     # Spelled out here, not read back from cli.KINDS: a misspelt entry there
     # would make that kind unselectable while a loop over KINDS still passes.
     ALL_KINDS = ["counter_overflow", "counter_underflow", "parallel_case", "full_case", "index_range",
-                 "shift_range", "div_zero", "mem_addr", "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary",
-                 "dead_branch"]
+                 "shift_range", "div_zero", "truncation", "mem_addr", "fifo_overflow", "fifo_underflow",
+                 "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary", "dead_branch"]
 
     def test_every_check_kind_is_accepted(self):
         self.assertEqual(cli.KINDS, self.ALL_KINDS)
@@ -647,6 +647,34 @@ class DeadBranches(CliCase):
         self.assertNotIn("matches no check", err)
         _, _, err = self.run_cli("--waivers", w, "--dead-branches")
         self.assertIn("waiver 'dead_branch:gone' matches no check", err)
+
+
+class Fifos(CliCase):
+    """The FIFO detector is faked: its checks join the others, and the
+    pointers it names have their counter checks settled."""
+
+    def test_wiring(self):
+        calls = []
+        fifo = Check("fifo_overflow", "mem", "a.v:1", "d", checker="fvl_fifo")
+
+        def fake(nl, inactive):
+            calls.append(inactive)
+            return [fifo], {nl.driver[nl.netnames["acc"]["bits"][0]].cell}   # acc's register as a pointer
+        with mock.patch.object(cli, "detect_fifos", fake):
+            self.run_cli()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(list(calls[0].values()), [0])                 # rst inactive
+            res = {r["id"]: r for r in self.results()["results"]}
+            self.assertIn("fifo_overflow:mem", res)
+            self.assertEqual((res["counter_overflow:acc"]["status"], res["counter_overflow:acc"]["reason"]),
+                             ("INFO", "fifo_pointer"))
+            self.assertEqual(res["counter_underflow:acc"]["status"], "PROVEN")
+            self.run_cli("--checks", "counter_overflow")
+            self.assertEqual(len(calls), 1)                                # not asked for: not looked for
+            self.run_cli("--checks", "fifo_underflow")
+            self.assertEqual(len(calls), 2)
+            self.run_cli("--checks", "fifo_overflow")
+            self.assertEqual(len(calls), 3)
 
 
 class Baselines(CliCase):

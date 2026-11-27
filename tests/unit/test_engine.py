@@ -1066,6 +1066,57 @@ class Reachability(EngineCase):
         self.assertTrue(eng.run.calls[0].multiclock)
 
 
+class Strengthened(EngineCase):
+    """A check with a fallback is a strengthened form of it (a guess added
+    to the property): proven, the result is the plain check's; otherwise
+    the plain one is proven instead."""
+
+    def strong(self):
+        plain = self.checks["other"]
+        return Check(plain.kind, plain.target, plain.src, plain.desc, checker=plain.checker,
+                     params=dict(plain.params, HI=plain.params["HI"] - 1), ports=plain.ports, conds=plain.conds,
+                     anchors=plain.anchors, fallback=plain), plain
+
+    def test_proven_strengthened(self):
+        strong, plain = self.strong()
+
+        def policy(c):
+            if c.tag == "r0_kind0":
+                self.assertEqual(c.prop("fvl_t0").params, strong.params)
+                return jr("PASS")
+            if c.tag == "vacuity_bmc":
+                self.assertEqual(c.prop("fvl_v0").params, plain.params)       # the plain property's condition
+                return jr("FAIL", fvl_v0="fail")
+            self.fail(c.tag)
+        eng = self.engine(policy, lemmas={})
+        (r,) = eng.prove_all([strong])
+        self.assertIs(r.check, plain)
+        self.assertEqual((r.status, r.vacuity), (PROVEN, "ok"))
+        self.assertTrue(r.detail.endswith(" (with the design's count as a helper)"))
+
+    def test_not_proven_falls_back(self):
+        strong, plain = self.strong()
+        seen = []
+
+        def policy(c):
+            seen.append((c.tag, c.props[0].params == strong.params if c.props else None))
+            if c.tag == "r0_kind0" and c.props[0].params == strong.params:
+                return jr("UNKNOWN", fvl_t0=PropResult("unknown", phase="induction"))
+            if c.tag == "r0_kind0":
+                return jr("PASS")
+            if c.tag == "vacuity_bmc":
+                return jr("FAIL", fvl_v0="fail")
+            return jr("UNKNOWN", **{n: PropResult("unknown", phase="induction") for n in c.names})
+        eng = self.engine(policy, lemmas={}, max_level=0, try_full=False)
+        (r,) = eng.prove_all([strong])
+        self.assertIs(r.check, plain)
+        self.assertEqual((r.status, r.vacuity), (PROVEN, "ok"))
+        self.assertEqual(r.history, [("strengthened", "not proven"), ("full", "pass")])
+        self.assertNotIn("helper)", r.detail)
+        self.assertEqual([t for t, _ in seen].count("vacuity_bmc"), 1)       # once, for the plain proof
+        self.assertNotIn("deepbmc", [t for t, _ in seen])
+
+
 class Scenarios(EngineCase):
     """prove_all from start to finish."""
 

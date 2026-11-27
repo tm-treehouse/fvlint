@@ -17,6 +17,7 @@ from .branches import detect_branches, reach_verdicts
 from .checks import ERROR, FAIL, HORIZON, INFO, PROVEN, UNKNOWN, VACUOUS, WAIVED, Result, merge_parts
 from .detect import detect_all, fmt_cycles, harmless_full_case
 from .elaborate import Sources, elaborate, elaborate_without_full_case
+from .fifo import detect_fifos, settle_pointers
 from .engine import Engine, Options
 from .fsm import analyse_fsms, dead_in_unreachable_states
 from .netlist import Netlist, display_path
@@ -26,8 +27,8 @@ from .tools import Toolchain, ToolError
 from .waivers import Waivers
 
 KINDS = ["counter_overflow", "counter_underflow", "parallel_case", "full_case", "index_range",
-         "shift_range", "div_zero", "mem_addr", "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary",
-         "dead_branch"]
+         "shift_range", "div_zero", "truncation", "mem_addr", "fifo_overflow", "fifo_underflow",
+         "fsm_unreachable", "fsm_trap", "fsm_reset", "fsm_summary", "dead_branch"]
 # What runs without --checks.  Dead branches are opt-in (--dead-branches): a
 # check for every if/else arm, case item and ?: choice costs time, and
 # defensive code (an else that can't happen) is dead on purpose.
@@ -281,6 +282,10 @@ def main(argv=None, project: dict | None = None) -> int:
         return 2
 
     checks, lemmas = detect_all(nl, args.max_level, args.uninit)
+    if kinds & {"fifo_overflow", "fifo_underflow"}:
+        fifos, pointers = detect_fifos(nl, dict(resets.inactive_conds()))
+        settle_pointers(checks, pointers)
+        checks += fifos
     if "dead_branch" in kinds:
         checks += detect_branches(nl, dict(resets.inactive_conds()))
     if elab["fsm_warning"]:
