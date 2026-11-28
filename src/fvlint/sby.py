@@ -87,6 +87,8 @@ def instance(p: Prop) -> dict:
     for k, v in p.params.items():
         if k in ("LO", "HI"):
             params[k] = _bin(v, w)
+        elif k == "RPOL":
+            params[k] = _bin(v, p.params["NR"])
         elif k == "SET":
             params[k] = _bin(v, p.params["N"] * w)
         else:

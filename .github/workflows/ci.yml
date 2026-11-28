@@ -73,13 +73,26 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      # The bug configuration's FAIL is in its baseline: a known finding,
+      # reported as a notice, so the run passes.
       - uses: ./
         id: all
-        continue-on-error: true            # the action exits with fvlint's status: 1 (findings) here
         with:
           config: tests/regress/action_smoke.toml
           output: action_out
           artifact-name: action-smoke
+      # The same FAIL as a new finding: exit status 1, without failing the
+      # step (fail-on-findings) or annotating it (annotations).
+      - uses: ./
+        id: new
+        with:
+          config: tests/regress/action_smoke.toml
+          configs: bug
+          args: --baseline tests/regress/empty_baseline.json
+          output: action_out_new
+          upload: "false"
+          annotations: "false"
+          fail-on-findings: "false"
       - uses: ./
         id: clean
         with:
@@ -90,20 +103,23 @@ jobs:
       - name: Check the action's outputs and results
         env:
           RC_ALL: ${{ steps.all.outputs.exit-code }}
-          OUTCOME_ALL: ${{ steps.all.outcome }}
+          RC_NEW: ${{ steps.new.outputs.exit-code }}
+          OUTCOME_NEW: ${{ steps.new.outcome }}
           RC_CLEAN: ${{ steps.clean.outputs.exit-code }}
         run: |
           set -eu
-          [ "$RC_ALL" = 1 ] || { echo "::error::exit-code with a FAIL: '$RC_ALL', expected 1"; exit 1; }
-          [ "$OUTCOME_ALL" = failure ] || { echo "::error::the step with a FAIL ended '$OUTCOME_ALL'"; exit 1; }
+          [ "$RC_ALL" = 0 ] || { echo "::error::exit-code with a known FAIL: '$RC_ALL', expected 0"; exit 1; }
+          [ "$RC_NEW" = 1 ] || { echo "::error::exit-code with a new FAIL: '$RC_NEW', expected 1"; exit 1; }
+          [ "$OUTCOME_NEW" = success ] || { echo "::error::fail-on-findings false, yet the step ended '$OUTCOME_NEW'"; exit 1; }
           [ "$RC_CLEAN" = 0 ] || { echo "::error::exit-code of the clean run: '$RC_CLEAN', expected 0"; exit 1; }
           python3 - <<'PY'
           import json
-          def statuses(path):
+          def results(path):
               with open(path) as f:
-                  return {r["id"]: r["status"] for r in json.load(f)["results"]}
-          assert statuses("action_out/clean/results.json") == {"counter_overflow:q": "PROVEN"}
-          assert statuses("action_out/bug/results.json") == {"counter_overflow:q": "FAIL"}
-          assert statuses("action_out_clean/clean/results.json") == {"counter_overflow:q": "PROVEN"}
+                  return {r["id"]: (r["status"], r["baseline"]) for r in json.load(f)["results"]}
+          assert results("action_out/clean/results.json") == {"counter_overflow:q": ("PROVEN", None)}
+          assert results("action_out/bug/results.json") == {"counter_overflow:q": ("FAIL", "FAIL")}
+          assert results("action_out_new/bug/results.json") == {"counter_overflow:q": ("FAIL", None)}
+          assert results("action_out_clean/clean/results.json") == {"counter_overflow:q": ("PROVEN", None)}
           PY
           [ ! -e action_out_clean/bug ] || { echo "::error::configs: clean also ran bug"; exit 1; }

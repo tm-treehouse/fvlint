@@ -90,7 +90,9 @@ class Generator(unittest.TestCase):
         self.assertEqual(m[("full_case", "fx")], {"en": ["1'b1"], "bad": ["(!(in2) && !(!in2))"]})
         self.assertEqual(m[("parallel_case", "fx")]["bad"], ["((in2) && (!in2))"])
         self.assertEqual(m[("div_zero", "dq")], {"en": ["in0"], "bad": ["(in0 && (r3 == 2'd0))"]})   # and a division
-        self.assertEqual(len(m), 12)
+        # and a 5-bit register plus din stored in 3 bits (its own stream too)
+        self.assertEqual(m[("truncation", "tq")], {"en": ["1'b1"], "bad": ["(1'b1 && ((8'd0 + r2 + din) > 8'd7))"]})
+        self.assertEqual(len(m), 13)
 
     def test_case_and_part_select_monitors(self):
         seen = set()
@@ -165,7 +167,7 @@ class Generator(unittest.TestCase):
         # Exact text and monitors (checked by hand: a 3-bit `ud + 1` wraps from 7, so
         # ud > 6; `pq - 1` wraps from 0, so pq < 1), and which registers start at zero.
         d = fuzz.generate(1)
-        self.assertIn("output [63:0] o, output [31:0] o2);", d.text)
+        self.assertIn("output [63:0] o, output [31:0] o2, output [7:0] o3);", d.text)
         self.assertIn("  always @(posedge clk) if (rst) ud <= 3'd3; else if (in2 && ud != 3'd6) ud <= ud + 3'd1; "
                       "else if (in0) ud <= ud - 3'd1;\n", d.text)
         self.assertEqual(d.monitors[("counter_overflow", "ud", 1)]["bad"],
@@ -252,6 +254,53 @@ class Generator(unittest.TestCase):
                                 ("div", "/", "'d0"), ("div", "%", "'d0"), ("div", "/", "'d1"), ("div", "%", "'d1"),
                                 ("div", "/", "input"), ("div", "%", "input"), ("assume", True), ("assume", False)})
 
+    def test_width_constructs(self):
+        # A truncated sum and a FIFO: their own stream; on o3.
+        seen = set()
+        for seed in range(1, 80):
+            d = fuzz.generate(seed)
+            m, text = d.monitors, d.text
+            one_clock = "posedge clk2" not in text and "negedge clk" not in text
+            with self.subTest(seed=seed):
+                tq = re.search(r"reg \[(\d)'?:0\] tq;\n  always @\(posedge clk\) (?:if (\(din < 4'd\d\)) )?tq <= (r\d) "
+                               r"\+ din;", text)
+                if tq:
+                    top, guard, r = tq.groups()
+                    t, guard = int(top) + 1, guard or "1'b1"
+                    self.assertIn(t, (2, 3, 4))
+                    self.assertEqual(m[("truncation", "tq")],
+                                     {"en": [guard], "bad": [f"({guard} && ((8'd0 + {r} + din) > 8'd{(1 << t) - 1}))"]})
+                    self.assertIn(("tq", t), d.regs)
+                    seen.add(("trunc", guard != "1'b1"))
+                else:
+                    self.assertNotIn(("truncation", "tq"), m)
+                full = re.search(r"wire fpush = in0 && \((.*)\);\n  wire fpop = in1 && \((.*)\);", text)
+                if full:
+                    self.assertTrue(one_clock)
+                    f, e = full.groups()
+                    self.assertIn((f, e), [("fc != 3'd4", "fc != 3'd0"), ("1'b1", "fc != 3'd0"),
+                                           ("fc != 3'd5", "fc != 3'd0"), ("fc != 3'd4", "1'b1")])
+                    self.assertEqual(m[("fifo_overflow", "fmem")],
+                                     {"en": ["(fpush && !fpop)"], "bad": ["(fpush && !fpop && fc == 3'd4)"]})
+                    self.assertEqual(m[("fifo_underflow", "fmem")], {"en": ["fpop"], "bad": ["(fpop && fc == 3'd0)"]})
+                    self.assertEqual(m[("counter_overflow", "fw", 1)],
+                                     {"en": ["fpush"], "bad": ["(fpush && fw == 2'd3)"]})
+                    self.assertEqual(m[("counter_overflow", "fr", 1)],
+                                     {"en": ["fpop"], "bad": ["(fpop && fr == 2'd3)"]})
+                    self.assertIn("\n  reg [3:0] fmem [0:3];\n  reg [1:0] fw, fr;\n  reg [2:0] fc;\n", text)
+                    self.assertIn(("fc", 3), d.regs)
+                    seen.add(("fifo", f, e))
+                else:
+                    self.assertNotIn(("fifo_overflow", "fmem"), m)
+                outs = re.search(r"assign o3 = \{(.*)\};", text)
+                self.assertEqual(outs.group(1).split(", ") if outs else [],
+                                 (["tq"] if tq else []) + (["frd"] if full else []))
+                if outs:
+                    self.assertIn("output [7:0] o3);", text.splitlines()[0])
+        self.assertEqual(seen, {("trunc", False), ("trunc", True), ("fifo", "fc != 3'd4", "fc != 3'd0"),
+                                ("fifo", "1'b1", "fc != 3'd0"), ("fifo", "fc != 3'd5", "fc != 3'd0"),
+                                ("fifo", "fc != 3'd4", "1'b1")})
+
     def test_op_constructs_of_known_designs(self):
         # Checked by hand: din << r0 into 6 bits loses everything from 6 on
         # (r0 is 2 bits, so never: fvlint has no check); din >> r1 loses din's
@@ -315,15 +364,18 @@ class Generator(unittest.TestCase):
         self.assertEqual(fuzz.generate(31).stages, ["s1", "s2"])        # the state machine resets on s2
         self.assertIn(("st", 2), fuzz.generate(31).regs)
         self.assertEqual(fuzz.generate(10).stages, [])                  # no synchronizer
-        self.assertEqual(fuzz.generate(9).regs, [("r0", 4), ("r1", 4), ("r2", 3), ("s1", 1), ("s2", 1), ("msk", 1)])
-        self.assertEqual(fuzz.generate(10).regs, [("r0", 2), ("r1", 5), ("r2", 5), ("r3", 2), ("ok0", 1), ("ok2", 1)])
+        self.assertEqual(fuzz.generate(9).regs, [("r0", 4), ("r1", 4), ("r2", 3), ("s1", 1), ("s2", 1), ("msk", 1),
+                                                 ("tq", 4), ("fw", 2), ("fr", 2), ("fc", 3)])
+        self.assertEqual(fuzz.generate(10).regs, [("r0", 2), ("r1", 5), ("r2", 5), ("r3", 2), ("ok0", 1), ("ok2", 1),
+                                                  ("tq", 3)])
 
     def test_clocks_and_dependencies(self):
         # Seed 7: r2 runs on clk2 and the memory address is r2; r1's checks
         # depend on clk registers only.
         d = fuzz.generate(7)
         self.assertEqual(d.clock, {"r0": "posedge clk", "ok1": "posedge clk", "r1": "posedge clk",
-                                   "r2": "posedge clk2", "mem": "posedge clk", "ud": "posedge clk"})
+                                   "r2": "posedge clk2", "mem": "posedge clk", "ud": "posedge clk",
+                                   "tq": "posedge clk"})
         self.assertEqual(d.reads["sel"], {"wire", "lanes", "r1"})
         self.assertEqual(d.clocks_of(" ".join(d.monitors[("counter_overflow", "r1", 1)]["bad"])), {"posedge clk"})
         self.assertEqual(d.clocks_of(" ".join(d.monitors[("mem_addr", "mem.rd0")]["bad"])),

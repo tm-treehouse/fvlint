@@ -30,7 +30,7 @@ class Pins(unittest.TestCase):
 
     def test_ci_runs_the_action_from_the_checkout(self):
         ci = read(".github/workflows/ci.yml")
-        self.assertEqual(ci.count("      - uses: ./\n"), 2)
+        self.assertEqual(ci.count("      - uses: ./\n"), 3)
         for path in re.findall(r"config: (\S+)", ci):
             self.assertTrue(os.path.exists(os.path.join(ROOT, path)), path)
 

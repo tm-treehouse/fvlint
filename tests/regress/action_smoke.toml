@@ -3,9 +3,10 @@
 #
 # Project file for the CI job that runs the GitHub Action from the checkout
 # (.github/workflows/ci.yml, job `action`): one clean configuration and one
-# with a known FAIL.  Also runs locally:
-#   fvlint --config tests/regress/action_smoke.toml -o OUT          # exit status 1
-#   fvlint --config tests/regress/action_smoke.toml clean -o OUT    # exit status 0
+# with a FAIL, recorded in its baseline (a known finding).  Also runs locally:
+#   fvlint --config tests/regress/action_smoke.toml -o OUT          # exit status 0
+#   fvlint --config tests/regress/action_smoke.toml bug -o OUT \
+#          --baseline tests/regress/empty_baseline.json             # exit status 1
 out = "fvlint_out"
 
 [defaults]
@@ -18,3 +19,4 @@ files = ["../fixtures/counters.sv"]
 [config.bug]
 top = "cnt_badlimit"
 files = ["../fixtures/counters.sv"]
+baseline = "action_smoke_bug_baseline.json"

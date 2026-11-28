@@ -1,0 +1,7 @@
+{
+  "fvlint_baseline": 1,
+  "top": "cnt_badlimit",
+  "findings": {
+    "counter_overflow:q": "FAIL"
+  }
+}

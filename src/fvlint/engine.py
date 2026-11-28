@@ -253,10 +253,24 @@ class Engine:
         for s in states:
             if not s.done:
                 self._finish_unknown(s)
-        self._deep_bmc([s for s in states if s.res.status == UNKNOWN and not s.cex])
+        # A strengthened check (a guess added to the property) that wasn't
+        # proven says nothing about the plain one: prove that instead.
+        retry = [s for s in states if s.chk.fallback is not None and s.res.status != PROVEN]
+        if retry:
+            for s, r in zip(retry, self.prove_all([s.chk.fallback for s in retry])):
+                s.res, s.done = r, True
+                r.history[:0] = [("strengthened", "not proven")]
+        retried = {id(s) for s in retry}                 # done: their own prove_all ran the rest
+        for s in states:
+            if s.chk.fallback is not None and id(s) not in retried:
+                # Proven in the stronger form; the result is the plain check's.
+                s.chk = s.res.check = s.chk.fallback
+                s.res.detail += " (with the design's count as a helper)"
+        rest = [s for s in states if id(s) not in retried]
+        self._deep_bmc([s for s in rest if s.res.status == UNKNOWN and not s.cex])
         if self.opts.vacuity:
             # A reachability check's probe would be its own property again.
-            self._vacuity([s for s in states if s.res.status == PROVEN and not s.chk.reach])
+            self._vacuity([s for s in rest if s.res.status == PROVEN and not s.chk.reach])
         for s in states:
             s.res.seconds = round(time.time() - s.t0, 2)
         return [s.res for s in states]

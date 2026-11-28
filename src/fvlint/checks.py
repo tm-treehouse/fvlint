@@ -22,6 +22,7 @@ FREE_RUNNING = "free_running"      # the counter's step doesn't depend on it: wr
 HORIZON = "horizon"                # the counter can't wrap within --horizon cycles
 DEAD_STATE = "dead_state"          # applies only in an unreachable FSM state
 FULL_CASE_X = "full_case_x"        # full_case on a signal set to 'x before the case: the pragma changes nothing
+FIFO_POINTER = "fifo_pointer"      # a FIFO pointer's increment: it wraps by design (fifo_overflow/underflow check it)
 
 REACH = "fvl_reach"                # checker of reachability checks (Check.reach)
 
@@ -52,6 +53,7 @@ class Check:
     group: str | None = None            # id of the reported check this one is a part of (case statements)
     part: str = ""                      # what this part covers (the signal a case statement assigns)
     condition: str | None = None        # dead_branch: the branch's condition as Verilog, if it has one
+    fallback: "Check | None" = None     # proved instead when this (a strengthened form of it) isn't proven
 
     @property
     def reach(self) -> bool:

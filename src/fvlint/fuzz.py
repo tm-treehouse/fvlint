@@ -7,7 +7,8 @@ statements, part-selects, non-power-of-two memories, state machines,
 occasionally a second clock or a falling-edge register, and constructs
 fvlint settles without a proof: case statements in FSM states, up/down
 counters under a small --horizon, full_case on 'x or valued signals,
-parameter guards), shifts and divisions by registers, and sometimes an
+parameter guards), shifts and divisions by registers, sums stored in fewer
+bits, four-entry FIFOs with one guard wrong or none, and sometimes an
 assumption on an internal net (the same assume statement in fvlint's
 --assume file and in the oracle's copy), runs fvlint on each (half of them
 with --dead-branches), and then checks every verdict with an independent
@@ -39,7 +40,8 @@ are inactive (a flop that data can set is not a reset).
                        after the reset); a BMC that deep checks it completely.
   full_case_x       -> the generator must have set the signal to 'x before
                        the case (not expressible as a monitor).
-  free_running      -> nothing claimed.
+  free_running,
+  fifo_pointer      -> nothing claimed (an intended wrap).
 * A construct behind a parameter guard that is 1 must have a check.
 
 The oracle is bounded, so a disagreement beyond its depth goes unnoticed;
@@ -314,11 +316,17 @@ def generate(seed: int) -> Design:
     extra2 = _settling_constructs(d, random.Random(seed * 104729 + 31), lines, widths, ins)
     extra2 += _op_constructs(d, random.Random(seed * 15485863 + 47), lines, widths, ins,
                              single_clock=not two_clocks and neg is None)
+    # (On an output of their own: o2's width was full, and the designs before them stay as they were.)
+    extra3 = _width_constructs(d, random.Random(seed * 32452843 + 89), lines, widths,
+                               single_clock=not two_clocks and neg is None)
     outs = ", ".join([f"r{i}" for i in range(n)] + extra)
     lines.append(f"  assign o = {{{outs}}};")
     if extra2:
         lines[0] = lines[0].replace("output [63:0] o);", "output [63:0] o, output [31:0] o2);")
         lines.append(f"  assign o2 = {{{', '.join(extra2)}}};")
+    if extra3:
+        lines[0] = lines[0].replace(");", ", output [7:0] o3);", 1)
+        lines.append(f"  assign o3 = {{{', '.join(extra3)}}};")
     lines.append("endmodule")
     d.text = "\n".join(lines) + "\n"
     d.record()
@@ -461,6 +469,51 @@ def _op_constructs(d: Design, g: random.Random, lines: list, widths: list, ins: 
     return out
 
 
+def _width_constructs(d: Design, g: random.Random, lines: list, widths: list, single_clock: bool) -> list:
+    """A truncated sum and a FIFO, from their own random stream `g` (every
+    decision drawn whether or not it is used).  Returns the signals for o3
+    (at most 8 bits)."""
+    out = []
+    n = len(widths)
+
+    # (h) A sum of a register and din (5 bits or more) stored in 2-4 bits,
+    # sometimes only when din is small: enough, or not.
+    use, k, t, guarded, lim = g.random() < 0.5, g.randrange(n), g.randint(2, 4), g.random() < 0.5, g.randint(1, 8)
+    if use:
+        guard = f"(din < 4'd{lim})" if guarded else "1'b1"
+        stmt = f"tq <= r{k} + din;"
+        lines.append(f"  reg [{t - 1}:0] tq;")
+        lines.append("  always @(posedge clk) " + (f"if {guard} {stmt}" if guarded else stmt))
+        d.regs.append(("tq", t))
+        d.monitor(("truncation", "tq"), guard, f"({guard} && ((8'd0 + r{k} + din) > 8'd{(1 << t) - 1}))")
+        out.append("tq")
+
+    # (i) A four-entry FIFO with a count, in a one-clock design: at most one
+    # of its guards wrong (no full check, full at 5, or no empty check).
+    # The monitors read the count: until the first violation it is the
+    # number of entries held, as fvlint's own count is.
+    use, bug = g.random() < 0.4, g.choice(["none", "none", "nofull", "full5", "noempty"])
+    if use and single_clock:
+        full = {"nofull": "1'b1", "full5": "fc != 3'd5"}.get(bug, "fc != 3'd4")
+        empty = "1'b1" if bug == "noempty" else "fc != 3'd0"
+        lines += ["  reg [3:0] fmem [0:3];", "  reg [1:0] fw, fr;", "  reg [2:0] fc;",
+                  f"  wire fpush = in0 && ({full});", f"  wire fpop = in1 && ({empty});",
+                  "  always @(posedge clk) if (rst) begin fw <= 2'd0; fr <= 2'd0; fc <= 3'd0; end "
+                  "else begin if (fpush) fw <= fw + 2'd1; if (fpop) fr <= fr + 2'd1; "
+                  "fc <= fc + {2'd0, fpush} - {2'd0, fpop}; end",
+                  "  always @(posedge clk) if (fpush) fmem[fw] <= din;",
+                  "  wire [3:0] frd = fmem[fr];"]
+        d.regs += [("fw", 2), ("fr", 2), ("fc", 3)]
+        d.monitor(("fifo_overflow", "fmem"), "(fpush && !fpop)", "(fpush && !fpop && fc == 3'd4)")
+        # The pointers wrap by design (fvlint says so, INFO fifo_pointer); if
+        # it didn't see the FIFO, its counter checks have these to go by.
+        d.monitor(("counter_overflow", "fw", 1), "fpush", "(fpush && fw == 2'd3)")
+        d.monitor(("counter_overflow", "fr", 1), "fpop", "(fpop && fr == 2'd3)")
+        d.monitor(("fifo_underflow", "fmem"), "fpop", "(fpop && fc == 3'd0)")
+        out.append("frd")
+    return out
+
+
 # -------------------------------------------------------------------- oracle
 
 
@@ -557,7 +610,7 @@ def _settled(res: dict, design: Design, horizon, problems: list):
         if target not in design.x_defaults:
             problems.append(f"{res['id']}: fvlint INFO (the full_case pragma changes nothing), but the code sets "
                             f"{target} to a value before the case")
-    return None                    # free-running (an intended wrap: nothing claimed), summaries
+    return None                    # free-running, a FIFO pointer (an intended wrap: nothing claimed), summaries
 
 
 def oracle(out: str, design: Design, depth: int, engine_opts, max_depth: int = 80) -> tuple[list, list]:

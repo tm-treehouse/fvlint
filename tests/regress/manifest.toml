@@ -100,9 +100,12 @@ tags = ["counter", "bug", "review"]
 name = "memory/ring_ok"
 files = ["../fixtures/memory.sv"]
 top = "ring_ok"
-expect = { "mem_addr:mem.rd0" = "PROVEN", "mem_addr:mem.wr0" = "PROVEN", "counter_overflow:wp" = "PROVEN", "counter_overflow:rp" = "PROVEN" }
+# The addresses stay in range, but nothing guards writes or reads: a FIFO
+# that overflows and underflows.  Its pointers wrap explicitly at 99, so
+# their counter checks stay (and prove the wrap works).
+expect = { "mem_addr:mem.rd0" = "PROVEN", "mem_addr:mem.wr0" = "PROVEN", "counter_overflow:wp" = "PROVEN", "counter_overflow:rp" = "PROVEN", "fifo_overflow:mem" = "FAIL", "fifo_underflow:mem" = "FAIL" }
 strict = true
-tags = ["memory"]
+tags = ["memory", "fifo"]
 
 [[case]]
 name = "memory/ring_bug"
@@ -680,3 +683,122 @@ args = ["--baseline", "{dir}/empty_baseline.json"]
 expect = { "counter_overflow:used" = "FAIL", "counter_underflow:used" = "PROVEN" }
 exit = 1
 tags = ["baseline"]
+
+# ------------------------------------------------------------- truncation
+[[case]]
+name = "widths/trunc_bug"
+files = ["../fixtures/widths.sv"]
+top = "trunc_bug"
+args = ["--no-reset"]
+expect = { "truncation:q" = "FAIL" }
+strict = true
+tags = ["widths", "bug"]
+
+[[case]]
+name = "widths/trunc_guarded"
+files = ["../fixtures/widths.sv"]
+top = "trunc_guarded"
+args = ["--no-reset"]
+engines = ["pdr", "smtbmc"]
+expect = { "truncation:q" = "PROVEN" }
+strict = true
+exit = 0
+tags = ["widths"]
+
+[[case]]
+name = "widths/trunc_explicit"
+files = ["../fixtures/widths.sv"]
+top = "trunc_explicit"
+args = ["--no-reset"]
+# An explicit slice of a named wire, and `c + 1` into 5 bits: nothing to check.
+expect = {}
+strict = true
+exit = 0
+tags = ["widths"]
+
+[[case]]
+name = "widths/trunc_counter"
+files = ["../fixtures/widths.sv"]
+top = "trunc_counter"
+expect = { "counter_overflow:n" = "PROVEN" }
+strict = true
+exit = 0
+tags = ["widths", "counter"]
+
+[[case]]
+name = "widths/trunc_sub"
+files = ["../fixtures/widths.sv"]
+top = "trunc_sub"
+args = ["--no-reset"]
+expect = { "truncation:q" = "FAIL", "truncation:p" = "PROVEN" }
+strict = true
+tags = ["widths", "bug"]
+
+[[case]]
+name = "widths/trunc_signed"
+files = ["../fixtures/widths.sv"]
+top = "trunc_signed"
+args = ["--no-reset"]
+engines = ["pdr", "smtbmc"]
+expect = { "truncation:q" = "FAIL", "truncation:p" = "PROVEN" }
+strict = true
+tags = ["widths", "bug"]
+
+# ------------------------------------------------------------------ FIFOs
+# FIFO proofs relate the checker's count to the design's own bookkeeping:
+# PDR finds that, k-induction alone doesn't (see the README's limitations).
+[[case]]
+name = "fifo/count"
+files = ["../fixtures/fifos.sv"]
+top = "fifo_count"
+engines = ["pdr"]
+expect = { "fifo_overflow:mem" = "PROVEN", "fifo_underflow:mem" = "PROVEN", "counter_overflow:wp" = "INFO", "counter_overflow:rp" = "INFO" }
+strict = true
+exit = 0
+tags = ["fifo"]
+
+[[case]]
+name = "fifo/pointers"
+files = ["../fixtures/fifos.sv"]
+top = "fifo_ptrs"
+engines = ["pdr"]
+# The 4-bit pointers wrap by overflowing: INFO, not the FAIL they used to be.
+expect = { "fifo_overflow:mem" = "PROVEN", "fifo_underflow:mem" = "PROVEN", "counter_overflow:wp" = "INFO", "counter_overflow:rp" = "INFO" }
+strict = true
+exit = 0
+tags = ["fifo"]
+
+[[case]]
+name = "fifo/no_full_check"
+files = ["../fixtures/fifos.sv"]
+top = "fifo_nofull"
+engines = ["pdr", "smtbmc"]
+expect = { "fifo_overflow:mem" = "FAIL" }
+tags = ["fifo", "bug"]
+
+[[case]]
+name = "fifo/full_off_by_one"
+files = ["../fixtures/fifos.sv"]
+top = "fifo_offbyone"
+expect = { "fifo_overflow:mem" = "FAIL", "fifo_underflow:mem" = "PROVEN" }
+tags = ["fifo", "bug"]
+
+[[case]]
+name = "fifo/three_entries"
+files = ["../fixtures/fifos.sv"]
+top = "fifo_three"
+engines = ["pdr"]
+expect = { "fifo_overflow:mem" = "PROVEN", "fifo_underflow:mem" = "PROVEN", "counter_overflow:wp" = "PROVEN", "counter_overflow:rp" = "PROVEN" }
+exit = 0
+tags = ["fifo"]
+
+[[case]]
+name = "fifo/flush"
+files = ["../fixtures/fifos.sv"]
+top = "fifo_flush"
+args = ["--checks", "fifo_overflow,fifo_underflow"]
+# Pointers loaded in mid-run: not a FIFO these checks can count.
+expect = {}
+strict = true
+exit = 0
+tags = ["fifo"]
